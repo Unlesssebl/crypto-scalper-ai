@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS observations (
     observed_at REAL, price REAL, status TEXT NOT NULL DEFAULT 'pending',
     PRIMARY KEY(event_id, minutes)
 );
+CREATE TABLE IF NOT EXISTS telegram_offsets (
+    bot_id INTEGER PRIMARY KEY, next_update INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS observations_due ON observations(due_at) WHERE status = 'pending';
 """
 
@@ -123,6 +126,17 @@ class Journal:
                         "UPDATE observations SET status='observed',price=?,observed_at=? WHERE event_id=? AND minutes=?",
                         (price, observed_at, row["event_id"], row["minutes"]),
                     )
+
+    def telegram_offset(self, bot_id):
+        row = self.db.execute("SELECT next_update FROM telegram_offsets WHERE bot_id=?", (bot_id,)).fetchone()
+        return row[0] if row else 0
+
+    def save_telegram_offset(self, bot_id, offset):
+        with self.db:
+            self.db.execute(
+                "INSERT INTO telegram_offsets VALUES(?,?) ON CONFLICT(bot_id) DO UPDATE SET next_update=excluded.next_update",
+                (bot_id, offset),
+            )
 
     def close(self):
         try:

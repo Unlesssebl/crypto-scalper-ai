@@ -7,3 +7,4 @@ pandas==3.0.1
 pyfiglet==1.0.4
 python-dotenv==1.2.2
 rich==14.3.3
+TA-Lib==0.8.3

@@ -5,6 +5,8 @@ import math
 import time
 from dataclasses import asdict
 
+from .activity import CANDLE_SOURCE, tape_baseline
+
 from hyperdata_terminal.data_layer.hub import HyperDataHub
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
@@ -103,7 +105,7 @@ def metric(value, source, updated_at, unit, quality="ok"):
             "unit": unit, "quality": quality}
 
 
-def capture(hub, asset, window, now):
+def capture(hub, asset, window, now, candles=None):
     market_at = hub.market_timestamp()
     market_quality = "synthetic" if hub.demo else ("ok" if hub.market_age() <= 20 else "stale")
     market_source = "HyperData demo" if hub.demo else "Hyperliquid metaAndAssetCtxs"
@@ -141,9 +143,23 @@ def capture(hub, asset, window, now):
         ("ofi", flow.ofi if flow else None, "ratio"),
         ("volume", flow.buy_volume + flow.sell_volume if flow else None, "USD"),
         ("trade_count", flow.trade_count if flow else None, "trades"),
+        ("trade_rate", flow.trades_per_sec if flow else None, "trades/s"),
     ):
         metrics[name] = metric(value if flow_quality != "unavailable" else None, flow_source,
                                last_trade, unit, flow_quality)
+    seconds = WINDOWS[window]
+    closed_at = candles["closed_at"] if candles else None
+    candle_quality = "unavailable" if not candles else "ok" if now - closed_at <= seconds + 90 else "stale"
+    for name, unit in (("natr", "%"), ("range_ratio", "×")):
+        value = candles[name] if candles else None
+        metrics[name] = metric(value, CANDLE_SOURCE, closed_at, unit,
+                               candle_quality if value is not None else "unavailable")
+    baseline = tape_baseline(candles, now, seconds) if candle_quality == "ok" else None
+    relative = flow.trade_count / baseline if flow_quality == "ok" and baseline and flow else None
+    metrics["activity_ratio"] = metric(
+        relative, f"{flow_source} / {CANDLE_SOURCE} median", last_trade, "×",
+        "ok" if relative is not None else "unavailable",
+    )
     # These are observed trades from the same native window as OFI and CVD.
     # Price levels provide context for the independent analysis without a new indicator.
     if bucket and bucket.trades:

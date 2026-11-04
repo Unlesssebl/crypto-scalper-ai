@@ -7,12 +7,14 @@ import pytest
 from aiohttp import ClientSession, web
 
 from apps.scalper_web.__main__ import ScalperAPI
+from extensions.scalper.activity import active_anomalies, candle_indicators, tape_baseline
 from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.quality import calculate_quality
 from extensions.scalper.service import Screener
-from hyperdata_terminal.data_layer.market_data import AssetInfo
+from extensions.scalper.telegram import listen_reports, report_command, report_text
+from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, ShardState, Trade
 
@@ -315,4 +317,95 @@ def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
         assert report["1m"]["horizons"][15]["pending"] == 2
         assert report["5m"]["horizons"][1]["missing"] == 1
     finally:
+        journal.close()
+
+
+def test_activity_uses_closed_candles_and_nonoverlapping_trade_baseline():
+    candles = [{"timestamp": i * 60_000, "high": 101, "low": 99, "close": 100, "trade_count": 10}
+               for i in range(20)]
+    candles[-2].update(high=104, low=96, trade_count=500)
+    candles[-1].update(high=140, low=50, trade_count=900)
+    now = 19 * 60 + 10
+    indicators = candle_indicators(candles, 60, now)
+    assert indicators["closed_at"] == 19 * 60
+    assert indicators["range_ratio"] == pytest.approx(4)
+    assert indicators["natr"] == pytest.approx((13 * 2 + 8) / 14)
+    assert tape_baseline(indicators, now, 60) == 10
+    snapshot = {"metrics": {"activity_ratio": {"quality": "ok", "value": 2},
+                            "trade_count": {"value": 20},
+                            "range_ratio": {"quality": "ok", "value": 4}}}
+    assert active_anomalies(snapshot) == {"tape_burst", "range_burst"}
+
+
+async def test_native_candle_request_preserves_market_symbol_and_trade_count(monkeypatch):
+    market = MarketData()
+    market.assets["kPEPE"] = None
+
+    async def post(session, request):
+        assert request["type"] == "candleSnapshot"
+        assert request["req"]["coin"] == "kPEPE"
+        assert request["req"]["interval"] == "1m"
+        return [{"t": 0, "o": "1", "h": "2", "l": "1", "c": "2", "v": "3", "n": 7}]
+
+    monkeypatch.setattr(market, "_post", post)
+    assert (await market.get_candles("kPEPE", "1m"))[0]["trade_count"] == 7
+
+
+def test_telegram_report_is_restricted_to_configured_chat(tmp_path):
+    update = {"message": {"date": 1000, "chat": {"id": 42}, "text": "/report@ScalperBot 5m"}}
+    assert report_command(update, "42", "scalperbot", 1010) == ("5m",)
+    assert report_command(update, "43", "scalperbot", 1010) is None
+    assert report_command(update, "42", "otherbot", 1010) is None
+    assert report_command(update, "42", "scalperbot", 1300) is None
+    journal = Journal(tmp_path / "reports.sqlite")
+    try:
+        journal.save_telegram_offset(12, 7)
+        assert journal.telegram_offset(12) == 7 and journal.telegram_offset(13) == 0
+        report = calculate_quality(tmp_path / "reports.sqlite", 1000, ("1m", "5m"))
+        text = report_text(report, "5m")
+        assert "Окно 5m" in text and "Окно 1m" not in text
+        assert "15 мин: верно 0, неверно 0" in text
+    finally:
+        journal.close()
+
+
+async def test_telegram_listener_replies_and_advances_offset(monkeypatch, tmp_path):
+    path = tmp_path / "reports.sqlite"
+    journal = Journal(path)
+    replies = []
+    sent = asyncio.Event()
+
+    async def call(session, token, method, body=None, timeout=10):
+        if method == "getWebhookInfo":
+            return {"url": ""}
+        if method == "getMe":
+            return {"id": 12, "username": "ScalperBot"}
+        if method == "getMyCommands":
+            return [{"command": "report", "description": "Report"}]
+        assert method == "getUpdates"
+        if body["offset"] == 0:
+            return [
+                {"update_id": 6, "message": {"date": int(time.time()), "chat": {"id": 43}, "text": "/report"}},
+                {"update_id": 7, "message": {"date": int(time.time()), "chat": {"id": 42}, "text": "/report 1m"}},
+            ]
+        assert body["offset"] == 8
+        await asyncio.Future()
+
+    async def send(message):
+        replies.append(message)
+        sent.set()
+        return True
+
+    monkeypatch.setattr("extensions.scalper.telegram.telegram_call", call)
+    alerts = SimpleNamespace(telegram_token="test", telegram_chat_id="42", send_telegram=send)
+    service = SimpleNamespace(hub=SimpleNamespace(alerts=alerts), journal=journal,
+                              quality_report=calculate_quality(path, time.time(), ("1m", "5m")))
+    task = asyncio.create_task(listen_reports(None, service))
+    try:
+        await asyncio.wait_for(sent.wait(), 1)
+        assert len(replies) == 1 and "Окно 1m" in replies[0] and "Окно 5m" not in replies[0]
+        assert journal.telegram_offset(12) == 8
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         journal.close()

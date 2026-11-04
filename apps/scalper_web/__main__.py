@@ -10,10 +10,12 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
+from extensions.scalper.activity import active_anomalies
 from extensions.scalper.analysis import Gemini, OpenRouter
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, ScalperHub, orderbook_details
 from extensions.scalper.service import Screener
+from extensions.scalper.telegram import listen_reports
 from hyperdata_terminal.api_server import HyperDataAPI
 from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
 from hyperdata_terminal.paths import DATA_DIR
@@ -51,7 +53,8 @@ class ScalperAPI(HyperDataAPI):
                 accepted = self.service.journal.latest(symbol, frame, accepted=True)
                 rows.append({**row, "latest": latest[0] if latest else None,
                              "accepted": accepted[0] if accepted else None,
-                             "queued": (symbol, frame) in self.service.pending})
+                             "queued": (symbol, frame) in self.service.pending,
+                             "anomalies": sorted(active_anomalies(row["snapshot"]))})
         return web.json_response({"mode": self.hub.status.mode,
                                   "market": self.hub.status.market_data,
                                   "gemini": "configured" if self.service.gemini.key else "disabled",
@@ -128,6 +131,10 @@ async def run(args):
                 tasks.extend(asyncio.create_task(worker()) for worker in
                              (service.run, service.analyze, service.deliver))
                 tasks.append(asyncio.create_task(service.refresh_quality(args.journal), name="scalper-quality"))
+                if not args.demo:
+                    tasks.append(asyncio.create_task(service.refresh_activity(), name="scalper-activity"))
+                if notify:
+                    tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
                 logging.info("Dashboard: http://127.0.0.1:%d/scalper", args.port)
                 if args.tui:
                     dashboard = MarketOverviewDashboard(

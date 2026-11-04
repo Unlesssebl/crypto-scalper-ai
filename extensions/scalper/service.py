@@ -7,6 +7,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 
+from .activity import active_anomalies, refresh_candles
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
 from .market import WINDOWS, capture
@@ -74,6 +75,7 @@ class Screener:
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.rows = {}
         self.quality_report = None
+        self.candles = {}
         self.states = {}
         self.pending = set()
         self.cooldowns = {}
@@ -86,9 +88,9 @@ class Screener:
         rows = {}
         for asset in assets[:20]:
             for window in WINDOWS:
-                snapshot, native = capture(self.hub, asset, window, now)
-                native["snapshot"] = snapshot_key(snapshot)
                 key = (asset.symbol, window)
+                snapshot, native = capture(self.hub, asset, window, now, self.candles.get(key))
+                native["snapshot"] = snapshot_key(snapshot)
                 rows[key] = {"snapshot": snapshot, "hyperdata": native}
                 if not self.hub.demo:
                     self.detect(key, snapshot, native, now)
@@ -106,30 +108,33 @@ class Screener:
 
     def detect(self, key, snapshot, native, now):
         direction = native["direction"]
-        previous, was_strong = self.states.get(key, (None, False))
+        anomalies = active_anomalies(snapshot)
+        previous, was_strong, previous_anomalies = self.states.get(key, (None, False, frozenset()))
+        new_anomalies = anomalies - previous_anomalies
         strong = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
         if direction == "NOT_AVAILABLE":
             return
         trigger = ((direction in DIRECTIONAL and direction != previous)
                    or (previous in DIRECTIONAL and direction == "NEUTRAL")
-                   or (strong and not was_strong))
+                   or (strong and not was_strong) or bool(new_anomalies))
         if not trigger:
-            self.states[key] = direction, strong
+            self.states[key] = direction, strong, anomalies
             return
         if key in self.pending or self.jobs.full() or self.cooldowns.get(key, 0) > now:
             return
 
         event = {
-            "type": "orderflow_transition", "previous_direction": previous,
+            "type": "market_activity" if new_anomalies else "orderflow_transition",
+            "anomalies": sorted(new_anomalies), "previous_direction": previous,
             "direction": direction, "native_signal": native["native_signal"],
             "source": native["source"],
         }
-        self.states[key] = direction, strong
+        self.states[key] = direction, strong, anomalies
         self.pending.add(key)
         self.sequence += 1
         # New candidates in one scan have the same age. Let strong events
         # lead that batch, while older candidates retain priority over new ones.
-        priority = 0 if strong else 1 if direction in DIRECTIONAL else 2
+        priority = 0 if new_anomalies else 1 if strong else 2 if direction in DIRECTIONAL else 3
         self.jobs.put_nowait((now, priority, self.sequence, key, event))
 
     async def run(self):
@@ -139,6 +144,9 @@ class Screener:
             except Exception:
                 LOG.exception("Screener scan failed")
             await asyncio.sleep(5)
+
+    async def refresh_activity(self):
+        await refresh_candles(self.hub, WINDOWS, self.candles)
 
     async def refresh_quality(self, path):
         while True:
@@ -164,6 +172,9 @@ class Screener:
                 if (now - snapshot["captured_at"] > 10
                         or snapshot["metrics"]["price"]["quality"] != "ok"
                         or native["direction"] == "NOT_AVAILABLE"):
+                    self.states.pop(candidate, None)
+                    continue
+                if event["anomalies"] and not active_anomalies(snapshot).intersection(event["anomalies"]):
                     self.states.pop(candidate, None)
                     continue
                 if native["direction"] != event["direction"]:

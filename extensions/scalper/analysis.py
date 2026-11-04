@@ -13,7 +13,9 @@ KEY_FIELDS = ("symbol", "exchange", "contract", "window", "captured_at")
 PROMPT = """Независимо оцени данный снимок Hyperliquid perpetual для ручного наблюдения.
 Используй как доказательства только метрики с quality=ok. Ссылайся на них по metric.
 Направление требует подтверждения из нескольких независимых групп метрик.
-CVD, OFI, объём и число сделок относятся к одной группе потока.
+CVD, OFI, число сделок и скорость ленты описывают один поток. Торговый объём даёт контекст.
+NATR показывает типичный относительный диапазон, activity_ratio и range_ratio — всплески.
+Всплески и волатильность показывают активность, направление ими не подтверждается.
 first_trade_price и last_trade_price — наблюдавшиеся сделки на границах текущего окна,
 используй их для контекста реакции цены. Для направления сопоставь поток с независимым
 фактором, например с реакцией цены или стаканом.
@@ -40,6 +42,8 @@ SCHEMA = {
 GROUPS = {
     "first_trade_price": "price_action", "last_trade_price": "price_action",
     "cvd": "flow", "ofi": "flow", "volume": "flow", "trade_count": "flow",
+    "trade_rate": "flow", "activity_ratio": "flow",
+    "natr": "volatility", "range_ratio": "volatility",
     "imbalance": "book", "spread": "book", "best_bid": "book", "best_ask": "book",
 }
 
@@ -100,7 +104,7 @@ def validate(raw, snapshot):
             arg["reason"] = clean_text(arg["reason"])
     if reply["direction"] in DIRECTIONAL:
         groups = {GROUPS.get(arg["metric"], arg["metric"]) for arg in reply["arguments"]}
-        if "price" not in usable or len(groups) < 2 or "flow" not in groups:
+        if "price" not in usable or "flow" not in groups or not groups.intersection({"price_action", "book"}):
             raise ValueError("Model supplied insufficient directional evidence")
     if reply["direction"] == "NEUTRAL" and not reply["arguments"]:
         raise ValueError("Model supplied no evidence for neutrality")

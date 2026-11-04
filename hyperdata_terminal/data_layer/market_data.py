@@ -184,10 +184,12 @@ class MarketData:
         async with self._managed_session() as session:
             data = await self._post(session, {
                 "type": "candleSnapshot",
-                "coin": symbol.upper(),
-                "interval": timeframe,
-                "startTime": start_ms,
-                "endTime": now_ms,
+                "req": {
+                    "coin": symbol if symbol in self.assets else symbol.upper(),
+                    "interval": timeframe,
+                    "startTime": start_ms,
+                    "endTime": now_ms,
+                },
             })
 
         if not isinstance(data, list):
@@ -203,6 +205,7 @@ class MarketData:
                     "low": float(c.get("l", 0)),
                     "close": float(c.get("c", 0)),
                     "volume": float(c.get("v", 0)),
+                    "trade_count": c.get("n"),
                 })
             except (TypeError, ValueError, AttributeError):
                 logger.debug("Dropped malformed candle: %.100s", c)
