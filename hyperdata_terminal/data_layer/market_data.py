@@ -36,6 +36,8 @@ class MarketData:
 
     def __init__(self) -> None:
         self.assets: dict[str, AssetInfo] = {}
+        self.observed_fields: dict[str, set[str]] = {}
+        self.observed_at = 0.0
         self.last_update: float = 0.0
         self._cache_ttl: float = 1.0  # 1 second (was 5 — too stale for trading)
         self._semaphore = asyncio.Semaphore(MAX_REQUESTS_PER_SECOND)
@@ -56,6 +58,7 @@ class MarketData:
         universe = meta.get("universe", [])
 
         assets: dict[str, AssetInfo] = {}
+        observed_fields: dict[str, set[str]] = {}
         for asset_meta, ctx in zip(universe, asset_ctxs):
             symbol = asset_meta.get("name", "")
             if not symbol:
@@ -95,11 +98,21 @@ class MarketData:
                     index_price=oracle_px,
                     premium_pct=premium_pct,
                 )
+                observed_fields[symbol] = {
+                    name for name, raw in {
+                        "price": ("markPx",),
+                        "volume_24h": ("dayNtlVlm",),
+                        "funding_rate": ("funding",),
+                        "open_interest": ("openInterest", "markPx"),
+                    }.items() if all(field in ctx for field in raw)
+                }
             except (ValueError, TypeError) as exc:
                 logger.debug("Skipping %s: %s", symbol, exc)
 
         self.assets = assets
+        self.observed_fields = observed_fields
         self.last_update = time.monotonic()
+        self.observed_at = time.time()
         logger.info("Refreshed market data for %d assets", len(assets))
 
     async def get_asset(self, symbol: str) -> AssetInfo:

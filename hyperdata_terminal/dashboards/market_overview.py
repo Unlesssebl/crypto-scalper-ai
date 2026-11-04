@@ -116,12 +116,14 @@ class MarketOverviewDashboard:
         market_data: MarketData | None = None,
         demo: bool = False,
         refresh_rate: int = 10,
+        asset_reader=None,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
         self.demo = demo
         self.cycle = 0
         self.refresh_rate = refresh_rate
+        self.asset_reader = asset_reader
         self.assets: list[AssetInfo] = []
         self.last_update: float = 0.0
         self.update_error: str | None = None
@@ -408,6 +410,11 @@ class MarketOverviewDashboard:
 
     async def update_data(self) -> None:
         """Fetch new data or generate mock data."""
+        if self.asset_reader is not None:
+            self.assets = self.asset_reader()
+            self.last_update = time.time()
+            return
+
         if self.demo:
             self.assets = generate_mock_assets(n=25)
             self.last_update = time.time()

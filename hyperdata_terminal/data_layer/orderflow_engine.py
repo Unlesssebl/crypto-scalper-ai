@@ -277,8 +277,9 @@ class OrderFlowEngine:
     """Connects to Hyperliquid WS, ingests trades, and maintains per-symbol
     per-timeframe CVD / OFI buckets."""
 
-    def __init__(self, symbols: list[str] | None = None) -> None:
+    def __init__(self, symbols: list[str] | None = None, *, include_binance: bool = True) -> None:
         self.symbols: list[str] = symbols or list(DEFAULT_SYMBOLS)
+        self.include_binance = include_binance
         self.timeframes: dict[str, int] = dict(TIMEFRAME_WINDOWS)
 
         # symbol -> timeframe -> bucket
@@ -646,10 +647,11 @@ class OrderFlowEngine:
             asyncio.create_task(self._run_forever(i), name=f"orderflow-hl-{i}")
             for i in range(len(shards))
         ]
-        self._binance_task = asyncio.create_task(self._binance_trade_loop(), name="orderflow-binance")
+        if self.include_binance:
+            self._binance_task = asyncio.create_task(self._binance_trade_loop(), name="orderflow-binance")
         logger.info(
-            "OrderFlowEngine started for %d symbols: Hyperliquid on %d sockets of <=%d subscriptions + Binance",
-            len(self.symbols), len(shards), HL_SUBSCRIPTIONS_PER_SOCKET,
+            "OrderFlowEngine started for %d symbols: Hyperliquid on %d sockets of <=%d subscriptions (Binance enabled: %s)",
+            len(self.symbols), len(shards), HL_SUBSCRIPTIONS_PER_SOCKET, self.include_binance,
         )
 
     async def stop(self) -> None:
@@ -686,6 +688,17 @@ class OrderFlowEngine:
         self._hl_tasks = []
         self._binance_task = None
         logger.info("OrderFlowEngine stopped")
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def hyperliquid_connected_at(self, symbol: str) -> float:
+        """Start of the current connection for this symbol, or zero."""
+        for index, symbols in enumerate(self._hl_shard_plan):
+            if symbol in symbols:
+                return self._hl_shard_state[index].connected_at
+        return 0.0
 
     def on_trade(self, callback: Callable[[Trade], None]) -> None:
         """Register a callback invoked for every incoming trade."""

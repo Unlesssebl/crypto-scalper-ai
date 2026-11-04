@@ -1,3 +1,5 @@
+> **Crypto Scalper AI** · [Установка, запуск и архитектура](docs/crypto-scalper.md)
+
 <div align="center">
 
 # HyperData Terminal

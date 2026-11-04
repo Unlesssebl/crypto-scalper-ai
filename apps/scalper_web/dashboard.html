@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crypto Scalper AI</title>
+<style>
+:root{color-scheme:dark;--bg:#10171b;--panel:#172127;--line:#304149;--muted:#a6b7bf;--accent:#7cdec3}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eef4f5;font:15px system-ui,sans-serif}
+main{max-width:1600px;margin:auto;padding:clamp(16px,4vw,54px)}
+header{margin-bottom:30px}h1{margin:8px 0;font-size:clamp(28px,5vw,49px)}h2{font-size:23px}h3{font-size:17px}
+.kicker{color:var(--accent);letter-spacing:.1em;font-size:12px;font-weight:700}
+p,.muted{color:var(--muted);line-height:1.5}.toolbar{display:flex;gap:15px;align-items:end;flex-wrap:wrap;margin:20px 0}
+label{display:grid;gap:6px;color:var(--muted)}input,select,button{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:8px 10px}
+button{cursor:pointer}button:hover,button:focus-visible{border-color:var(--accent)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:auto}
+table{width:100%;border-collapse:collapse;text-align:left;font-variant-numeric:tabular-nums}
+th,td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{white-space:nowrap;color:var(--muted);font-size:13px}
+th button,td button{border:0;padding:0;text-align:left;background:none;color:inherit;text-decoration:underline;text-underline-offset:3px}
+td:last-child{min-width:175px}td.symbol{color:var(--accent);font-weight:700}.bull{color:#8ce7c2}.bear{color:#ffad9d}.warn{color:#f4cd83}
+.detail{padding:18px;margin-top:24px}.detail[hidden]{display:none}details{margin:10px 0;border-top:1px solid var(--line);padding-top:12px}
+summary{cursor:pointer}pre{overflow:auto;font-size:13px;white-space:pre-wrap}small{color:var(--muted)}.notes{max-width:850px}
+</style>
+</head>
+<body><main>
+<header><div class="kicker">HYPERDATA TERMINAL / HYPERLIQUID PERPETUALS</div>
+<h1>Crypto Scalper AI</h1>
+<p>Топ-20 по объёму за 24 часа. Выберите инструмент, чтобы увидеть источники данных и историю оценок.</p>
+<p id="status" role="status">Подключение к HyperData…</p></header>
+<section aria-label="Фильтры" class="toolbar">
+<label>Окно<select id="window"><option>1m</option><option>5m</option></select></label>
+<label>Инструмент<input id="search" type="search" placeholder="Например, BTC"></label>
+<label>Последний Consensus<select id="filter"><option value="">Все</option></select></label>
+<button id="refresh" type="button">Обновить</button>
+</section>
+<div class="panel"><table aria-label="Рыночный скринер">
+<thead id="head"></thead><tbody id="rows"></tbody></table></div>
+<p class="notes">HyperData в таблице показывает текущий Order Flow. Gemini и Consensus относятся к последнему сохранённому событию, время которого указано рядом с выводом.</p>
+<section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const categories = ["CONSENSUS_LONG","CONSENSUS_SHORT","DIVERGENCE","HYPERDATA_ONLY","AI_ONLY","NEUTRAL","INSUFFICIENT_DATA"];
+for (const category of categories) $("filter").add(new Option(category, category));
+const number = new Intl.NumberFormat("ru-RU", {maximumSignificantDigits: 6});
+const stamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU") : "—";
+const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
+let data = [], symbol = "", sort = "volume_24h", ascending = false, generation = 0;
+let detailGeneration = 0;
+const columns = [
+  ["symbol","Инструмент"],["price","Mark, USD"],["volume_24h","24h, USD"],
+  ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
+  ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
+  ["ai","Gemini"],["category","Consensus"],["quality","Данные"],["summary","Комментарий"],
+];
+const tableRow = document.createElement("tr");
+for (const [key,label] of columns) {
+  const th = tableRow.appendChild(document.createElement("th"));
+  th.scope = "col";
+  const button = th.appendChild(document.createElement("button"));
+  button.textContent = label;
+  button.onclick = () => { ascending = sort === key ? !ascending : key === "symbol"; sort = key; render(); };
+}
+$("head").append(tableRow);
+
+function display(row) {
+  const {snapshot, hyperdata, latest} = row, {metrics} = snapshot;
+  const current = Object.fromEntries(Object.entries(metrics).map(([key, item]) => [
+    key, ["ok", "synthetic"].includes(item.quality) ? item.value : null,
+  ]));
+  return {...current, symbol:snapshot.symbol, native:hyperdata.direction,
+    ai:latest?.ai?.direction ?? latest?.ai?.status,
+    category:latest?.consensus?.category, quality:metrics.ofi.quality + " / " + metrics.price.quality,
+    summary:latest?.ai?.summary, captured:latest?.captured_at};
+}
+
+function node(tag, text, parent) {
+  const element = document.createElement(tag);
+  if (text !== null) element.textContent = text;
+  if (parent) parent.appendChild(element);
+  return element;
+}
+
+function render() {
+  const query = $("search").value.trim().toUpperCase(), filter = $("filter").value;
+  const rows = data.map(display).filter(row => row.symbol.includes(query) && (!filter || row.category === filter));
+  rows.sort((a,b) => {
+    const x = a[sort], y = b[sort];
+    if (x == null || y == null) return (x == null) - (y == null);
+    const order = typeof x === "number" ? x-y : String(x).localeCompare(String(y));
+    return ascending ? order : -order;
+  });
+  for (const [index,[key]] of columns.entries()) {
+    tableRow.cells[index].setAttribute("aria-sort", sort === key ? (ascending ? "ascending" : "descending") : "none");
+  }
+  $("rows").replaceChildren();
+  if (!rows.length) node("td", "Нет строк для выбранных условий.", node("tr", null, $("rows"))).colSpan = columns.length;
+  for (const row of rows) {
+    const tr = node("tr", null, $("rows"));
+    for (const [key] of columns) {
+      const td = node("td", null, tr);
+      if (key === "symbol") {
+        td.className = "symbol";
+        node("button", row.symbol, td).onclick = () => {
+          symbol = row.symbol;
+          loadDetail();
+          $("detail").scrollIntoView({block:"nearest"});
+        };
+      } else {
+        const shown = row[key];
+        td.textContent = value(shown);
+        if (["BULLISH","CONSENSUS_LONG"].includes(shown)) td.className = "bull";
+        if (["BEARISH","CONSENSUS_SHORT"].includes(shown)) td.className = "bear";
+        if (shown === "DIVERGENCE") td.className = "warn";
+        if (key === "category" && row.captured) node("div", stamp(row.captured), td).className = "muted";
+      }
+    }
+  }
+}
+
+async function request(path) {
+  const result = await fetch(path, {cache:"no-store", signal:AbortSignal.timeout(4500)});
+  if (!result.ok) throw new Error("HTTP " + result.status);
+  return result.json();
+}
+
+async function loadDetail() {
+  const sequence = ++detailGeneration, detail = $("detail");
+  if (!symbol) return;
+  const selected = symbol, window = $("window").value;
+  detail.hidden = false;
+  try {
+    const row = await request("/v1/scalper/" + encodeURIComponent(selected) + "?window=" + window);
+    if (sequence !== detailGeneration) return;
+    detail.replaceChildren();
+    node("button", "Закрыть", detail).onclick = () => { symbol = ""; ++detailGeneration; detail.hidden = true; };
+    node("h2", row.snapshot.contract + " · " + window, detail);
+    node("p", "Снимок " + stamp(row.snapshot.captured_at) + " · " + row.hyperdata.direction, detail);
+    const table = node("table", null, detail);
+    const header = node("tr", null, node("thead", null, table));
+    for (const label of ["Метрика","Значение","Источник","Обновлено","Качество"]) node("th",label,header);
+    const body = node("tbody", null, table);
+    for (const [name, item] of Object.entries(row.snapshot.metrics)) {
+      const tr = node("tr",null,body);
+      for (const text of [name, value(item.value) + (item.value == null ? "" : " " + item.unit),
+          item.source, stamp(item.updated_at), item.quality]) node("td",text,tr);
+    }
+    if (row.book) {
+      const book = node("details", null, detail);
+      node("summary", "Уровни стакана · " + stamp(row.book.timestamp), book);
+      for (const [key, label] of [["bids","Покупка"],["asks","Продажа"]]) {
+        node("p", label + " · цена × размер", book);
+        node("pre", row.book[key].slice(0,10).map(level => value(level.price) + " × " + value(level.size)).join("\n"), book);
+      }
+    }
+    node("h3", "Последние события", detail);
+    if (!row.history.length) node("p", "Событий пока нет.", detail);
+    for (const event of row.history) {
+      const item = node("details", null, detail), ai = event.ai;
+      node("summary", stamp(event.captured_at) + " · " + (event.consensus?.category ?? event.delivery), item);
+      node("p", "HyperData " + event.hyperdata.direction + " · Gemini " +
+        (ai?.direction ?? ai?.status ?? "—") + " · " + (event.consensus?.overlap ?? "—"), item);
+      if (ai?.summary) {
+        node("p", ai.summary, item);
+        for (const [key, title] of [["arguments","Аргументы"],["contradictions","Противоречия"]]) {
+          if (ai[key].length) {
+            node("strong", title, item);
+            const list = node("ul", null, item);
+            for (const arg of ai[key]) node("li", arg.metric + " — " + arg.reason, list);
+          }
+        }
+        for (const [key,label] of [["scenario","Сценарий"],["invalidation","Отмена гипотезы"],["watch","Наблюдение"]]) {
+          node("p", label + " — " + ai[key], item);
+        }
+      }
+      node("p", "Telegram " + event.delivery + " · Mark после события " + event.observations.map(o =>
+        o.minutes + "m " + (o.status === "observed" ? value(o.price) + " (" + stamp(o.observed_at) + ")" : o.status)).join(" / "), item);
+    }
+  } catch (error) {
+    if (sequence !== detailGeneration) return;
+    detail.replaceChildren();
+    node("button", "Закрыть", detail).onclick = () => { symbol = ""; ++detailGeneration; detail.hidden = true; };
+    node("p", "Карточка недоступна: " + error.message, detail);
+  }
+}
+
+async function refresh() {
+  const sequence = ++generation;
+  try {
+    const result = await request("/v1/scalper?window=" + $("window").value);
+    if (sequence !== generation) return;
+    data = result.rows;
+    $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
+      " · Gemini " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
+    render();
+  } catch (error) {
+    if (sequence === generation) $("status").textContent = "Обновление недоступно · " + error.message;
+  }
+}
+$("window").onchange = () => { data = []; render(); refresh(); loadDetail(); };
+$("refresh").onclick = () => { refresh(); loadDetail(); };
+$("search").oninput = $("filter").onchange = render;
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body></html>

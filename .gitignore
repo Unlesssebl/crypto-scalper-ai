@@ -25,3 +25,7 @@ venv/
 *.bak
 .venv-verify/
 .gstack/
+
+.runtime/
+*.sqlite-wal
+*.sqlite-shm

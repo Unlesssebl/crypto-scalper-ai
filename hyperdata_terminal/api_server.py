@@ -440,6 +440,7 @@ class HyperDataAPI:
         for path in legacy_paths:
             app.router.add_get(path, self._make_redirect(f"/v1{path}"))
 
+        self.add_routes(app)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
@@ -452,6 +453,9 @@ class HyperDataAPI:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ws-heartbeat")
 
         logger.info("API v1 server started on http://%s:%d", self.host, self.port)
+
+    def add_routes(self, app: web.Application) -> None:
+        """Allow local applications to extend the API under the same middleware."""
 
     async def stop(self) -> None:
         if self._heartbeat_task:

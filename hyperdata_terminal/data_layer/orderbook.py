@@ -118,7 +118,7 @@ class OrderBookEngine:
     # ── Public API ───────────────────────────────────────────────
 
     def get_snapshot(self, symbol: str) -> OrderBookSnapshot | None:
-        snap = self.snapshots.get(symbol.upper())
+        snap = self.snapshots.get(symbol) or self.snapshots.get(symbol.upper())
         if snap is not None:
             # Recompute staleness at read time so the flag keeps tracking age
             # even when no new books arrive (a frozen feed must read as stale).

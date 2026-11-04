@@ -373,23 +373,7 @@ class AlertManager:
 
         self.alerts_sent += 1
 
-        # Telegram
-        if self.telegram_token and self.telegram_chat_id:
-            try:
-                url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                async with self._session.post(url, json={
-                    "chat_id": self.telegram_chat_id,
-                    "text": message,
-                    "parse_mode": "HTML",
-                }, timeout=self._SEND_TIMEOUT) as resp:
-                    if resp.status == 200:
-                        logger.info("Telegram alert sent")
-                    else:
-                        logger.warning("Telegram send returned %d", resp.status)
-            except Exception as exc:
-                # Exception type only — aiohttp error messages can embed the
-                # request URL, which contains the bot token.
-                logger.warning("Telegram send failed: %s", type(exc).__name__)
+        await self.send_telegram(message)
 
         # Discord
         if self.discord_webhook:
@@ -412,6 +396,27 @@ class AlertManager:
         first_line = message.strip().splitlines()[0] if message.strip() else ""
         redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
         logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
+
+    async def send_telegram(self, message: str) -> bool:
+        """Send one HTML message and report Telegram's acceptance."""
+        if not self.telegram_token or not self.telegram_chat_id:
+            return False
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            async with self._session.post(url, json={
+                "chat_id": self.telegram_chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+            }, timeout=self._SEND_TIMEOUT, allow_redirects=False) as response:
+                if response.status == 200 and (await response.json()).get("ok") is True:
+                    logger.info("Telegram alert sent")
+                    return True
+                logger.warning("Telegram send returned %d", response.status)
+        except Exception as exc:
+            logger.warning("Telegram send failed: %s", type(exc).__name__)
+        return False
 
     async def send_test(self) -> bool:
         """Send a test alert to verify configuration."""
