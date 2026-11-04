@@ -5,6 +5,7 @@ import sqlite3
 from statistics import median
 
 from .audit import audit_report
+from .shadow import VARIANTS
 
 HORIZONS = (1, 5, 15)
 PERIOD_SECONDS = 24 * 60 * 60
@@ -54,9 +55,9 @@ def attempt(row):
     if row["status"] == "ok":
         return {"BULLISH": "directional", "BEARISH": "directional",
                 "NEUTRAL": "neutral", "INSUFFICIENT_DATA": "insufficient"}.get(row["direction"], "error")
-    if row["status"] in ("expired", "unconfigured", "insufficient_market_data"):
+    if row["status"] in ("expired", "unconfigured", "insufficient_market_data", "facts_only"):
         return "skipped"
-    if row["status"] is None and row["delivery"] == "pending":
+    if row["status"] is None and row["effective_delivery"] == "pending":
         return "pending"
     return "error"
 
@@ -111,14 +112,17 @@ def calculate_quality(path, now, windows):
         db.row_factory = sqlite3.Row
         rows = db.execute("""
             SELECT a.id, a.window, a.delivery, a.event, a.analyzed_at,
-                   json_extract(a.ai, '$.status') AS status,
+                   CASE WHEN a.ai IS NULL AND f.event_id IS NOT NULL AND a.captured_at <= ? THEN 'facts_only'
+                        ELSE json_extract(a.ai, '$.status') END AS status,
+                   CASE WHEN a.ai IS NULL AND f.event_id IS NOT NULL THEN 'pending' ELSE a.delivery END AS effective_delivery,
                    json_extract(a.ai, '$.direction') AS direction,
                    CASE WHEN json_extract(a.snapshot, '$.metrics.price.quality') = 'ok'
                         THEN json_extract(a.snapshot, '$.metrics.price.value') END AS start_price,
                    o.minutes, o.price AS end_price, o.status AS observation
             FROM analyses a LEFT JOIN observations o ON o.event_id = a.id
+            LEFT JOIN fact_messages f ON f.event_id = a.id
             WHERE a.captured_at BETWEEN ? AND ?
-        """, (since, now))
+        """, (now - 150, since, now))
         events = {}
         for row in rows:
             window = results.get(row["window"])
@@ -144,6 +148,14 @@ def calculate_quality(path, now, windows):
                     target["horizons"][row["minutes"]][result] += 1
         experiments = context_quality(db, since, now, windows)
         audit = audit_report(db, since, now, windows)
+        shadow = {window: {variant: {} for variant in VARIANTS} for window in windows}
+        for row in db.execute("""
+            SELECT window,variant,status,COUNT(*) AS count FROM shadow_findings
+            WHERE detected_at BETWEEN ? AND ? GROUP BY window,variant,status
+        """, (since, now)):
+            if row["window"] in shadow:
+                counts = shadow[row["window"]].setdefault(row["variant"], {})
+                counts[row["status"]] = row["count"]
     for window in results.values():
         for target in (window, *window["triggers"].values()):
             for counts in target["horizons"].values():
@@ -153,4 +165,4 @@ def calculate_quality(path, now, windows):
             group["median_delay_seconds"] = round(median(delays), 1) if delays else None
             group["delay_samples"] = len(delays)
     return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS,
-            "context_experiment": experiments, "finding_audit": audit}
+            "context_experiment": experiments, "finding_audit": audit, "shadow": shadow}

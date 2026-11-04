@@ -398,7 +398,7 @@ class AlertManager:
         logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
 
     async def send_telegram(self, message: str, *, rich_html: str | None = None,
-                            copy_text: str | None = None) -> bool:
+                            copy_text: str | None = None, return_message: bool = False):
         """Send a Telegram alert, with HTML fallback on explicit Rich Message rejection."""
         if not self.telegram_token or not self.telegram_chat_id:
             return False
@@ -420,9 +420,13 @@ class AlertManager:
                     url, json={"chat_id": self.telegram_chat_id, **payload},
                     timeout=self._SEND_TIMEOUT, allow_redirects=False,
                 ) as response:
-                    if response.status == 200 and (await response.json()).get("ok") is True:
-                        logger.info("Telegram alert sent")
-                        return True
+                    if response.status == 200:
+                        result = await response.json()
+                        if result.get("ok") is True:
+                            logger.info("Telegram alert sent")
+                            if return_message:
+                                return ((result.get("result") or {}).get("message_id"), method == "sendRichMessage")
+                            return True
                     if (method == "sendRichMessage" and response.status in (400, 404)
                             and (await response.json()).get("ok") is False):
                         logger.info("Telegram rejected rich alert (%d), using HTML", response.status)
@@ -432,6 +436,27 @@ class AlertManager:
         except Exception as exc:
             logger.warning("Telegram send failed: %s", type(exc).__name__)
         return False
+
+    async def edit_telegram(self, message_id, message, *, rich_html=None, copy_text=None):
+        if not self._session or not self.telegram_token or not self.telegram_chat_id:
+            return False
+        payload = {"chat_id": self.telegram_chat_id, "message_id": message_id}
+        if rich_html is not None:
+            payload["rich_message"] = {"html": rich_html}
+        else:
+            payload.update(text=message, parse_mode="HTML", link_preview_options={"is_disabled": True})
+            if copy_text:
+                payload["reply_markup"] = {"inline_keyboard": [[{
+                    "text": "Копировать фьючерс", "copy_text": {"text": copy_text},
+                }]]}
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/editMessageText"
+            async with self._session.post(url, json=payload, timeout=self._SEND_TIMEOUT,
+                                          allow_redirects=False) as response:
+                return response.status == 200 and (await response.json()).get("ok") is True
+        except Exception as exc:
+            logger.warning("Telegram edit failed: %s", type(exc).__name__)
+            return False
 
     async def send_test(self) -> bool:
         """Send a test alert to verify configuration."""

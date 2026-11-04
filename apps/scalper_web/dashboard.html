@@ -70,6 +70,11 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <table aria-label="Движение по задержке доставки">
 <thead><tr><th>Задержка</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / без данных</th></tr></thead>
 <tbody id="finding-delay"></tbody></table>
+<h3>Теневые пороги</h3>
+<p>Движение ≥ NATR за 5 минут после обнаружения. Теневые находки не отправляются.</p>
+<table aria-label="Теневые пороги">
+<thead><tr><th>Вариант</th><th>Находки</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / нет данных</th></tr></thead>
+<tbody id="shadow-outcomes"></tbody></table>
 <small id="quality-updated"></small>
 </details>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
@@ -89,7 +94,7 @@ const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
 let data = [], symbol = "", sort = "strengthRank", ascending = false, generation = 0;
 let detailGeneration = 0;
 const allColumns = [
-  ["symbol","Инструмент"],["strengthRank","Сила находки"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
+  ["symbol","Инструмент"],["strengthRank","Сила находки"],["movementPhase","Фаза движения"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
   ["trade_rate","Сделок/с"],["trade_count","Сделок"],["natr","NATR, %"],["btcCorrelation","Корр. с BTC"],["anomalies","Всплески"],
   ["volume_24h","24h, USD"],["range_ratio","Диапазон к ATR"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
@@ -146,7 +151,8 @@ function display(row) {
   const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
     : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
   return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes, strength:row.strength,
-    strengthRank:row.strength?.rank ?? 0, btcCorrelation:row.btc_context?.correlation,
+    strengthRank:row.strength?.rank ?? 0, movementPhase:row.movement_phase?.label,
+    movement:row.movement_phase, btcCorrelation:row.btc_context?.correlation,
     anomalies: anomalies.map(name => ({tape_burst:"Лента", range_burst:"Диапазон"})[name]).join(" · ") || null,
     ai:assessment?.ai.direction, category:assessment?.consensus.category,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
@@ -207,6 +213,10 @@ function render() {
           loadDetail();
           $("detail").scrollIntoView({block:"nearest"});
         };
+      } else if (key === "movementPhase") {
+        node("strong", row.movementPhase ?? "—", td);
+        const context = movementDetails(row.movement);
+        if (context) node("small", context, td);
       } else if (key === "strengthRank") {
         node("strong", row.strength ? row.strength.icon + " " + row.strength.label : "—", td);
         for (const reason of row.strength?.reasons ?? []) node("small", reason, td);
@@ -270,6 +280,13 @@ function showProfile(profile, detail) {
   }
 }
 
+function movementDetails(phase) {
+  if (phase?.started_at == null) return "";
+  const distance = phase.distance_natr == null ? "NATR на старте недоступен"
+    : value(phase.distance_natr) + " NATR от начала";
+  return distance + " · " + phase.age_seconds + " с";
+}
+
 async function loadDetail() {
   const sequence = ++detailGeneration, detail = $("detail");
   if (!symbol) return;
@@ -285,6 +302,14 @@ async function loadDetail() {
     if (row.strength) {
       node("p", row.strength.icon + " Сила находки — " + row.strength.label, detail);
       if (row.strength.reasons.length) node("p", row.strength.reasons.join(" · "), detail);
+    }
+    if (row.movement_phase) {
+      const phase = row.movement_phase;
+      node("p", "Фаза движения — " + phase.label, detail);
+      if (phase.started_at != null) {
+        node("p", "Начало " + stamp(phase.started_at) + " · цена " + value(phase.start_price)
+          + " · " + movementDetails(phase), detail);
+      }
     }
     node("h3", "Что происходит", detail);
     const facts = node("ul", null, detail);
@@ -333,8 +358,10 @@ async function loadDetail() {
     for (const event of row.history) {
       const item = node("details", null, detail), ai = event.ai;
       const rank = event.event.strength;
+      const phase = event.event.movement_phase;
       node("summary", stamp(event.captured_at) + " · " + (rank ? rank.icon + " " + rank.label
         : (event.consensus?.category ?? event.delivery)), item);
+      if (phase) node("p", "Фаза: " + phase.label + (movementDetails(phase) ? " · " + movementDetails(phase) : ""), item);
       node("p", "HyperData " + event.hyperdata.direction + " · AI " +
         (ai?.direction ?? ai?.status ?? "—") + " · " + (event.consensus?.overlap ?? "—"), item);
       const context15m = event.snapshot.context_15m;
@@ -377,6 +404,7 @@ function renderQuality(report) {
   $("quality-triggers").replaceChildren();
   renderContextExperiment(report?.context_experiment?.[window]);
   renderFindingAudit(report?.finding_audit?.[window]);
+  renderShadow(report?.shadow?.[window]);
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
     $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
@@ -478,6 +506,19 @@ function renderFindingAudit(audit) {
       node("td", (group.pending ?? 0) + " / " + ((group.missing ?? 0) + (group.no_natr ?? 0)), row);
       node("td", value(group.median_delay_seconds) + " с", row);
     }
+  }
+}
+
+function renderShadow(variants) {
+  const body = $("shadow-outcomes");
+  body.replaceChildren();
+  for (const [name, counts] of Object.entries(variants ?? {})) {
+    const row = node("tr", null, body);
+    node("th", name, row).scope = "row";
+    node("td", Object.values(counts).reduce((sum, value) => sum + value, 0), row);
+    node("td", counts.hit ?? 0, row);
+    node("td", counts.quiet ?? 0, row);
+    node("td", (counts.pending ?? 0) + " / " + (counts.missing ?? 0), row);
   }
 }
 

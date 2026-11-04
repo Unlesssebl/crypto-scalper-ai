@@ -31,7 +31,12 @@ OI, funding и стакан по отдельности не задают нап
 Формулируй сценарий как гипотезу.
 Проверяй разные роли метрик: движение цены, направленный поток, интенсивность, волатильность и ликвидность.
 Не считай несколько метрик одной роли отдельными подтверждениями.
-context_1m описывает текущий импульс; context_5m даёт более широкий поток.
+context_1m описывает текущий импульс; context_5m даёт более широкий контекст.
+flow_quality отдельно показывает доступность OFI и CVD. При статусе, отличном от ok,
+не делай вывод о направлении или нейтральности потока этого окна.
+movement_context содержит наблюдаемые возраст, расстояние и откат от максимума в NATR.
+Положительное расстояние означает движение по наблюдаемому импульсу. Null означает неизвестное значение.
+Учитывай, сколько движение уже прошло; отсутствие наблюдаемого начала не означает ранний импульс.
 context_15m содержит фон по закрытым свечам: изменение за четыре свечи, их диапазон и положение последнего закрытия.
 Если окна заметно расходятся, объясни это; старшее окно не отменяет автоматически краткий импульс.
 Если есть btc_context, сравни последнюю закрытую свечу инструмента с BTC.
@@ -77,9 +82,15 @@ def blind_payload(snapshot):
             key: context[key] for key in ("reference", "window", "samples", "updated_at", "correlation",
                                           "btc_last_return_pct", "asset_last_return_pct", "relative_last_return_pp")
         }
+    if movement := snapshot.get("movement_context"):
+        payload["movement_context"] = {field: movement[field] for field in
+                                       ("status", "age_seconds", "distance_natr", "retracement_natr", "natr_at_start")
+                                       if field in movement}
     for key in ("context_1m", "context_5m", "context_15m"):
         if context := snapshot.get(key):
             payload[key] = {field: context[field] for field in ("window", "captured_at", "metrics")}
+            if "flow_quality" in context:
+                payload[key]["flow_quality"] = context["flow_quality"]
     return payload
 
 

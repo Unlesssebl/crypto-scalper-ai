@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS finding_candidates (
     decision TEXT NOT NULL, analysis_id TEXT UNIQUE REFERENCES analyses(id)
 );
 CREATE INDEX IF NOT EXISTS finding_candidates_detected ON finding_candidates(detected_at);
+CREATE TABLE IF NOT EXISTS fact_messages (
+    event_id TEXT PRIMARY KEY REFERENCES analyses(id), message_id INTEGER,
+    rich INTEGER NOT NULL DEFAULT 0, edit_status TEXT
+);
 CREATE TABLE IF NOT EXISTS finding_decisions (
     candidate_id TEXT REFERENCES finding_candidates(id), at REAL NOT NULL, decision TEXT NOT NULL
 );
@@ -60,6 +64,15 @@ CREATE TABLE IF NOT EXISTS quiet_moves (
 );
 CREATE INDEX IF NOT EXISTS quiet_moves_pending ON quiet_moves(slot) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS quiet_moves_time ON quiet_moves(delivered_at);
+CREATE TABLE IF NOT EXISTS shadow_findings (
+    variant TEXT NOT NULL, symbol TEXT NOT NULL, window TEXT NOT NULL, detected_at REAL NOT NULL,
+    rank INTEGER NOT NULL, target_pct REAL NOT NULL, snapshot TEXT NOT NULL,
+    anchor_price REAL, last_at REAL, peak_pct REAL, gap INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(variant,symbol,window,detected_at)
+);
+CREATE INDEX IF NOT EXISTS shadow_findings_pending ON shadow_findings(detected_at) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS shadow_findings_time ON shadow_findings(detected_at);
 CREATE TABLE IF NOT EXISTS telegram_offsets (
     bot_id INTEGER PRIMARY KEY, next_update INTEGER NOT NULL
 );
@@ -121,23 +134,54 @@ class Journal:
         with self.db:
             changed = self.db.execute(
                 "UPDATE finding_candidates SET decision=?,analysis_id=COALESCE(?,analysis_id) "
-                "WHERE id=? AND decision<>?", (decision, analysis_id, key, decision),
+                "WHERE id=? AND decision<>? AND decision<>'delivered'", (decision, analysis_id, key, decision),
             ).rowcount
             if changed:
                 self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)", (key, now, decision))
 
+    def register_fact_message(self, key, snapshot, event, native):
+        with self.db:
+            if not self._record(key, event, snapshot, native):
+                return False
+            self.db.execute("INSERT INTO fact_messages(event_id) VALUES(?)", (key,))
+            self.db.execute("UPDATE finding_candidates SET analysis_id=? WHERE id=?", (key, key))
+        return True
+
+    def fact_message(self, key):
+        row = self.db.execute(
+            "SELECT a.*, f.message_id, f.rich, f.edit_status "
+            "FROM fact_messages f JOIN analyses a ON a.id=f.event_id WHERE f.event_id=?", (key,),
+        ).fetchone()
+        return self.decode(row) if row else None
+
+    def fact_message_sent(self, key, message_id, rich):
+        with self.db:
+            self.db.execute("UPDATE fact_messages SET message_id=?,rich=? WHERE event_id=?",
+                            (message_id, rich, key))
+
+    def fact_message_edit(self, key, state):
+        with self.db:
+            self.db.execute("UPDATE fact_messages SET edit_status=? WHERE event_id=?", (state, key))
+
+    def save_fact_analysis_input(self, key, snapshot):
+        with self.db:
+            self.db.execute("UPDATE analyses SET snapshot=? WHERE id=?", (dump(snapshot), key))
+
     def record(self, key, event, snapshot, hyperdata):
         with self.db:
-            inserted = self.db.execute(
-                "INSERT OR IGNORE INTO analyses(id,symbol,window,captured_at,event,snapshot,hyperdata)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (key, snapshot["symbol"], snapshot["window"], snapshot["captured_at"],
-                 dump(event), dump(snapshot), dump(hyperdata)),
-            ).rowcount
-            if inserted:
-                self.db.executemany("INSERT INTO observations(event_id,minutes,due_at) VALUES(?,?,?)", (
-                    (key, minutes, snapshot["captured_at"] + 60 * minutes) for minutes in (1, 5, 15)
-                ))
+            return self._record(key, event, snapshot, hyperdata)
+
+    def _record(self, key, event, snapshot, hyperdata):
+        inserted = self.db.execute(
+            "INSERT OR IGNORE INTO analyses(id,symbol,window,captured_at,event,snapshot,hyperdata)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (key, snapshot["symbol"], snapshot["window"], snapshot["captured_at"],
+             dump(event), dump(snapshot), dump(hyperdata)),
+        ).rowcount
+        if inserted:
+            self.db.executemany("INSERT INTO observations(event_id,minutes,due_at) VALUES(?,?,?)", (
+                (key, minutes, snapshot["captured_at"] + 60 * minutes) for minutes in (1, 5, 15)
+            ))
         return bool(inserted)
 
     def finish(self, key, ai, consensus, now):
@@ -250,6 +294,26 @@ class Journal:
                         (*state, row["symbol"], row["window"], row["slot"]),
                     )
 
+            for row in self.db.execute(
+                "SELECT *,detected_at AS delivered_at FROM shadow_findings WHERE status='pending'"
+            ).fetchall():
+                state = update_move(row, now, prices.get(row["symbol"]))
+                previous = tuple(row[key] for key in ("anchor_price", "last_at", "peak_pct", "gap", "status"))
+                if state != previous:
+                    self.db.execute(
+                        "UPDATE shadow_findings SET anchor_price=?,last_at=?,peak_pct=?,gap=?,status=? "
+                        "WHERE variant=? AND symbol=? AND window=? AND detected_at=?",
+                        (*state, row["variant"], row["symbol"], row["window"], row["detected_at"]),
+                    )
+
+    def record_shadow_findings(self, findings):
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO shadow_findings(variant,symbol,window,detected_at,rank,target_pct,snapshot) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ((*row[:-1], dump(row[-1])) for row in findings),
+            )
+
     def record_quiet_moves(self, samples):
         with self.db:
             self.db.executemany(
@@ -265,6 +329,7 @@ class Journal:
         with self.db:
             self.db.execute("DELETE FROM instrument_samples WHERE slot < ?", (before,))
             self.db.execute("DELETE FROM quiet_moves WHERE delivered_at < ?", (before,))
+            self.db.execute("DELETE FROM shadow_findings WHERE detected_at < ?", (before,))
 
     def telegram_offset(self, bot_id):
         row = self.db.execute("SELECT next_update FROM telegram_offsets WHERE bot_id=?", (bot_id,)).fetchone()

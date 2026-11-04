@@ -1,9 +1,11 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from extensions.scalper.audit import RULESET
 from extensions.scalper.journal import Journal
 from extensions.scalper.quality import calculate_quality
 from extensions.scalper.service import Screener
+from extensions.scalper.shadow import ShadowDetector
 
 
 def snapshot(at, natr=1.0):
@@ -56,7 +58,7 @@ def test_rank_outcome_uses_peak_after_delivery_and_separates_missing_coverage(tm
             journal.observe(delivered + 331, {"BTC": (150, delivered + 305)})
         report = calculate_quality(path, 1250, ("1m", "5m"))["finding_audit"]["1m"]
         assert report["decisions"] == {"delivered": 3}
-        ranks = report["versions"]["finding-v2"]
+        ranks = report["versions"][RULESET]
         assert ranks[4] == {"hit": 1, "quiet": 1, "median_delay_seconds": 12}
         assert ranks[3] == {"missing": 1, "median_delay_seconds": 12}
     finally:
@@ -88,10 +90,53 @@ def test_completed_signals_match_quiet_controls_once_by_instrument_window_and_na
         journal.close()
 
 def test_weak_anomaly_does_not_generate_telegram_alert():
-    states = []
-    journal = SimpleNamespace(delivery=lambda key, state: states.append((key, state)))
-    service = Screener(None, journal, None, True)
-    service.schedule_alert("weak", snapshot(100), {"direction": "BULLISH"}, {"status": "ok"},
-                           {"anomalies": ["range_burst"], "strength": {"rank": 2}})
+    service = Screener(None, None, None, True)
+    service.enqueue_facts("weak", snapshot(100), {"direction": "BULLISH"},
+                          {"anomalies": ["range_burst"], "strength": {"rank": 2}, "detected_at": 100},
+                          {}, 100)
     assert service.notifications.empty()
-    assert states == [("weak", "below_strength")]
+
+
+def test_shadow_variants_use_same_snapshot_and_do_not_repeat_an_active_finding(tmp_path):
+    snap = snapshot(100, natr=0.1)
+    for key, value in {"spread": 0.001, "activity_ratio": 1.7, "trade_count": 20,
+                       "range_ratio": 1, "first_trade_price": 100, "last_trade_price": 100.12}.items():
+        snap["metrics"][key] = {"quality": "ok", "value": value}
+    native = {"direction": "BULLISH", "native_signal": "BULLISH"}
+    tracker = ShadowDetector()
+    key = ("BTC", "1m")
+    rows = tracker.evaluate(key, snap, native)
+    assert [row[0] for row in rows] == ["Лента от 1,5×"]
+    assert tracker.evaluate(key, {**snap, "captured_at": 105}, native) == []
+    path = tmp_path / "shadow.sqlite"
+    journal = Journal(path)
+    try:
+        journal.record_shadow_findings(rows)
+        for at in range(105, 400, 10):
+            journal.observe(at, {"BTC": (100 if at == 105 else 101, at)})
+        journal.observe(431, {})
+        report = calculate_quality(path, 431, ("1m", "5m"))
+        assert report["shadow"]["1m"]["Лента от 1,5×"] == {"hit": 1}
+        assert report["finding_audit"]["1m"]["candidates"] == 0
+    finally:
+        journal.close()
+
+
+def test_fact_enqueue_does_not_require_an_ai_slot(tmp_path, monkeypatch):
+    path = tmp_path / "audit.sqlite"
+    journal = Journal(path)
+    try:
+        service = Screener(SimpleNamespace(), journal, None, True)
+        for i in range(service.jobs.maxsize):
+            service.jobs.put_nowait((i,))
+        monkeypatch.setattr("extensions.scalper.service.active_anomalies", lambda snapshot: {"tape_burst"})
+        monkeypatch.setattr("extensions.scalper.service.finding_strength", lambda *args: {"rank": 3})
+        snap = snapshot(100)
+        native = {"direction": "BULLISH", "native_signal": "STRONG_BULL", "source": "test"}
+        row = {"facts": ["наблюдение"], "movement_phase": None, "other": None, "btc_context": None}
+        service.detect(("BTC", "1m"), snap, native, 100, "ready", "neutral", row)
+        action, key = service.notifications.get_nowait()
+        assert action == "facts" and journal.fact_message(key)["ai"] is None
+        assert journal.db.execute("SELECT decision FROM finding_candidates").fetchone()[0] == "queue_full"
+    finally:
+        journal.close()

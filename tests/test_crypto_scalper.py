@@ -13,7 +13,7 @@ from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.quality import calculate_quality
 from extensions.scalper.profile import calculate_profiles, profile_context, sample_window
-from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context, with_senior_context
+from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context, with_movement_context, with_senior_context
 from extensions.scalper.telegram import listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
@@ -144,16 +144,26 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
     })
     now, hub, asset = market
     journal = Journal(tmp_path / "scalper.sqlite")
-    sent = []
+    sent, edits = [], []
+    facts_sent = asyncio.Event()
 
     async def analyze(snapshot):
+        await facts_sent.wait()
         return {**model_reply("BULLISH"), "snapshot": snapshot_key(snapshot), "status": "ok"}
 
-    async def send(message, *, rich_html, copy_text):
+    async def send(message, *, rich_html, copy_text, return_message):
+        assert return_message and "гипотеза пока не готова" in message
+        assert "Гипотеза AI</b>" not in rich_html
         sent.append((message, rich_html, copy_text))
+        facts_sent.set()
+        return len(sent), True
+
+    async def edit(message_id, message, *, rich_html, copy_text):
+        assert 1 <= message_id <= len(sent)
+        edits.append((message, rich_html, copy_text))
         return True
 
-    hub.alerts = SimpleNamespace(send_telegram=send)
+    hub.alerts = SimpleNamespace(send_telegram=send, edit_telegram=edit)
     service = Screener(hub, journal, SimpleNamespace(key=None, provider="test", analyze=analyze), True)
     service.scan(now)
     service.scan(now + 5)
@@ -164,7 +174,8 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
         assert len(rows) == 1 and len(sent) == 2
-        plain, rich, ticker = sent[0]
+        assert len(edits) == 2
+        plain, rich, ticker = edits[0]
         assert ticker == "HYPERLIQUID:KPEPEUSDC.P"
         headline = f'<b><a href="https://app.hyperliquid.xyz/trade/kPEPE">{ticker}</a></b> · '
         assert plain.startswith(headline)
@@ -187,11 +198,13 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
-        assert event["captured_at"] == now + 5
+        assert event["captured_at"] == now
         assert event["snapshot"]["captured_at"] == event["hyperdata"]["snapshot"]["captured_at"]
         minute = journal.latest(asset.symbol, "1m")[0]["snapshot"]
         assert minute["context_5m"]["captured_at"] == minute["captured_at"]
         assert "direction" not in minute["context_5m"]
+        assert minute["context_5m"]["flow_quality"] == {"ofi": "ok", "cvd": "ok"}
+        assert minute["movement_context"]["status"] == "untracked"
         now = event["captured_at"]
         assert event["delivery"] == "sent"
         assert not journal.record(event["id"], event["event"], event["snapshot"], event["hyperdata"])
@@ -283,22 +296,13 @@ async def test_openrouter_accepts_non_google_model_and_preserves_blind_analysis(
     assert result["status"] == "ok" and result["direction"] == "BEARISH"
 
 
-def test_expired_ai_does_not_notify_about_hypothesis_change():
-    previous = {
-        "captured_at": 990, "hyperdata": {"direction": "BULLISH"},
-        "ai": {"direction": "BULLISH", "status": "ok"},
-    }
-    deliveries = []
-    journal = SimpleNamespace(
-        latest=lambda *args, **kwargs: [previous],
-        delivery=lambda key, state: deliveries.append((key, state)),
-    )
+def test_expired_ai_does_not_edit_existing_telegram_message():
+    journal = SimpleNamespace(fact_message=lambda key: {
+        "message_id": 1, "ai": {"status": "expired"}, "edit_status": None,
+    })
     service = Screener(None, journal, None, True)
-    service.schedule_alert("event", {"symbol": "BTC", "window": "1m", "captured_at": 1000},
-                           {"direction": "BEARISH"}, {"status": "expired"},
-                           {"category": "HYPERDATA_ONLY"})
+    service.queue_hypothesis("event")
     assert service.notifications.empty()
-    assert deliveries == [("event", "not_applicable")]
 
 
 def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
@@ -587,3 +591,25 @@ def test_btc_context_requires_aligned_closed_returns_and_ignores_flat_series():
     assert btc_context({"returns": {stamp: 0 for stamp in returns}}, btc, 36 * 300) is None
     assert btc_context({"returns": dict(list(returns.items())[1:])}, btc, 36 * 300) is None
     assert btc_context(btc, btc, 36 * 300) is None
+
+
+def test_blind_context_distinguishes_warming_flow_and_observed_impulse(market):
+    now, hub, asset = market
+    minute, _ = capture(hub, asset, "1m", now)
+    longer, _ = capture(hub, asset, "5m", now)
+    longer["metrics"]["ofi"]["quality"] = "warming_up"
+    longer["metrics"]["cvd"]["quality"] = "warming_up"
+    snapshot = with_context(minute, {"snapshot": longer})
+    phase = {"phase": "confirmed", "direction": "BULLISH", "started_at": now - 25,
+             "age_seconds": 25, "distance_natr": 1.25, "retracement_natr": 0.25, "natr_at_start": 0.1}
+    payload = blind_payload(with_movement_context(snapshot, phase))
+    assert payload["context_5m"]["flow_quality"] == {"ofi": "warming_up", "cvd": "warming_up"}
+    assert "ofi" not in payload["context_5m"]["metrics"]
+    assert "spread" in payload["context_5m"]["metrics"]
+    assert payload["movement_context"] == {
+        "status": "observed", "age_seconds": 25, "distance_natr": 1.25,
+        "retracement_natr": 0.25, "natr_at_start": 0.1,
+    }
+    missing = blind_payload(with_context(minute, None))
+    assert missing["context_5m"]["flow_quality"] == {"ofi": "unavailable", "cvd": "unavailable"}
+    assert missing["context_5m"]["metrics"] == {}

@@ -104,13 +104,13 @@ def tape_baseline(indicators, now, seconds):
     return median(samples)
 
 
-def active_anomalies(snapshot):
+def active_anomalies(snapshot, *, tape_ratio=BURST_RATIO):
     metrics = snapshot["metrics"]
     ratio = metrics.get("activity_ratio", {})
     trades = metrics.get("trade_count", {})
     volatility = metrics.get("range_ratio", {})
     active = set()
-    if ratio.get("quality") == "ok" and ratio["value"] >= BURST_RATIO and trades["value"] >= MIN_BURST_TRADES:
+    if ratio.get("quality") == "ok" and ratio["value"] >= tape_ratio and trades["value"] >= MIN_BURST_TRADES:
         active.add("tape_burst")
     if volatility.get("quality") == "ok" and volatility["value"] >= BURST_RATIO:
         active.add("range_burst")
@@ -124,9 +124,10 @@ def wide_spread(snapshot):
             and 100 * spread / mark >= WIDE_SPREAD_ATR_FRACTION * natr)
 
 
-def finding_strength(snapshot, native):
+def finding_strength(snapshot, native, *, tape_ratio=BURST_RATIO, price_floor=MIN_STRONG_MOVE_PCT,
+                     price_natr_multiple=1.0):
     metrics = snapshot["metrics"]
-    anomalies = active_anomalies(snapshot)
+    anomalies = active_anomalies(snapshot, tape_ratio=tape_ratio)
     reasons = []
     if "tape_burst" in anomalies:
         reasons.append("Ускорение ленты")
@@ -144,7 +145,7 @@ def finding_strength(snapshot, native):
     spread_pct = 100 * spread / mark if spread is not None and mark and mark > 0 else None
     aligned = direction in {"BULLISH", "BEARISH"} and change != 0 and (change > 0) == (direction == "BULLISH")
     confirms = (aligned and natr is not None and natr > 0 and spread_pct is not None
-                and abs(change) >= max(MIN_STRONG_MOVE_PCT, natr, SPREAD_MULTIPLE * spread_pct))
+                and abs(change) >= max(price_floor, price_natr_multiple * natr, SPREAD_MULTIPLE * spread_pct))
     if confirms:
         reasons.append(f"Цена уже прошла {abs(change):.2f}% в сторону потока")
     strong_flow = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
