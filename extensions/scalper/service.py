@@ -5,7 +5,7 @@ import html
 import logging
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
@@ -20,19 +20,52 @@ QUEUE_LIMIT = 20
 ALERT_CATEGORIES = {"CONSENSUS_LONG", "CONSENSUS_SHORT", "DIVERGENCE"}
 
 
+ALERT_TITLES = {
+    "CONSENSUS_LONG": "Обе оценки указывают вверх",
+    "CONSENSUS_SHORT": "Обе оценки указывают вниз",
+    "DIVERGENCE": "Оценки расходятся",
+    "HYPERDATA_ONLY": "Направление видит только HyperData",
+    "AI_ONLY": "Направление видит только AI",
+    "NEUTRAL": "Обе оценки нейтральны",
+    "INSUFFICIENT_DATA": "Направление не подтверждено",
+}
+ALERT_DIRECTIONS = {
+    "BULLISH": "вверх",
+    "BEARISH": "вниз",
+    "NEUTRAL": "нейтрально",
+    "NOT_AVAILABLE": "оценка недоступна",
+    "INSUFFICIENT_DATA": "недостаточно данных",
+}
+MOSCOW = timezone(timedelta(hours=3), "МСК")
+
+
 def alert_text(snapshot, native, ai, consensus):
-    stamp = datetime.fromtimestamp(snapshot["captured_at"], timezone.utc).isoformat(timespec="seconds")
+    stamp = datetime.fromtimestamp(snapshot["captured_at"], MOSCOW).strftime("%d.%m.%Y в %H:%M:%S %Z")
+    title = ALERT_TITLES[consensus["category"]]
+    native_direction = ALERT_DIRECTIONS[native["direction"]]
+    ai_direction = ALERT_DIRECTIONS.get(ai.get("direction"), "оценка недоступна")
     ofi = snapshot["metrics"]["ofi"]["value"]
-    native_reason = f" (OFI {ofi:+.3f})" if native["evidence"] else ""
-    reasons = [arg["reason"] for arg in ai.get("arguments", [])[:2]]
-    return html.escape("\n".join([
-        f'{snapshot["contract"]} · Hyperliquid · {snapshot["window"]}',
-        f'HyperData: {native["direction"]}{native_reason}',
-        f'AI ({ai.get("provider", "—")}): {ai.get("direction", ai["status"])}',
-        f'{consensus["category"]} · {consensus["overlap"]}',
-        *reasons, *(["Контраргумент: " + ai["contradictions"][0]["reason"]]
-                    if ai.get("contradictions") else []), stamp,
-    ]))
+    flow = ""
+    if "ofi" in native["evidence"] and ofi:
+        flow = " (в потоке преобладают покупки)" if ofi > 0 else " (в потоке преобладают продажи)"
+    lines = [
+        f'<b>{html.escape(snapshot["contract"])} · {title}</b>',
+        f'Hyperliquid · окно {html.escape(snapshot["window"])}',
+        "",
+        f"<b>HyperData</b> — {native_direction}{flow}",
+        f"<b>AI</b> — {ai_direction}",
+    ]
+    arguments = ai.get("arguments") or []
+    explanation = ai.get("summary") or (arguments[0]["reason"] if arguments else None)
+    if explanation:
+        lines.extend(("", f"<b>Почему</b> — {html.escape(explanation)}"))
+    contradictions = ai.get("contradictions") or []
+    if contradictions:
+        lines.append(f'<b>Что против</b> — {html.escape(contradictions[0]["reason"])}')
+    if ai.get("invalidation"):
+        lines.append(f'<b>Когда пересмотреть</b> — {html.escape(ai["invalidation"])}')
+    lines.extend(("", f"<i>Снимок рынка: {stamp}</i>"))
+    return "\n".join(lines)
 
 
 class Screener:

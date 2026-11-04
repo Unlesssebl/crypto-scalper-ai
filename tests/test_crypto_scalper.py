@@ -156,7 +156,11 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
         assert len(rows) == 1 and len(sent) == 2
-        assert "kPEPE-PERP" in sent[0]
+        assert "<b>kPEPE-PERP · Обе оценки указывают вверх</b>" in sent[0]
+        assert "<b>HyperData</b> — вверх (в потоке преобладают покупки)" in sent[0]
+        assert "<b>AI</b> — вверх" in sent[0]
+        assert "<b>Почему</b>" in sent[0] and "МСК" in sent[0]
+        assert "CONSENSUS_LONG" not in sent[0] and "OFI" not in sent[0]
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
