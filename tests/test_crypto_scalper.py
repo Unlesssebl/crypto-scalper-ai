@@ -10,6 +10,7 @@ from apps.scalper_web.__main__ import ScalperAPI
 from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
+from extensions.scalper.quality import calculate_quality
 from extensions.scalper.service import Screener
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
@@ -273,3 +274,45 @@ def test_expired_ai_does_not_notify_about_hypothesis_change():
                            {"category": "HYPERDATA_ONLY"})
     assert service.notifications.empty()
     assert deliveries == [("event", "not_applicable")]
+
+
+def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
+    path = tmp_path / "scalper.sqlite"
+    journal = Journal(path)
+    now = 100_000
+
+    def record(key, window, at, price, status, direction=None):
+        snapshot = {"symbol": key, "window": window, "captured_at": at,
+                    "metrics": {"price": {"value": price, "quality": "ok"}}}
+        journal.record(key, {}, snapshot, {})
+        if status:
+            journal.finish(key, {"status": status, "direction": direction}, {}, at + 1)
+
+    try:
+        record("long", "1m", now - 350, 100, "ok", "BULLISH")
+        record("short", "1m", now - 350, 100, "ok", "BEARISH")
+        record("neutral", "1m", now - 30, 100, "ok", "NEUTRAL")
+        record("insufficient", "1m", now - 30, 100, "ok", "INSUFFICIENT_DATA")
+        record("failed", "1m", now - 30, 100, "network_error")
+        record("skipped", "1m", now - 30, 100, "expired")
+        record("pending", "1m", now - 10, 100, None)
+        record("other", "5m", now - 350, 100, "ok", "BEARISH")
+        record("old", "1m", now - 90_000, 100, "ok", "BULLISH")
+        journal.observe(now - 285, {"long": (101, now - 286), "short": (100, now - 286)})
+        journal.observe(now - 45, {"long": (98, now - 46), "short": (99, now - 46)})
+        journal.observe(now, {})
+
+        report = calculate_quality(path, now, ("1m", "5m"))["windows"]
+        assert report["1m"]["attempts"] == {
+            "directional": 2, "neutral": 1, "insufficient": 1, "error": 1, "skipped": 1, "pending": 1,
+        }
+        assert report["1m"]["horizons"][1] == {
+            "correct": 1, "incorrect": 0, "flat": 1, "pending": 0, "missing": 0,
+        }
+        assert report["1m"]["horizons"][5] == {
+            "correct": 1, "incorrect": 1, "flat": 0, "pending": 0, "missing": 0,
+        }
+        assert report["1m"]["horizons"][15]["pending"] == 2
+        assert report["5m"]["horizons"][1]["missing"] == 1
+    finally:
+        journal.close()

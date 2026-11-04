@@ -56,6 +56,7 @@ class ScalperAPI(HyperDataAPI):
                                   "market": self.hub.status.market_data,
                                   "gemini": "configured" if self.service.gemini.key else "disabled",
                                   "ai_provider": self.service.gemini.provider,
+                                  "quality_report": self.service.quality_report,
                                   "rows": rows})
 
     async def detail(self, request):
@@ -126,6 +127,7 @@ async def run(args):
                 await hub.start()
                 tasks.extend(asyncio.create_task(worker()) for worker in
                              (service.run, service.analyze, service.deliver))
+                tasks.append(asyncio.create_task(service.refresh_quality(args.journal), name="scalper-quality"))
                 logging.info("Dashboard: http://127.0.0.1:%d/scalper", args.port)
                 if args.tui:
                     dashboard = MarketOverviewDashboard(

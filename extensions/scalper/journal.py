@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     delivery TEXT NOT NULL DEFAULT 'pending', delivered_at REAL
 );
 CREATE INDEX IF NOT EXISTS analyses_latest ON analyses(symbol, window, captured_at DESC);
+CREATE INDEX IF NOT EXISTS analyses_captured_at ON analyses(captured_at);
 CREATE TABLE IF NOT EXISTS observations (
     event_id TEXT REFERENCES analyses(id), minutes INTEGER, due_at REAL NOT NULL,
     observed_at REAL, price REAL, status TEXT NOT NULL DEFAULT 'pending',

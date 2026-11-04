@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
 from .market import WINDOWS, capture
+from .quality import calculate_quality
 
 LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
@@ -72,6 +73,7 @@ class Screener:
     def __init__(self, hub, journal, gemini, notify):
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.rows = {}
+        self.quality_report = None
         self.states = {}
         self.pending = set()
         self.cooldowns = {}
@@ -137,6 +139,14 @@ class Screener:
             except Exception:
                 LOG.exception("Screener scan failed")
             await asyncio.sleep(5)
+
+    async def refresh_quality(self, path):
+        while True:
+            try:
+                self.quality_report = await asyncio.to_thread(calculate_quality, path, time.time(), WINDOWS)
+            except Exception:
+                LOG.exception("AI quality report refresh failed")
+            await asyncio.sleep(60)
 
     async def analyze(self):
         next_request = 0
