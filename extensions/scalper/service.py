@@ -84,7 +84,7 @@ def alert_market_facts(snapshot):
     return facts
 
 
-def alert_text(snapshot, native, ai, event, *, rich=False):
+def alert_text(snapshot, native, ai, event, *, rich=False, updates=()):
     stamp = datetime.fromtimestamp(snapshot["captured_at"], MOSCOW).strftime("%H:%M:%S %Z")
     labels = {"tape_burst": "Всплеск ленты", "range_burst": "Всплеск диапазона"}
     reason = " + ".join(labels[name] for name in event.get("anomalies", ()) if name in labels)
@@ -104,18 +104,14 @@ def alert_text(snapshot, native, ai, event, *, rich=False):
         if phase["distance_natr"] is not None:
             trigger += f' · {phase["distance_natr"]:+.1f} NATR от начала'
         trigger += f' · {phase["age_seconds"]} с'
-    hypothesis = []
+    characterization = hypothesis = None
     ai_direction = ALERT_DIRECTIONS["NOT_AVAILABLE"]
     if ai["status"] == "ok":
         ai_direction = ALERT_DIRECTIONS.get(ai.get("direction"), ai_direction)
-        if ai.get("scenario"):
-            hypothesis.append(html.escape(ai["scenario"]))
-        if ai.get("watch"):
-            hypothesis.append(f'<b>Что наблюдать:</b> {html.escape(ai["watch"])}')
-        if ai.get("invalidation"):
-            hypothesis.append(f'<b>Когда пересмотреть:</b> {html.escape(ai["invalidation"])}')
+        characterization = ai.get("summary")
+        hypothesis = ai.get("scenario")
     if ai["status"] == "pending":
-        ai_direction = "гипотеза пока не готова"
+        ai_direction = "характеристика пока не готова"
     native_direction = ALERT_DIRECTIONS.get(native["direction"], ALERT_DIRECTIONS["NOT_AVAILABLE"])
     header = [headline, f"<i>Бессрочный фьючерс · {stamp}</i>"]
     facts = alert_market_facts(snapshot)
@@ -123,6 +119,13 @@ def alert_text(snapshot, native, ai, event, *, rich=False):
         facts.append(("Фон BTC", f'BTC {btc["btc_last_return_pct"]:+.2f}% · актив {btc["asset_last_return_pct"]:+.2f}%'
                                  f' за 5m · корреляция {btc["correlation"]:+.2f} за 3 ч'))
     order_flow = f"<b>HyperData</b> {native_direction} · <b>AI</b> {ai_direction}"
+    updates_text = []
+    for update in updates:
+        window = html.escape(update["window"])
+        direction = ALERT_DIRECTIONS[update["hyperdata"]["direction"]]
+        strength = html.escape(update["event"]["strength"]["label"])
+        captured = datetime.fromtimestamp(update["captured_at"], MOSCOW).strftime("%H:%M:%S %Z")
+        updates_text.append(f"<b>Обновление {window}</b> · {direction} · {strength} · {captured}")
     if rich:
         lines = [f"<p>{'<br>'.join(header)}</p>", "<hr/>", f"<p>{trigger}</p>"]
         if facts:
@@ -131,8 +134,11 @@ def alert_text(snapshot, native, ai, event, *, rich=False):
         else:
             lines.append("<p>Свежие метрики недоступны.</p>")
         lines.append(f"<p>{order_flow}</p>")
+        lines.extend(f"<p>{text}</p>" for text in updates_text)
+        if characterization:
+            lines.append(f"<p><b>🧠 Характеристика AI</b><br>{html.escape(characterization)}</p>")
         if hypothesis:
-            lines.append("<blockquote><b>🧠 Гипотеза AI</b><br>" + "<br>".join(hypothesis) + "</blockquote>")
+            lines.append(f"<blockquote><b>Гипотеза AI</b><br>{html.escape(hypothesis)}</blockquote>")
         lines.append(
             f'<tg-button-row align="left"><tg-button type="copy_text" text="{html.escape(ticker)}">'
             'Копировать фьючерс</tg-button></tg-button-row>'
@@ -141,9 +147,11 @@ def alert_text(snapshot, native, ai, event, *, rich=False):
     market = [trigger, *(f"<b>{label}</b> · {value}" for label, value in facts)]
     if not facts:
         market.append("Свежие метрики недоступны.")
-    message = "\n\n".join(("\n".join(header), "\n".join(market), order_flow))
+    message = "\n\n".join(("\n".join(header), "\n".join(market), order_flow, *updates_text))
+    if characterization:
+        message += f"\n\n<b>🧠 Характеристика AI</b>\n{html.escape(characterization)}"
     if hypothesis:
-        message += "\n\n<blockquote><b>🧠 Гипотеза AI</b>\n" + "\n".join(hypothesis) + "</blockquote>"
+        message += f"\n\n<blockquote><b>Гипотеза AI</b>\n{html.escape(hypothesis)}</blockquote>"
     return message
 
 
@@ -518,6 +526,15 @@ class Screener:
             self.journal.fact_message_edit(key, "queued")
             self.notifications.put_nowait(("edit", key))
 
+    async def edit_alert(self, row, updates, *, include_ai):
+        snapshot, native, event = row["snapshot"], row["hyperdata"], row["event"]
+        ai = row["ai"] if include_ai else {"status": "pending"}
+        return await self.hub.alerts.edit_telegram(
+            row["message_id"], alert_text(snapshot, native, ai, event, updates=updates),
+            rich_html=alert_text(snapshot, native, ai, event, rich=True, updates=updates) if row["rich"] else None,
+            copy_text=futures_ticker(snapshot),
+        )
+
     async def deliver(self):
         while True:
             action, key = await self.notifications.get()
@@ -528,22 +545,32 @@ class Screener:
                 snapshot, native, event = row["snapshot"], row["hyperdata"], row["event"]
                 ticker = futures_ticker(snapshot)
                 if action == "edit":
-                    ai = row["ai"]
-                    edited = await self.hub.alerts.edit_telegram(
-                        row["message_id"], alert_text(snapshot, native, ai, event),
-                        rich_html=alert_text(snapshot, native, ai, event, rich=True) if row["rich"] else None,
-                        copy_text=ticker,
-                    )
+                    edited = await self.edit_alert(row, self.journal.fact_updates(key).values(), include_ai=True)
                     self.journal.fact_message_edit(key, "edited" if edited else "failed")
                     continue
 
                 now = time.time()
+                if now - event["detected_at"] > MAX_EVENT_AGE[snapshot["window"]]:
+                    self.journal.delivery(key, "expired")
+                    continue
+                parent = self.journal.recent_fact_message(snapshot["symbol"], now - ALERT_COOLDOWN)
+                if parent:
+                    updates = self.journal.fact_updates(parent["id"])
+                    previous = updates.get(row["window"])
+                    if previous is None and parent["window"] == row["window"]:
+                        previous = parent
+                    if previous and event["strength"]["rank"] <= previous["event"]["strength"]["rank"]:
+                        self.journal.delivery(key, "cooldown")
+                        continue
+                    updates[row["window"]] = row
+                    if await self.edit_alert(parent, updates.values(), include_ai=parent["edit_status"] == "edited"):
+                        self.journal.merge_fact_message(parent["id"], key, row["window"], time.time())
+                    else:
+                        self.journal.delivery(key, "merge_failed")
+                    continue
                 last = self.journal.last_delivery(snapshot["symbol"], snapshot["window"])
                 if last and now - last < ALERT_COOLDOWN:
                     self.journal.delivery(key, "cooldown")
-                    continue
-                if now - event["detected_at"] > MAX_EVENT_AGE[snapshot["window"]]:
-                    self.journal.delivery(key, "expired")
                     continue
                 self.journal.delivery(key, "sending", now)
                 pending = {"status": "pending"}

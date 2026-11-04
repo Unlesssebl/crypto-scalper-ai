@@ -43,8 +43,8 @@ def market():
 
 def model_reply(direction):
     return {
-        "direction": direction, "summary": "Инициатива меняется", "scenario": "Наблюдать за спросом",
-        "invalidation": "Поток разворачивается", "watch": "Следить за стаканом",
+        "direction": direction, "summary": "Инициатива меняется",
+        "scenario": "Если спрос сохранится, покупатели могут удержать инициативу",
         "arguments": [{"metric": "cvd", "reason": "Односторонний поток"},
                       {"metric": "imbalance", "reason": "Стакан даёт дополнительный контекст"}],
         "contradictions": [],
@@ -95,6 +95,15 @@ def test_gemini_input_and_validation(market):
     assert "STRONG_BULL" not in json.dumps(blind_payload(snapshot))
     reply = model_reply("BULLISH")
     assert validate(json.dumps(reply), snapshot) == reply
+    characterization = (
+        "Покупатели удерживают инициативу, и цена отвечает на их агрессию. "
+        "Лента ускорилась, но встречная ликвидность в стакане ограничивает продвижение цены. "
+        "На более длинном окне преобладает противоположный поток, поэтому пока видна локальная реакция. "
+        "Доступные метрики описывают разные стороны этой реакции."
+    )
+    descriptive_reply = {**reply, "summary": characterization, "scenario": ""}
+    assert len(characterization) > 240
+    assert validate(json.dumps(descriptive_reply), snapshot) == descriptive_reply
     reply["summary"] = "Непроверенный уровень 12.5"
     reply["arguments"][0]["reason"] = "Отрицательная дельта за 5m"
     cleaned = validate(json.dumps(reply), snapshot)
@@ -152,7 +161,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         return {**model_reply("BULLISH"), "snapshot": snapshot_key(snapshot), "status": "ok"}
 
     async def send(message, *, rich_html, copy_text, return_message):
-        assert return_message and "гипотеза пока не готова" in message
+        assert return_message and "характеристика пока не готова" in message
         assert "Гипотеза AI</b>" not in rich_html
         sent.append((message, rich_html, copy_text))
         facts_sent.set()
@@ -173,9 +182,10 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         await asyncio.wait_for(service.jobs.join(), 2)
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
-        assert len(rows) == 1 and len(sent) == 2
+        assert len(rows) == 1 and len(sent) == 1
         assert len(edits) == 2
-        plain, rich, ticker = edits[0]
+        plain, rich, ticker = edits[-1]
+        assert "Обновление" in plain and "Обновление" in rich
         assert ticker == "HYPERLIQUID:KPEPEUSDC.P"
         headline = f'<b><a href="https://app.hyperliquid.xyz/trade/kPEPE">{ticker}</a></b> · '
         assert plain.startswith(headline)
@@ -185,28 +195,31 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         assert "<table striped compact>" in rich
         assert "<th>Стакан</th><td>дисбаланс" in rich
         assert "<b>Стакан</b> · дисбаланс" in plain
-        assert "<blockquote><b>🧠 Гипотеза AI</b>" in rich
+        assert "<blockquote><b>Гипотеза AI</b>" in rich
         for message in (plain, rich):
             assert "Сила:" in message and "Mark $" in message and "МСК" in message
             assert "<b>HyperData</b> 🟢 вверх · <b>AI</b> 🟢 вверх" in message
             assert "bid $" not in message and "ask $" not in message
-            assert "<b>Что наблюдать:</b>" in message and "<b>Когда пересмотреть:</b>" in message
+            assert "<b>🧠 Характеристика AI</b>" in message and "Инициатива меняется" in message
+            assert "Что наблюдать" not in message and "Когда пересмотреть" not in message
             assert "<details" not in message and "expandable" not in message
-            assert message.index("Всплеск ленты") < message.index("<b>HyperData</b>") < message.index("<blockquote>")
-        assert rich.index("Когда пересмотреть") < rich.index("Копировать фьючерс")
+            assert message.index("Всплеск ленты") < message.index("<b>HyperData</b>")
+            assert message.index("Характеристика AI") < message.index("<blockquote>")
+        assert rich.index("Гипотеза AI") < rich.index("Копировать фьючерс")
         assert "CONSENSUS_LONG" not in rich
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
         assert event["captured_at"] == now
         assert event["snapshot"]["captured_at"] == event["hyperdata"]["snapshot"]["captured_at"]
-        minute = journal.latest(asset.symbol, "1m")[0]["snapshot"]
+        minute_event = journal.latest(asset.symbol, "1m")[0]
+        assert {event["delivery"], minute_event["delivery"]} == {"sent", "merged"}
+        minute = minute_event["snapshot"]
         assert minute["context_5m"]["captured_at"] == minute["captured_at"]
         assert "direction" not in minute["context_5m"]
         assert minute["context_5m"]["flow_quality"] == {"ofi": "ok", "cvd": "ok"}
         assert minute["movement_context"]["status"] == "untracked"
         now = event["captured_at"]
-        assert event["delivery"] == "sent"
         assert not journal.record(event["id"], event["event"], event["snapshot"], event["hyperdata"])
 
         journal.observe(now + 59, {asset.symbol: (14, now + 59)})
@@ -225,7 +238,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         async with TestClient(TestServer(app)) as client:
             response = await client.get("/v1/scalper/kPEPE?window=5m")
             assert response.status == 200
-            assert (await response.json())["history"][0]["delivery"] == "sent"
+            assert (await response.json())["history"][0]["delivery"] == event["delivery"]
             newer = {**event["snapshot"], "captured_at": now + 1}
             identity = snapshot_key(newer)
             native = {**event["hyperdata"], "snapshot": identity}

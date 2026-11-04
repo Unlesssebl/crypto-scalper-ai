@@ -1,11 +1,13 @@
 """Summarize AI direction against subsequent Hyperliquid mark prices."""
+from bisect import bisect_left
+from collections import defaultdict
 from contextlib import closing
 import json
 import sqlite3
 from statistics import median
 
 from .audit import audit_report
-from .shadow import VARIANTS
+from .shadow import MINUTE_CONTROL, MOVE_THRESHOLD_PCT, SHADOW_COOLDOWN, STRICT_MINUTE, VARIANTS
 
 HORIZONS = (1, 5, 15)
 PERIOD_SECONDS = 24 * 60 * 60
@@ -104,6 +106,33 @@ def context_quality(db, since, now, windows):
     return results
 
 
+def minute_shadow_comparison(db, since, now):
+    rows = db.execute("""
+        SELECT variant,symbol,detected_at,status,peak_pct FROM shadow_findings
+        WHERE window='1m' AND variant IN (?,?) AND detected_at BETWEEN ? AND ?
+        ORDER BY detected_at
+    """, (MINUTE_CONTROL, STRICT_MINUTE, since, now)).fetchall()
+    strict_times = defaultdict(list)
+    for row in rows:
+        if row["variant"] == STRICT_MINUTE:
+            strict_times[row["symbol"]].append(row["detected_at"])
+    result = {"baseline": 0, "strict": 0, "baseline_moves": 0, "missed_moves": 0}
+    for row in rows:
+        if row["variant"] == STRICT_MINUTE:
+            result["strict"] += 1
+            continue
+        result["baseline"] += 1
+        if row["status"] not in ("hit", "quiet") or row["peak_pct"] < MOVE_THRESHOLD_PCT:
+            continue
+        result["baseline_moves"] += 1
+        times = strict_times[row["symbol"]]
+        at = row["detected_at"]
+        index = bisect_left(times, at - SHADOW_COOLDOWN)
+        if index == len(times) or times[index] > at + SHADOW_COOLDOWN:
+            result["missed_moves"] += 1
+    return result
+
+
 def calculate_quality(path, now, windows):
     since = now - PERIOD_SECONDS
     results = {window: {**counters(), "triggers": {}} for window in windows}
@@ -148,6 +177,7 @@ def calculate_quality(path, now, windows):
                     target["horizons"][row["minutes"]][result] += 1
         experiments = context_quality(db, since, now, windows)
         audit = audit_report(db, since, now, windows)
+        minute_shadow = minute_shadow_comparison(db, since, now)
         shadow = {window: {variant: {} for variant in VARIANTS} for window in windows}
         for row in db.execute("""
             SELECT window,variant,status,COUNT(*) AS count FROM shadow_findings
@@ -165,4 +195,5 @@ def calculate_quality(path, now, windows):
             group["median_delay_seconds"] = round(median(delays), 1) if delays else None
             group["delay_samples"] = len(delays)
     return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS,
-            "context_experiment": experiments, "finding_audit": audit, "shadow": shadow}
+            "context_experiment": experiments, "finding_audit": audit, "shadow": shadow,
+            "minute_shadow": minute_shadow}

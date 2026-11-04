@@ -8,11 +8,16 @@ import aiohttp
 
 DIRECTIONAL = {"BULLISH", "BEARISH"}
 AI_DIRECTIONS = ("BULLISH", "BEARISH", "NEUTRAL", "INSUFFICIENT_DATA")
-TEXT_FIELDS = ("summary", "scenario", "invalidation", "watch")
+TEXT_LIMITS = {"summary": 720, "scenario": 200}
 KEY_FIELDS = ("symbol", "exchange", "contract", "window", "captured_at")
-PROMPT = """Опиши, что происходит в данном снимке Hyperliquid perpetual и почему инструмент стоит наблюдать.
-В summary перечисляй наблюдения, в scenario формулируй условную гипотезу отдельно.
-В watch предложи наблюдаемый признак подтверждения или ослабления. Не задавай целевую цену.
+PROMPT = """Дай развёрнутую характеристику текущей ситуации Hyperliquid perpetual.
+В summary напиши связный текст из нескольких предложений: как реагирует цена на поток,
+что показывают интенсивность, волатильность и стакан, подтверждают ли картину другие окна.
+Если метрики или окна расходятся, назови обе стороны расхождения и объясни,
+что оно меняет в трактовке. Если сопоставление невозможно, укажи, каких данных не хватает.
+Объединяй факты по смыслу. Не перечисляй все метрики подряд и не предлагай действий.
+В scenario оставь одну короткую условную гипотезу. При слабой опоре на данные оставь пустую строку.
+Не давай рекомендаций, торговых инструкций или целевой цены.
 instrument_profile, если есть, описывает историческую норму инструмента и размер выборки.
 Используй профиль как фон для сравнения, а не как доказательство текущего направления.
 Используй как доказательства только метрики с quality=ok. Ссылайся на них по metric.
@@ -26,7 +31,7 @@ first_trade_price и last_trade_price — наблюдавшиеся сделк�
 OI, funding и стакан по отдельности не задают направление.
 При нехватке данных выбери INSUFFICIENT_DATA. Раздели аргументы и контраргументы.
 Не пересчитывай индикаторы, не добавляй числа или уровни, не давай команд на сделки.
-Пиши по-русски. В каждом текстовом поле одна короткая фраза, до 160 символов.
+Пиши по-русски. Характеристика — до 720 символов, гипотеза — до 200.
 В каждом аргументе metric — ровно один точный ключ из metrics, без списков и объединений.
 Формулируй сценарий как гипотезу.
 Проверяй разные роли метрик: движение цены, направленный поток, интенсивность, волатильность и ликвидность.
@@ -48,10 +53,10 @@ ARGUMENT = {
 }
 SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["direction", *TEXT_FIELDS, "arguments", "contradictions"],
+    "required": ["direction", *TEXT_LIMITS, "arguments", "contradictions"],
     "properties": {
         "direction": {"type": "string", "enum": list(AI_DIRECTIONS)},
-        **{field: {"type": "string", "maxLength": 240} for field in TEXT_FIELDS},
+        **{field: {"type": "string", "maxLength": limit} for field, limit in TEXT_LIMITS.items()},
         **{field: {"type": "array", "maxItems": 4, "items": deepcopy(ARGUMENT)}
            for field in ("arguments", "contradictions")},
     },
@@ -110,12 +115,12 @@ def response_schema(snapshot):
 MODEL_NUMBER = re.compile(r"[+−-]?\d+(?:[.,:/–-]\d+)*(?:%|[mM](?!\w))?")
 
 
-def clean_text(value):
+def clean_text(value, limit=240):
     if not isinstance(value, str):
         raise ValueError("Invalid model text")
     text = " ".join(MODEL_NUMBER.sub("…", value).split())
-    if len(text) > 240:
-        text = text[:239].rsplit(" ", 1)[0] + "…"
+    if len(text) > limit:
+        text = text[:limit - 1].rsplit(" ", 1)[0] + "…"
     if not any(char.isalpha() for char in text):
         raise ValueError("Invalid model text")
     return text
@@ -127,8 +132,12 @@ def validate(raw, snapshot):
         raise ValueError("Invalid model response structure")
     if reply["direction"] not in AI_DIRECTIONS:
         raise ValueError("Invalid model direction")
-    for key in TEXT_FIELDS:
-        reply[key] = clean_text(reply[key])
+    reply["summary"] = clean_text(reply["summary"], TEXT_LIMITS["summary"])
+    scenario = reply["scenario"]
+    if isinstance(scenario, str) and not scenario.strip():
+        reply["scenario"] = ""
+    else:
+        reply["scenario"] = clean_text(scenario, TEXT_LIMITS["scenario"])
     usable = {key for key, value in snapshot["metrics"].items()
               if value["quality"] == "ok" and value["value"] is not None}
     for field in ("arguments", "contradictions"):

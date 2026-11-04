@@ -85,7 +85,8 @@ def report_text(report, window=None, *, rich=False):
         audit = report.get("finding_audit", {}).get(frame)
         if audit and audit["candidates"]:
             delivered = audit["decisions"].get("delivered", 0)
-            finding_lines = [f'<b>Находки</b> · кандидатов {audit["candidates"]} · доставлено {delivered}']
+            merged = audit["decisions"].get("delivery_merged", 0)
+            finding_lines = [f'<b>Находки</b> · кандидатов {audit["candidates"]} · доставлено {delivered} · объединено {merged}']
             labels = ("Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная")
             for version, ranks in audit["versions"].items():
                 for rank, counts in sorted(ranks.items(), reverse=True):
@@ -105,6 +106,13 @@ def report_text(report, window=None, *, rich=False):
             else:
                 finding_lines.append("Сопоставимые обычные окна ещё накапливаются.")
             lines.append(paragraph(*finding_lines))
+        comparison = report.get("minute_shadow") if frame == "1m" else None
+        if comparison and comparison["baseline"]:
+            lines.append(paragraph(
+                f'<b>Строгий порог 1m</b> · находок {comparison["strict"]} против {comparison["baseline"]}',
+                f'Без строгого сигнала в пределах ±60 с · {comparison["missed_moves"]} из '
+                f'{comparison["baseline_moves"]} базовых событий с движением ≥ 0,5% за 5 минут.',
+            ))
     lines.append(paragraph("<i>Точность — верные среди верных и неверных. Проверка по mark без комиссий и исполнения.</i>"))
     return "\n".join(lines)
 

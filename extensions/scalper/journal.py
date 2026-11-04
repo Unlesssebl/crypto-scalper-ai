@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS fact_messages (
     event_id TEXT PRIMARY KEY REFERENCES analyses(id), message_id INTEGER,
     rich INTEGER NOT NULL DEFAULT 0, edit_status TEXT
 );
+CREATE TABLE IF NOT EXISTS fact_message_updates (
+    parent_id TEXT REFERENCES fact_messages(event_id), window TEXT NOT NULL,
+    event_id TEXT NOT NULL REFERENCES analyses(id), PRIMARY KEY(parent_id, window)
+);
 CREATE TABLE IF NOT EXISTS finding_decisions (
     candidate_id TEXT REFERENCES finding_candidates(id), at REAL NOT NULL, decision TEXT NOT NULL
 );
@@ -134,7 +138,8 @@ class Journal:
         with self.db:
             changed = self.db.execute(
                 "UPDATE finding_candidates SET decision=?,analysis_id=COALESCE(?,analysis_id) "
-                "WHERE id=? AND decision<>? AND decision<>'delivered'", (decision, analysis_id, key, decision),
+                "WHERE id=? AND decision<>? AND decision NOT IN ('delivered','delivery_merged','delivery_merge_failed')",
+                (decision, analysis_id, key, decision),
             ).rowcount
             if changed:
                 self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)", (key, now, decision))
@@ -162,6 +167,28 @@ class Journal:
     def fact_message_edit(self, key, state):
         with self.db:
             self.db.execute("UPDATE fact_messages SET edit_status=? WHERE event_id=?", (state, key))
+
+    def recent_fact_message(self, symbol, since):
+        row = self.db.execute("""
+            SELECT a.id FROM analyses a JOIN fact_messages f ON f.event_id=a.id
+            WHERE a.symbol=? AND a.delivery='sent' AND a.delivered_at>=? AND f.message_id IS NOT NULL
+            ORDER BY a.delivered_at DESC LIMIT 1
+        """, (symbol, since)).fetchone()
+        return self.fact_message(row["id"]) if row else None
+
+    def fact_updates(self, parent_id):
+        return {row["window"]: self.decode(row) for row in self.db.execute("""
+            SELECT a.* FROM fact_message_updates u JOIN analyses a ON a.id=u.event_id
+            WHERE u.parent_id=? ORDER BY u.window
+        """, (parent_id,))}
+
+    def merge_fact_message(self, parent_id, key, window, now):
+        with self.db:
+            self.db.execute("""
+                INSERT INTO fact_message_updates VALUES(?,?,?)
+                ON CONFLICT(parent_id, window) DO UPDATE SET event_id=excluded.event_id
+            """, (parent_id, window, key))
+            self._set_delivery(key, "merged", now)
 
     def save_fact_analysis_input(self, key, snapshot):
         with self.db:
@@ -191,26 +218,29 @@ class Journal:
 
     def delivery(self, key, state, at=None):
         with self.db:
-            self.db.execute("UPDATE analyses SET delivery=?,delivered_at=? WHERE id=?", (state, at, key))
-            if state != "sending":
-                decision = "delivered" if state == "sent" else "delivery_" + state
-                candidates = self.db.execute(
-                    "SELECT id FROM finding_candidates WHERE analysis_id=? AND decision<>?", (key, decision),
-                ).fetchall()
-                for candidate in candidates:
-                    self.db.execute("UPDATE finding_candidates SET decision=? WHERE id=?", (decision, candidate["id"]))
-                    self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)",
-                                    (candidate["id"], at if at is not None else time.time(), decision))
-            if state == "sent" and at is not None:
-                self.db.execute("""
-                    INSERT OR IGNORE INTO delivered_moves (analysis_id, delivered_at, rank, target_pct, status)
-                    SELECT a.id, ?, COALESCE(json_extract(a.event,'$.strength.rank'),0),
-                           json_extract(a.snapshot,'$.metrics.natr.value'),
-                           CASE WHEN json_extract(a.snapshot,'$.metrics.natr.quality')='ok'
-                                AND json_extract(a.snapshot,'$.metrics.natr.value')>0
-                                THEN 'pending' ELSE 'no_natr' END
-                    FROM analyses a JOIN finding_candidates c ON c.analysis_id=a.id WHERE a.id=?
-                """, (at, key))
+            self._set_delivery(key, state, at)
+
+    def _set_delivery(self, key, state, at):
+        self.db.execute("UPDATE analyses SET delivery=?,delivered_at=? WHERE id=?", (state, at, key))
+        if state != "sending":
+            decision = "delivered" if state == "sent" else "delivery_" + state
+            candidates = self.db.execute(
+                "SELECT id FROM finding_candidates WHERE analysis_id=? AND decision<>?", (key, decision),
+            ).fetchall()
+            for candidate in candidates:
+                self.db.execute("UPDATE finding_candidates SET decision=? WHERE id=?", (decision, candidate["id"]))
+                self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)",
+                                (candidate["id"], at if at is not None else time.time(), decision))
+        if state == "sent" and at is not None:
+            self.db.execute("""
+                INSERT OR IGNORE INTO delivered_moves (analysis_id, delivered_at, rank, target_pct, status)
+                SELECT a.id, ?, COALESCE(json_extract(a.event,'$.strength.rank'),0),
+                       json_extract(a.snapshot,'$.metrics.natr.value'),
+                       CASE WHEN json_extract(a.snapshot,'$.metrics.natr.quality')='ok'
+                            AND json_extract(a.snapshot,'$.metrics.natr.value')>0
+                            THEN 'pending' ELSE 'no_natr' END
+                FROM analyses a JOIN finding_candidates c ON c.analysis_id=a.id WHERE a.id=?
+            """, (at, key))
 
     def latest(self, symbol, window, limit=1, *, before=None, completed=False, accepted=False):
         sql = "SELECT * FROM analyses WHERE symbol=? AND window=?"
@@ -228,7 +258,7 @@ class Journal:
 
     def last_delivery(self, symbol, window):
         return self.db.execute(
-            "SELECT MAX(delivered_at) FROM analyses WHERE symbol=? AND window=?",
+            "SELECT MAX(delivered_at) FROM analyses WHERE symbol=? AND window=? AND delivery<>'merged'",
             (symbol, window),
         ).fetchone()[0]
 

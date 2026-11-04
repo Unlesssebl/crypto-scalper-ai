@@ -5,7 +5,7 @@ from extensions.scalper.audit import RULESET
 from extensions.scalper.journal import Journal
 from extensions.scalper.quality import calculate_quality
 from extensions.scalper.service import Screener
-from extensions.scalper.shadow import ShadowDetector
+from extensions.scalper.shadow import MINUTE_CONTROL, STRICT_MINUTE, ShadowDetector
 
 
 def snapshot(at, natr=1.0):
@@ -118,6 +118,26 @@ def test_shadow_variants_use_same_snapshot_and_do_not_repeat_an_active_finding(t
         report = calculate_quality(path, 431, ("1m", "5m"))
         assert report["shadow"]["1m"]["Лента от 1,5×"] == {"hit": 1}
         assert report["finding_audit"]["1m"]["candidates"] == 0
+    finally:
+        journal.close()
+
+
+def test_strict_minute_shadow_compares_large_moves_by_symbol_and_time(tmp_path):
+    path = tmp_path / "shadow.sqlite"
+    journal = Journal(path)
+    try:
+        cases = [(MINUTE_CONTROL, "BTC", 100, "hit", 0.6),
+                 (MINUTE_CONTROL, "ETH", 100, "quiet", 0.5),
+                 (MINUTE_CONTROL, "SOL", 100, "missing", 0.8),
+                 (STRICT_MINUTE, "BTC", 160, "pending", None),
+                 (STRICT_MINUTE, "ETH", 161, "pending", None)]
+        journal.db.executemany("""
+            INSERT INTO shadow_findings(variant,symbol,window,detected_at,rank,target_pct,snapshot,status,peak_pct)
+            VALUES (?,?,'1m',?,3,1.0,'{}',?,?)
+        """, cases)
+        journal.db.commit()
+        report = calculate_quality(path, 500, ("1m", "5m"))
+        assert report["minute_shadow"] == {"baseline": 3, "strict": 2, "baseline_moves": 2, "missed_moves": 1}
     finally:
         journal.close()
 

@@ -2,11 +2,12 @@
 from collections import Counter, defaultdict
 from statistics import median
 
-RULESET = "finding-v3"
+RULESET = "finding-v4"
 STRONG_RANK = 3
 RANK_LABELS = {
     "finding-v1": ("Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная"),
     "finding-v2": ("Нет данных", "Фоновая", "Заметная", "Выраженное движение", "Сильное движение"),
+    "finding-v3": ("Нет данных", "Фоновая", "Заметная", "Выраженное движение", "Сильное движение"),
     RULESET: ("Нет данных", "Фоновая", "Заметная", "Выраженное движение", "Сильное движение"),
 }
 MOVE_SECONDS = 300

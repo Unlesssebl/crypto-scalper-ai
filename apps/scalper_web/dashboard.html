@@ -27,7 +27,7 @@ summary{cursor:pointer}pre{overflow:auto;font-size:13px;white-space:pre-wrap}sma
 .quality-report{padding:12px 16px;margin:14px 0}.quality-report p{margin:6px 0 10px}
 td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:320px;overflow:auto}
 .situation{min-width:185px}.hypothesis{background:#21303a;border:1px solid #3a586c;border-radius:9px;padding:10px 12px;margin:8px 0}
-.hypothesis p{margin:5px 0}.hypothesis-cell{min-width:210px}.profile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.hypothesis p{margin:5px 0}.characterization-cell{min-width:240px;max-width:360px}.characterization-cell p{margin:0}.profile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
 </style>
 </head>
 <body><main>
@@ -72,6 +72,7 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <tbody id="finding-delay"></tbody></table>
 <h3>Теневые пороги</h3>
 <p>Движение ≥ NATR за 5 минут после обнаружения. Теневые находки не отправляются.</p>
+<p id="minute-shadow" hidden></p>
 <table aria-label="Теневые пороги">
 <thead><tr><th>Вариант</th><th>Находки</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / нет данных</th></tr></thead>
 <tbody id="shadow-outcomes"></tbody></table>
@@ -99,7 +100,7 @@ const allColumns = [
   ["volume_24h","24h, USD"],["range_ratio","Диапазон к ATR"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
   ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
-  ["facts","Что происходит"],["summary","Гипотеза AI"],["category","Consensus"],["quality","Данные"],
+  ["facts","Что происходит"],["summary","Характеристика AI"],["category","Consensus"],["quality","Данные"],
 ];
 const extraColumns = new Set(["btcCorrelation", "volume_24h", "range_ratio", "volume", "cvd", "open_interest", "funding_rate", "spread", "quality", "category"]);
 let columns;
@@ -157,7 +158,7 @@ function display(row) {
     ai:assessment?.ai.direction, category:assessment?.consensus.category,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
     facts:(row.facts ?? []).join(" · "),
-    summary:assessment?.ai.scenario ?? attempt, captured:assessment?.captured_at,
+    summary:assessment?.ai.summary ?? attempt, captured:assessment?.captured_at,
     comparedNative:assessment?.hyperdata.direction, attempt, queued};
 }
 
@@ -225,13 +226,10 @@ function render() {
         td.textContent = value(shown);
         if (key === "facts") td.className = "situation";
         if (key === "summary" && row.ai) {
-          td.className = "hypothesis-cell";
+          td.className = "characterization-cell";
           td.replaceChildren();
-          const card = node("div", null, td);
-          card.className = "hypothesis";
-          node("strong", directionLabel(row.ai), card);
-          node("p", row.summary, card);
-          node("small", stamp(row.captured), card);
+          node("p", row.summary, td);
+          node("small", stamp(row.captured), td);
         }
         if (["BULLISH","CONSENSUS_LONG"].includes(shown)) td.className = "bull";
         if (["BEARISH","CONSENSUS_SHORT"].includes(shown)) td.className = "bear";
@@ -251,11 +249,6 @@ async function request(path) {
   const result = await fetch(path, {cache:"no-store", signal:AbortSignal.timeout(4500)});
   if (!result.ok) throw new Error("HTTP " + result.status);
   return result.json();
-}
-
-function directionLabel(direction) {
-  return {BULLISH:"Возможен рост", BEARISH:"Возможно снижение", NEUTRAL:"Нейтральный сценарий",
-          INSUFFICIENT_DATA:"Недостаточно данных"}[direction] ?? "Оценка недоступна";
 }
 
 function showProfile(profile, detail) {
@@ -323,15 +316,18 @@ async function loadDetail() {
     }
     showProfile(row.profile, detail);
     const latestAI = row.history.find(event => event.ai?.status === "ok");
-    const hypothesis = node("section", null, detail);
-    hypothesis.className = "hypothesis";
-    node("h3", "Гипотеза AI", hypothesis);
+    const characterization = node("section", null, detail);
+    node("h3", "Характеристика AI", characterization);
     if (latestAI) {
-      node("strong", directionLabel(latestAI.ai.direction), hypothesis);
-      node("p", latestAI.ai.scenario, hypothesis);
-      node("p", "Что наблюдать — " + latestAI.ai.watch, hypothesis);
-      node("small", "Снимок " + stamp(latestAI.captured_at), hypothesis);
-    } else node("p", "Для этого инструмента ещё нет принятой оценки.", hypothesis);
+      node("p", latestAI.ai.summary, characterization);
+      node("small", "Снимок " + stamp(latestAI.captured_at), characterization);
+      if (latestAI.ai.scenario) {
+        const hypothesis = node("section", null, detail);
+        hypothesis.className = "hypothesis";
+        node("h3", "Гипотеза AI", hypothesis);
+        node("p", latestAI.ai.scenario, hypothesis);
+      }
+    } else node("p", "Для этого инструмента ещё нет принятой оценки.", characterization);
     const metrics = node("details", null, detail);
     node("summary", "Метрики и источники данных", metrics);
     const metricTable = node("div", null, metrics);
@@ -382,9 +378,7 @@ async function loadDetail() {
             for (const arg of ai[key]) node("li", arg.metric + " — " + arg.reason, list);
           }
         }
-        for (const [key,label] of [["scenario","Сценарий"],["invalidation","Отмена гипотезы"],["watch","Наблюдение"]]) {
-          node("p", label + " — " + ai[key], item);
-        }
+        if (ai.scenario) node("p", "Гипотеза AI — " + ai.scenario, item);
       }
       node("p", "Telegram " + event.delivery + " · Mark после события " + event.observations.map(o =>
         o.minutes + "m " + (o.status === "observed" ? value(o.price) + " (" + stamp(o.observed_at) + ")" : o.status)).join(" / "), item);
@@ -405,6 +399,12 @@ function renderQuality(report) {
   renderContextExperiment(report?.context_experiment?.[window]);
   renderFindingAudit(report?.finding_audit?.[window]);
   renderShadow(report?.shadow?.[window]);
+  const comparison = window === "1m" ? report?.minute_shadow : null;
+  $("minute-shadow").hidden = !comparison;
+  if (comparison) $("minute-shadow").textContent =
+    `Строгий порог 1m · находок ${comparison.strict} против ${comparison.baseline}. ` +
+    `Из ${comparison.baseline_moves} базовых событий с движением ≥ 0,5% за 5 минут ` +
+    `у ${comparison.missed_moves} не было строгой находки по тому же инструменту в пределах ±60 с.`;
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
     $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
@@ -472,6 +472,7 @@ function renderFindingAudit(audit) {
     delivered:"доставлено", queued:"в очереди", analyzing:"анализируется", delivery_pending:"готовится к отправке",
     tape_unavailable:"нет ленты", book_unavailable:"нет стакана", already_pending:"уже есть событие в очереди",
     queue_full:"очередь заполнена", cooldown:"пауза анализа", delivery_cooldown:"пауза доставки",
+    delivery_merged:"добавлено в сообщение", delivery_merge_failed:"ошибка обновления сообщения",
     stale_at_dispatch:"устарели данные", event_expired:"событие устарело", delivery_below_strength:"ниже порога уведомлений", direction_changed:"направление изменилось", anomaly_ended:"всплеск закончился",
     left_universe:"вне списка", delivery_not_applicable:"без уведомления", delivery_disabled:"Telegram выключен",
     delivery_queue_full:"очередь уведомлений заполнена", delivery_expired:"уведомление устарело",

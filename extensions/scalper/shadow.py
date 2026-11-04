@@ -4,10 +4,16 @@ from .analysis import DIRECTIONAL
 from .audit import STRONG_RANK
 from .profile import fresh
 
+BASELINE = "Текущие пороги"
+MINUTE_CONTROL = "1m · Контроль для строгого порога"
+STRICT_MINUTE = "1m · Цена от 0,25% и 1,5 NATR"
+MOVE_THRESHOLD_PCT = 0.5
 VARIANTS = {
-    "Текущие пороги": {},
+    BASELINE: {},
     "Лента от 1,5×": {"tape_ratio": 1.5},
     "Цена от 0,15% и 1,25 NATR": {"price_floor": 0.15, "price_natr_multiple": 1.25},
+    MINUTE_CONTROL: {},
+    STRICT_MINUTE: {"price_floor": 0.25, "price_natr_multiple": 1.5},
 }
 SHADOW_COOLDOWN = 60
 
@@ -28,6 +34,8 @@ class ShadowDetector:
         direction = native["direction"]
         results = []
         for variant, rules in VARIANTS.items():
+            if variant in (MINUTE_CONTROL, STRICT_MINUTE) and key[1] != "1m":
+                continue
             variant_key = (*key, variant)
             rank = finding_strength(snapshot, native, **rules)["rank"]
             anomalies = active_anomalies(snapshot, tape_ratio=rules.get("tape_ratio", 2.0))
