@@ -40,6 +40,7 @@ class Screener:
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.rows = {}
         self.states = {}
+        self.pending = set()
         self.cooldowns = {}
         self.sequence = 0
         self.jobs = asyncio.PriorityQueue(maxsize=QUEUE_LIMIT)
@@ -80,7 +81,7 @@ class Screener:
         if not trigger:
             self.states[key] = direction, strong
             return
-        if self.jobs.full() or self.cooldowns.get(key, 0) > now:
+        if key in self.pending or self.jobs.full() or self.cooldowns.get(key, 0) > now:
             return
 
         event = {
@@ -88,13 +89,13 @@ class Screener:
             "direction": direction, "native_signal": native["native_signal"],
             "source": native["source"],
         }
-        event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
         self.states[key] = direction, strong
-        self.cooldowns[key] = now + EVENT_COOLDOWN
-        if self.journal.record(event_id, event, snapshot, native):
-            self.sequence += 1
-            priority = 0 if strong else 1 if direction in DIRECTIONAL else 2
-            self.jobs.put_nowait((priority, self.sequence, event_id, snapshot, native))
+        self.pending.add(key)
+        self.sequence += 1
+        # New candidates in one scan have the same age. Let strong events
+        # lead that batch, while older candidates retain priority over new ones.
+        priority = 0 if strong else 1 if direction in DIRECTIONAL else 2
+        self.jobs.put_nowait((now, priority, self.sequence, key, event))
 
     async def run(self):
         while True:
@@ -109,23 +110,39 @@ class Screener:
         while True:
             if self.gemini.key:
                 await asyncio.sleep(max(0, next_request - time.monotonic()))
-            _, _, key, snapshot, native = await self.jobs.get()
+            detected_at, _, _, candidate, event = await self.jobs.get()
+            event_id = None
             try:
-                if time.time() - snapshot["captured_at"] > 55:
-                    ai = {"status": "expired", "snapshot": snapshot_key(snapshot)}
-                elif snapshot["metrics"]["price"]["quality"] != "ok":
-                    ai = {"status": "insufficient_market_data", "snapshot": snapshot_key(snapshot)}
-                else:
-                    next_request = time.monotonic() + AI_INTERVAL
-                    ai = await self.gemini.analyze(snapshot)
-                verdict = compare(snapshot, native, ai)
                 now = time.time()
-                self.journal.finish(key, ai, verdict, now)
-                self.schedule_alert(key, snapshot, native, ai, verdict)
+                row = self.rows.get(candidate)
+                if not row:
+                    continue
+                snapshot, native = row["snapshot"], row["hyperdata"]
+                if (now - snapshot["captured_at"] > 10
+                        or snapshot["metrics"]["price"]["quality"] != "ok"
+                        or native["direction"] == "NOT_AVAILABLE"):
+                    self.states.pop(candidate, None)
+                    continue
+                if native["direction"] != event["direction"]:
+                    # The original transition is obsolete. Let the next scan
+                    # decide whether the new direction merits a fresh event.
+                    continue
+                event = {**event, "detected_at": detected_at, "analyzed_signal": native["native_signal"]}
+                event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
+                if not self.journal.record(event_id, event, snapshot, native):
+                    continue
+                self.cooldowns[candidate] = now + EVENT_COOLDOWN
+                next_request = time.monotonic() + AI_INTERVAL
+                ai = await self.gemini.analyze(snapshot)
+                verdict = compare(snapshot, native, ai)
+                self.journal.finish(event_id, ai, verdict, time.time())
+                self.schedule_alert(event_id, snapshot, native, ai, verdict)
             except Exception:
                 LOG.exception("Event analysis failed")
-                self.journal.delivery(key, "error")
+                if event_id is not None:
+                    self.journal.delivery(event_id, "error")
             finally:
+                self.pending.discard(candidate)
                 self.jobs.task_done()
 
     def schedule_alert(self, key, snapshot, native, ai, verdict):

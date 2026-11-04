@@ -117,6 +117,7 @@ class MarketOverviewDashboard:
         demo: bool = False,
         refresh_rate: int = 10,
         asset_reader=None,
+        signal_reader=None,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -124,6 +125,7 @@ class MarketOverviewDashboard:
         self.cycle = 0
         self.refresh_rate = refresh_rate
         self.asset_reader = asset_reader
+        self.signal_reader = signal_reader
         self.assets: list[AssetInfo] = []
         self.last_update: float = 0.0
         self.update_error: str | None = None
@@ -180,6 +182,10 @@ class MarketOverviewDashboard:
         table.add_column("OI", style="bright_white", justify="right", min_width=10)
         table.add_column("24H VOL", style="bright_white", justify="right", min_width=10)
 
+        if self.signal_reader is not None:
+            table.add_column("1M AI", min_width=10)
+            table.add_column("5M AI", min_width=10)
+
         for idx, asset in enumerate(assets[:limit], 1):
             # Price change coloring
             if asset.price_change_24h_pct >= 0:
@@ -201,6 +207,7 @@ class MarketOverviewDashboard:
                 Text(fmt_funding(asset.funding_rate), style=fund_style),
                 fmt_usd(asset.open_interest),
                 fmt_usd(asset.volume_24h),
+                *(self.signal_reader(asset.symbol) if self.signal_reader else ()),
             )
 
         if not assets:

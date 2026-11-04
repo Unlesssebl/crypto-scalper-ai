@@ -20,7 +20,7 @@ first_trade_price и last_trade_price — наблюдавшиеся сделк�
 OI, funding и стакан по отдельности не задают направление.
 При нехватке данных выбери INSUFFICIENT_DATA. Раздели аргументы и контраргументы.
 Не пересчитывай индикаторы, не добавляй числа или уровни, не давай команд на сделки.
-Пиши по-русски. Каждое текстовое поле ограничено 240 символами.
+Пиши по-русски. В каждом текстовом поле одна короткая фраза, до 160 символов.
 В каждом аргументе metric — ровно один точный ключ из metrics, без списков и объединений.
 Формулируй сценарий как гипотезу."""
 ARGUMENT = {
@@ -65,17 +65,28 @@ def response_schema(snapshot):
     return schema
 
 
-def valid_text(value):
-    return (isinstance(value, str) and 0 < len(value.strip()) <= 240
-            and not any(char.isdigit() for char in value))
+MODEL_NUMBER = re.compile(r"[+−-]?\d+(?:[.,:/–-]\d+)*(?:%|[mM](?!\w))?")
+
+
+def clean_text(value):
+    if not isinstance(value, str):
+        raise ValueError("Invalid model text")
+    text = " ".join(MODEL_NUMBER.sub("…", value).split())
+    if len(text) > 240:
+        text = text[:239].rsplit(" ", 1)[0] + "…"
+    if not any(char.isalpha() for char in text):
+        raise ValueError("Invalid model text")
+    return text
 
 
 def validate(raw, snapshot):
     reply = json.loads(raw)
     if not isinstance(reply, dict) or set(reply) != set(SCHEMA["required"]):
         raise ValueError("Invalid model response structure")
-    if reply["direction"] not in AI_DIRECTIONS or not all(valid_text(reply[key]) for key in TEXT_FIELDS):
-        raise ValueError("Invalid model response fields")
+    if reply["direction"] not in AI_DIRECTIONS:
+        raise ValueError("Invalid model direction")
+    for key in TEXT_FIELDS:
+        reply[key] = clean_text(reply[key])
     usable = {key for key, value in snapshot["metrics"].items()
               if value["quality"] == "ok" and value["value"] is not None}
     for field in ("arguments", "contradictions"):
@@ -84,9 +95,9 @@ def validate(raw, snapshot):
             raise ValueError("Invalid model evidence list")
         for arg in items:
             if (not isinstance(arg, dict) or set(arg) != {"metric", "reason"}
-                    or not isinstance(arg["metric"], str) or arg["metric"] not in usable
-                    or not valid_text(arg["reason"])):
+                    or not isinstance(arg["metric"], str) or arg["metric"] not in usable):
                 raise ValueError("Model cited unavailable evidence")
+            arg["reason"] = clean_text(arg["reason"])
     if reply["direction"] in DIRECTIONAL:
         groups = {GROUPS.get(arg["metric"], arg["metric"]) for arg in reply["arguments"]}
         if "price" not in usable or len(groups) < 2 or "flow" not in groups:
@@ -130,7 +141,7 @@ class Gemini:
         result = {"snapshot": snapshot_key(snapshot), "model": self.model, "provider": self.provider}
         if not self.key:
             return {**result, "status": "unconfigured"}
-        market = json.dumps(blind_payload(snapshot), allow_nan=False)
+        market = json.dumps(blind_payload(snapshot), allow_nan=False, separators=(",", ":"))
         url, request, headers = self.request(market, response_schema(snapshot))
         try:
             async with self.session.post(
@@ -159,11 +170,14 @@ class OpenRouter(Gemini):
             "model": self.model,
             "messages": [{"role": "system", "content": PROMPT}, {"role": "user", "content": market}],
             "provider": {"require_parameters": True},
+            "max_tokens": 1000,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {"name": "scalper_assessment", "strict": True, "schema": schema},
             },
         }
+        if self.model.startswith("deepseek/deepseek-v4.1-flash"):
+            request["reasoning"] = {"enabled": False}
         return "https://openrouter.ai/api/v1/chat/completions", request, {"Authorization": f"Bearer {self.key}"}
 
     def unpack(self, payload):

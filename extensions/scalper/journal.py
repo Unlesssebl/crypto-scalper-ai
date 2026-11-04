@@ -75,13 +75,15 @@ class Journal:
         with self.db:
             self.db.execute("UPDATE analyses SET delivery=?,delivered_at=? WHERE id=?", (state, at, key))
 
-    def latest(self, symbol, window, limit=1, *, before=None, completed=False):
+    def latest(self, symbol, window, limit=1, *, before=None, completed=False, accepted=False):
         sql = "SELECT * FROM analyses WHERE symbol=? AND window=?"
         params = [symbol, window]
         if before is not None:
             sql += " AND captured_at<?"
             params.append(before)
-        if completed:
+        if accepted:
+            sql += " AND json_extract(ai, '$.status') = 'ok'"
+        elif completed:
             sql += " AND ai IS NOT NULL"
         return [self.decode(row) for row in self.db.execute(
             sql + " ORDER BY captured_at DESC LIMIT ?", (*params, limit)

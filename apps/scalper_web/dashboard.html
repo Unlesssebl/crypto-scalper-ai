@@ -8,7 +8,7 @@
 :root{color-scheme:dark;--bg:#10171b;--panel:#172127;--line:#304149;--muted:#a6b7bf;--accent:#7cdec3}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eef4f5;font:15px system-ui,sans-serif}
 main{max-width:1600px;margin:auto;padding:clamp(16px,4vw,54px)}
-header{margin-bottom:30px}h1{margin:8px 0;font-size:clamp(28px,5vw,49px)}h2{font-size:23px}h3{font-size:17px}
+header{margin-bottom:20px}h1{margin:8px 0;font-size:clamp(28px,5vw,49px)}h2{font-size:23px}h3{font-size:17px}
 .kicker{color:var(--accent);letter-spacing:.1em;font-size:12px;font-weight:700}
 p,.muted{color:var(--muted);line-height:1.5}.toolbar{display:flex;gap:15px;align-items:end;flex-wrap:wrap;margin:20px 0}
 label{display:grid;gap:6px;color:var(--muted)}input,select,button{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:8px 10px}
@@ -20,6 +20,11 @@ th button,td button{border:0;padding:0;text-align:left;background:none;color:inh
 td:last-child{min-width:175px}td.symbol{color:var(--accent);font-weight:700}.bull{color:#8ce7c2}.bear{color:#ffad9d}.warn{color:#f4cd83}
 .detail{padding:18px;margin-top:24px}.detail[hidden]{display:none}details{margin:10px 0;border-top:1px solid var(--line);padding-top:12px}
 summary{cursor:pointer}pre{overflow:auto;font-size:13px;white-space:pre-wrap}small{color:var(--muted)}.notes{max-width:850px}
+.overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px}
+.stat{padding:12px 16px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.stat strong{display:block;font-size:23px;margin-top:4px}
+.detail{margin:0 0 16px}.symbol{position:sticky;left:0;background:var(--panel)}
+td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:320px;overflow:auto}
 </style>
 </head>
 <body><main>
@@ -27,16 +32,19 @@ summary{cursor:pointer}pre{overflow:auto;font-size:13px;white-space:pre-wrap}sma
 <h1>Crypto Scalper AI</h1>
 <p>Топ-20 по объёму за 24 часа. Выберите инструмент, чтобы увидеть источники данных и историю оценок.</p>
 <p id="status" role="status">Подключение к HyperData…</p></header>
+<section id="overview" class="overview" aria-label="Состояние рынка"></section>
 <section aria-label="Фильтры" class="toolbar">
 <label>Окно<select id="window"><option>1m</option><option>5m</option></select></label>
 <label>Инструмент<input id="search" type="search" placeholder="Например, BTC"></label>
 <label>Последний Consensus<select id="filter"><option value="">Все</option></select></label>
+<button id="metrics" type="button" aria-pressed="false">Все метрики</button>
 <button id="refresh" type="button">Обновить</button>
 </section>
+<section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
 <div class="panel"><table aria-label="Рыночный скринер">
 <thead id="head"></thead><tbody id="rows"></tbody></table></div>
-<p class="notes">HyperData в таблице показывает текущий Order Flow. AI и Consensus относятся к последнему сохранённому событию, время которого указано рядом с выводом.</p>
-<section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
+<p class="notes">HyperData в таблице показывает текущий Order Flow. AI и Consensus показывают последнюю принятую оценку и время её снимка. Новые попытки отображаются отдельно.</p>
+
 </main>
 <script>
 "use strict";
@@ -48,31 +56,57 @@ const stamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU") : 
 const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
 let data = [], symbol = "", sort = "volume_24h", ascending = false, generation = 0;
 let detailGeneration = 0;
-const columns = [
+const allColumns = [
   ["symbol","Инструмент"],["price","Mark, USD"],["volume_24h","24h, USD"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
   ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
   ["ai","AI"],["category","Consensus"],["quality","Данные"],["summary","Комментарий"],
 ];
+const extraColumns = new Set(["volume", "cvd", "open_interest", "funding_rate", "spread", "quality"]);
+let columns;
 const tableRow = document.createElement("tr");
-for (const [key,label] of columns) {
-  const th = tableRow.appendChild(document.createElement("th"));
-  th.scope = "col";
-  const button = th.appendChild(document.createElement("button"));
-  button.textContent = label;
-  button.onclick = () => { ascending = sort === key ? !ascending : key === "symbol"; sort = key; render(); };
+function renderHead() {
+  columns = allColumns.filter(([key]) => $("metrics").ariaPressed === "true" || !extraColumns.has(key));
+  if (!columns.some(([key]) => key === sort)) { sort = "volume_24h"; ascending = false; }
+  tableRow.replaceChildren();
+  for (const [key,label] of columns) {
+    const th = tableRow.appendChild(document.createElement("th"));
+    th.scope = "col";
+    const button = th.appendChild(document.createElement("button"));
+    button.textContent = label;
+    button.onclick = () => { ascending = sort === key ? !ascending : key === "symbol"; sort = key; render(); };
+  }
 }
 $("head").append(tableRow);
+renderHead();
+
+function missingComment(ai) {
+  if (!ai) return "Пока нет завершённой оценки AI";
+  if (ai.status.startsWith("http_")) return "Ошибка провайдера (" + ai.status.slice(5) + ")";
+  const messages = {
+    expired: "Снимок устарел в очереди",
+    invalid_response: "Ответ AI не прошёл проверку формата",
+    network_error: "Провайдер не ответил вовремя или недоступен",
+    unconfigured: "На момент события AI не был настроен",
+    insufficient_market_data: "Недостаточно свежих рыночных данных",
+    incomplete: "Провайдер вернул неполный ответ",
+  };
+  return messages[ai.status] ?? "Комментарий AI недоступен";
+}
 
 function display(row) {
-  const {snapshot, hyperdata, latest} = row, {metrics} = snapshot;
+  const {snapshot, hyperdata, latest, accepted, queued} = row, {metrics} = snapshot;
   const current = Object.fromEntries(Object.entries(metrics).map(([key, item]) => [
     key, ["ok", "synthetic"].includes(item.quality) ? item.value : null,
   ]));
+  const assessment = accepted ?? (latest?.ai?.status === "ok" ? latest : null);
+  const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
+    : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
   return {...current, symbol:snapshot.symbol, native:hyperdata.direction,
-    ai:latest?.ai?.direction ?? latest?.ai?.status,
-    category:latest?.consensus?.category, quality:metrics.ofi.quality + " / " + metrics.price.quality,
-    summary:latest?.ai?.summary, captured:latest?.captured_at};
+    ai:assessment?.ai.direction, category:assessment?.consensus.category,
+    quality:metrics.ofi.quality + " / " + metrics.price.quality,
+    summary:assessment?.ai.summary ?? attempt, captured:assessment?.captured_at,
+    comparedNative:assessment?.hyperdata.direction, attempt, queued};
 }
 
 function node(tag, text, parent) {
@@ -84,7 +118,7 @@ function node(tag, text, parent) {
 
 function render() {
   const query = $("search").value.trim().toUpperCase(), filter = $("filter").value;
-  const rows = data.map(display).filter(row => row.symbol.includes(query) && (!filter || row.category === filter));
+  const rows = data.map(display).filter(row => row.symbol.toUpperCase().includes(query) && (!filter || row.category === filter));
   rows.sort((a,b) => {
     const x = a[sort], y = b[sort];
     if (x == null || y == null) return (x == null) - (y == null);
@@ -93,6 +127,21 @@ function render() {
   });
   for (const [index,[key]] of columns.entries()) {
     tableRow.cells[index].setAttribute("aria-sort", sort === key ? (ascending ? "ascending" : "descending") : "none");
+  }
+  const market = data.map(display);
+  $("overview").replaceChildren();
+  for (const [label, total] of [
+    ["Инструменты", market.length],
+    ["Order Flow доступен", market.filter(row => row.native !== "NOT_AVAILABLE").length],
+    ["Оценка AI в истории", market.filter(row => row.ai).length],
+    ["В очереди и анализе", market.filter(row => row.queued).length],
+    ["Согласия / расхождения", market.filter(row => row.category?.startsWith("CONSENSUS")).length
+      + " / " + market.filter(row => row.category === "DIVERGENCE").length],
+  ]) {
+    const card = node("div", null, $("overview"));
+    card.className = "stat";
+    node("small", label, card);
+    node("strong", String(total), card);
   }
   $("rows").replaceChildren();
   if (!rows.length) node("td", "Нет строк для выбранных условий.", node("tr", null, $("rows"))).colSpan = columns.length;
@@ -113,7 +162,11 @@ function render() {
         if (["BULLISH","CONSENSUS_LONG"].includes(shown)) td.className = "bull";
         if (["BEARISH","CONSENSUS_SHORT"].includes(shown)) td.className = "bear";
         if (shown === "DIVERGENCE") td.className = "warn";
-        if (key === "category" && row.captured) node("div", stamp(row.captured), td).className = "muted";
+        if (key === "category" && row.captured) {
+          node("small", "HyperData в снимке: " + row.comparedNative, td);
+          node("small", stamp(row.captured), td);
+        }
+        if (key === "summary" && row.ai && row.attempt) node("small", row.attempt, td);
       }
     }
   }
@@ -137,7 +190,14 @@ async function loadDetail() {
     node("button", "Закрыть", detail).onclick = () => { symbol = ""; ++detailGeneration; detail.hidden = true; };
     node("h2", row.snapshot.contract + " · " + window, detail);
     node("p", "Снимок " + stamp(row.snapshot.captured_at) + " · " + row.hyperdata.direction, detail);
-    const table = node("table", null, detail);
+    const latestAI = row.history.find(event => event.ai?.status === "ok");
+    if (latestAI) node("p", latestAI.consensus.category + " · " + stamp(latestAI.captured_at)
+      + " · " + latestAI.ai.summary, detail);
+    const metrics = node("details", null, detail);
+    node("summary", "Метрики и источники данных", metrics);
+    const metricTable = node("div", null, metrics);
+    metricTable.className = "metric-detail";
+    const table = node("table", null, metricTable);
     const header = node("tr", null, node("thead", null, table));
     for (const label of ["Метрика","Значение","Источник","Обновлено","Качество"]) node("th",label,header);
     const body = node("tbody", null, table);
@@ -199,6 +259,13 @@ async function refresh() {
   }
 }
 $("window").onchange = () => { data = []; render(); refresh(); loadDetail(); };
+$("metrics").onclick = () => {
+  const button = $("metrics");
+  button.ariaPressed = button.ariaPressed === "true" ? "false" : "true";
+  button.textContent = button.ariaPressed === "true" ? "Основные метрики" : "Все метрики";
+  renderHead();
+  render();
+};
 $("refresh").onclick = () => { refresh(); loadDetail(); };
 $("search").oninput = $("filter").onchange = render;
 refresh();

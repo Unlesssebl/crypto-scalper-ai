@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 import aiohttp
@@ -46,8 +47,11 @@ class ScalperAPI(HyperDataAPI):
         rows = []
         for (symbol, frame), row in self.service.rows.items():
             if frame == window:
-                latest = self.service.journal.latest(symbol, frame, completed=True)
-                rows.append({**row, "latest": latest[0] if latest else None})
+                latest = self.service.journal.latest(symbol, frame)
+                accepted = self.service.journal.latest(symbol, frame, accepted=True)
+                rows.append({**row, "latest": latest[0] if latest else None,
+                             "accepted": accepted[0] if accepted else None,
+                             "queued": (symbol, frame) in self.service.pending})
         return web.json_response({"mode": self.hub.status.mode,
                                   "market": self.hub.status.market_data,
                                   "gemini": "configured" if self.service.gemini.key else "disabled",
@@ -64,6 +68,24 @@ class ScalperAPI(HyperDataAPI):
             "book": orderbook_details(self.hub, symbol),
             "history": self.service.journal.latest(symbol, window, limit=20),
         })
+
+
+def terminal_signals(journal, symbol):
+    labels = {
+        "CONSENSUS_LONG": "Long", "CONSENSUS_SHORT": "Short", "DIVERGENCE": "Diverge",
+        "HYPERDATA_ONLY": "HD only", "AI_ONLY": "AI only", "NEUTRAL": "Neutral",
+        "INSUFFICIENT_DATA": "No signal",
+    }
+    cells = []
+    for window in WINDOWS:
+        rows = journal.latest(symbol, window, accepted=True)
+        if not rows:
+            cells.append("—")
+            continue
+        event = rows[0]
+        age = max(0, int((time.time() - event["captured_at"]) / 60))
+        cells.append(f'{labels[event["consensus"]["category"]]} {age}m')
+    return cells
 
 
 def analyst(session, demo):
@@ -108,6 +130,7 @@ async def run(args):
                 if args.tui:
                     dashboard = MarketOverviewDashboard(
                         market_data=hub.market, demo=args.demo, asset_reader=hub.get_all_assets,
+                        signal_reader=lambda symbol: terminal_signals(journal, symbol),
                     )
                     await dashboard.run()
                 else:

@@ -91,6 +91,11 @@ def test_gemini_input_and_validation(market):
     assert "STRONG_BULL" not in json.dumps(blind_payload(snapshot))
     reply = model_reply("BULLISH")
     assert validate(json.dumps(reply), snapshot) == reply
+    reply["summary"] = "Непроверенный уровень 12.5"
+    reply["arguments"][0]["reason"] = "Отрицательная дельта за 5m"
+    cleaned = validate(json.dumps(reply), snapshot)
+    assert cleaned["summary"] == "Непроверенный уровень …"
+    assert cleaned["arguments"][0]["reason"] == "Отрицательная дельта за …"
     reply["arguments"][1]["metric"] = "liquidations"
     with pytest.raises(ValueError, match="unavailable evidence"):
         validate(json.dumps(reply), snapshot)
@@ -141,7 +146,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         return True
 
     hub.alerts = SimpleNamespace(send_telegram=send)
-    service = Screener(hub, journal, SimpleNamespace(key=None, analyze=analyze), True)
+    service = Screener(hub, journal, SimpleNamespace(key=None, provider="test", analyze=analyze), True)
     service.scan(now)
     service.scan(now + 5)
     assert service.jobs.qsize() == 2
@@ -154,6 +159,10 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         assert "kPEPE-PERP" in sent[0]
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
+        assert event["event"]["detected_at"] == now
+        assert event["captured_at"] == now + 5
+        assert event["snapshot"]["captured_at"] == event["hyperdata"]["snapshot"]["captured_at"]
+        now = event["captured_at"]
         assert event["delivery"] == "sent"
         assert not journal.record(event["id"], event["event"], event["snapshot"], event["hyperdata"])
 
@@ -174,6 +183,17 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
             response = await client.get("/v1/scalper/kPEPE?window=5m")
             assert response.status == 200
             assert (await response.json())["history"][0]["delivery"] == "sent"
+            newer = {**event["snapshot"], "captured_at": now + 1}
+            identity = snapshot_key(newer)
+            native = {**event["hyperdata"], "snapshot": identity}
+            journal.record("newer", event["event"], newer, native)
+            failure = {"snapshot": identity, "status": "network_error"}
+            journal.finish("newer", failure, compare(newer, native, failure), now + 2)
+            response = await client.get("/v1/scalper?window=5m")
+            row = (await response.json())["rows"][0]
+            assert row["latest"]["id"] == "newer"
+            assert row["accepted"]["id"] == event["id"]
+            assert not row["queued"]
             assert (await client.get("/v1/scalper?window=4h")).status == 400
             assert (await client.get("/scalper")).status == 200
     finally:
