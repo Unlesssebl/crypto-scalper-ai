@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS context_observations (
     PRIMARY KEY(event_id, minutes)
 );
 CREATE INDEX IF NOT EXISTS context_observations_due ON context_observations(due_at) WHERE status = 'pending';
+CREATE TABLE IF NOT EXISTS instrument_samples (
+    symbol TEXT, window TEXT, slot INTEGER,
+    trades REAL, natr REAL, spread_bps REAL, return_pct REAL, imbalance REAL,
+    PRIMARY KEY(symbol, window, slot)
+);
+CREATE INDEX IF NOT EXISTS instrument_samples_slot ON instrument_samples(slot);
 CREATE TABLE IF NOT EXISTS telegram_offsets (
     bot_id INTEGER PRIMARY KEY, next_update INTEGER NOT NULL
 );
@@ -148,6 +154,14 @@ class Journal:
                             f"UPDATE {table} SET status='observed',price=?,observed_at=? WHERE event_id=? AND minutes=?",
                             (price, observed_at, row["event_id"], row["minutes"]),
                         )
+
+    def record_instrument_samples(self, samples):
+        with self.db:
+            self.db.executemany("INSERT OR IGNORE INTO instrument_samples VALUES(?,?,?,?,?,?,?,?)", samples)
+
+    def prune_instrument_samples(self, before):
+        with self.db:
+            self.db.execute("DELETE FROM instrument_samples WHERE slot < ?", (before,))
 
     def telegram_offset(self, bot_id):
         row = self.db.execute("SELECT next_update FROM telegram_offsets WHERE bot_id=?", (bot_id,)).fetchone()

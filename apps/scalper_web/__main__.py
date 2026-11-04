@@ -133,6 +133,7 @@ async def run(args):
                 tasks.append(asyncio.create_task(service.refresh_quality(args.journal), name="scalper-quality"))
                 if not args.demo:
                     tasks.append(asyncio.create_task(service.refresh_activity(), name="scalper-activity"))
+                    tasks.append(asyncio.create_task(service.refresh_profiles(args.journal), name="scalper-profiles"))
                 if notify:
                     tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
                 logging.info("Dashboard: http://127.0.0.1:%d/scalper", args.port)

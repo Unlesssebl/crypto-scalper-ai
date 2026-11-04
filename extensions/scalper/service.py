@@ -12,29 +12,17 @@ from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
 from .market import WINDOWS, capture, metric
 from .quality import calculate_quality
+from .profile import DAY, calculate_profiles, fresh, profile_context, sample_window, situation_facts
 
 LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
 EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
-HYPOTHESIS_MAX_AGE = 900
 QUEUE_LIMIT = 20
 WIDE_SPREAD_ATR_FRACTION = 0.25
 PRIORITY_STEP_SECONDS = 15
 CONTEXT_WINDOW_SECONDS = 900
 CONTEXT_TRIAL_INTERVAL = 10
-ALERT_CATEGORIES = {"CONSENSUS_LONG", "CONSENSUS_SHORT", "DIVERGENCE"}
-
-
-ALERT_TITLES = {
-    "CONSENSUS_LONG": "🟢 Совпадение · вверх",
-    "CONSENSUS_SHORT": "🔴 Совпадение · вниз",
-    "DIVERGENCE": "🟠 Оценки расходятся",
-    "HYPERDATA_ONLY": "🔵 Направление видит только HyperData",
-    "AI_ONLY": "🔵 Направление видит только AI",
-    "NEUTRAL": "⚪ Обе оценки нейтральны",
-    "INSUFFICIENT_DATA": "⚪ Направление не подтверждено",
-}
 ALERT_DIRECTIONS = {
     "BULLISH": "🟢 вверх",
     "BEARISH": "🔴 вниз",
@@ -45,33 +33,29 @@ ALERT_DIRECTIONS = {
 MOSCOW = timezone(timedelta(hours=3), "МСК")
 
 
-def alert_text(snapshot, native, ai, consensus):
+def alert_text(snapshot, ai, event):
     stamp = datetime.fromtimestamp(snapshot["captured_at"], MOSCOW).strftime("%d.%m.%Y в %H:%M:%S %Z")
-    title = ALERT_TITLES[consensus["category"]]
-    native_direction = ALERT_DIRECTIONS[native["direction"]]
-    ai_direction = ALERT_DIRECTIONS.get(ai.get("direction"), ALERT_DIRECTIONS["NOT_AVAILABLE"])
-    ofi = snapshot["metrics"]["ofi"]["value"]
-    flow = ""
-    if "ofi" in native["evidence"] and ofi:
-        flow = " (в потоке преобладают покупки)" if ofi > 0 else " (в потоке преобладают продажи)"
+    labels = {"tape_burst": "Всплеск ленты", "range_burst": "Всплеск диапазона"}
+    reason = " + ".join(labels[name] for name in event.get("anomalies", ()) if name in labels)
     lines = [
-        f"<b>{title}</b>",
-        f'<b>{html.escape(snapshot["contract"])}</b> · {html.escape(snapshot["window"])} · Hyperliquid',
+        f'<b>🟡 {html.escape(snapshot["contract"])} · Стоит посмотреть</b>',
+        f'Hyperliquid · {html.escape(snapshot["window"])} · {reason or "Смена направления потока"}',
         "",
-        f"<b>HyperData</b> — {native_direction}{flow}",
-        f"<b>AI</b> — {ai_direction}",
+        "<b>📊 Что происходит</b>",
+        *(html.escape(fact) for fact in (event.get("facts") or situation_facts(snapshot))),
     ]
-    arguments = ai.get("arguments") or []
-    explanation = ai.get("summary") or (arguments[0]["reason"] if arguments else None)
-    contradictions = ai.get("contradictions") or []
-    details = (
-        ("💬", "Почему", explanation),
-        ("⚠️", "Что против", contradictions[0]["reason"] if contradictions else None),
-        ("🔄", "Когда пересмотреть", ai.get("invalidation")),
-    )
-    for icon, label, detail in details:
-        if detail:
-            lines.extend(("", f"{icon} <b>{label}</b>", html.escape(detail)))
+    if ai["status"] == "ok":
+        direction = ALERT_DIRECTIONS.get(ai.get("direction"), ALERT_DIRECTIONS["NOT_AVAILABLE"])
+        hypothesis = [f"<b>🧠 Гипотеза AI · {direction}</b>"]
+        if ai.get("scenario"):
+            hypothesis.append(html.escape(ai["scenario"]))
+        if ai.get("watch"):
+            hypothesis.append(f'<b>Что наблюдать:</b> {html.escape(ai["watch"])}')
+        if ai.get("invalidation"):
+            hypothesis.append(f'<b>Когда пересмотреть:</b> {html.escape(ai["invalidation"])}')
+        lines.extend(("", "<blockquote>" + "\n".join(hypothesis) + "</blockquote>"))
+    else:
+        lines.extend(("", "<i>Гипотеза AI недоступна для этого снимка.</i>"))
     lines.extend(("", f"🕒 <i>Снимок рынка · {stamp}</i>"))
     return "\n".join(lines)
 
@@ -139,6 +123,9 @@ class Screener:
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.rows = {}
         self.quality_report = None
+        self.profiles = {}
+        self.sample_slots = {}
+        self.last_profile_prune = 0
         self.candles = {}
         self.context_events = 0
         self.states = {}
@@ -157,13 +144,24 @@ class Screener:
                 snapshot, native = capture(self.hub, asset, window, now, self.candles.get(key))
                 native["snapshot"] = snapshot_key(snapshot)
                 rows[key] = {"snapshot": snapshot, "hyperdata": native}
+        samples = []
         for key, row in rows.items():
             snapshot, native = row["snapshot"], row["hyperdata"]
             context = rows.get((key[0], "5m")) if key[1] == "1m" else None
+            profile = self.profiles.get(key)
+            row["facts"] = situation_facts(snapshot, profile)
+            row["profile"] = profile
             row["analysis_gate"] = minute_gate(snapshot)
             row["context_5m"] = five_minute_relation(native, context)
             if not self.hub.demo:
                 self.detect(key, snapshot, native, now, row["analysis_gate"], row["context_5m"])
+                sample = sample_window(snapshot, WINDOWS[key[1]])
+                if sample and self.sample_slots.get(key) != sample[2]:
+                    samples.append(sample)
+        if samples:
+            self.journal.record_instrument_samples(samples)
+            self.sample_slots.update({(sample[0], sample[1]): sample[2] for sample in samples})
+        self.sample_slots = {key: slot for key, slot in self.sample_slots.items() if key in rows}
         self.rows = rows
         self.states = {key: value for key, value in self.states.items() if key in rows}
         self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
@@ -220,6 +218,20 @@ class Screener:
     async def refresh_activity(self):
         await refresh_candles(self.hub, {**WINDOWS, "15m": CONTEXT_WINDOW_SECONDS}, self.candles)
 
+    async def refresh_profiles(self, path):
+        while True:
+            try:
+                now = time.time()
+                symbols = sorted({symbol for symbol, _ in self.rows})
+                if symbols:
+                    self.profiles = await asyncio.to_thread(calculate_profiles, path, now, symbols)
+                    if now - self.last_profile_prune > DAY:
+                        self.journal.prune_instrument_samples(now - 30 * DAY)
+                        self.last_profile_prune = now
+            except Exception:
+                LOG.exception("Instrument profile refresh failed")
+            await asyncio.sleep(300 if self.profiles else 30)
+
     async def refresh_quality(self, path):
         while True:
             try:
@@ -256,9 +268,12 @@ class Screener:
                     continue
                 other_window = "5m" if candidate[1] == "1m" else "1m"
                 baseline = with_context(snapshot, self.rows.get((candidate[0], other_window)))
+                profile = profile_context(self.profiles.get(candidate))
+                if profile:
+                    baseline = {**baseline, "instrument_profile": profile}
                 snapshot = with_senior_context(baseline, self.candles.get((candidate[0], "15m")))
                 event = {**event, "analyzed_signal": native["native_signal"],
-                         "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"]}
+                         "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"], "facts": row["facts"]}
                 event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
                 if not self.journal.record(event_id, event, snapshot, native):
                     continue
@@ -267,7 +282,7 @@ class Screener:
                 ai = await self.gemini.analyze(snapshot)
                 verdict = compare(snapshot, native, ai)
                 self.journal.finish(event_id, ai, verdict, time.time())
-                self.schedule_alert(event_id, snapshot, native, ai, verdict)
+                self.schedule_alert(event_id, snapshot, native, ai, event)
                 if self.gemini.key and "context_15m" in snapshot and f"context_{other_window}" in baseline:
                     sample = self.context_events % CONTEXT_TRIAL_INTERVAL == 0
                     self.context_events += 1
@@ -289,33 +304,28 @@ class Screener:
                 self.pending.discard(candidate)
                 self.jobs.task_done()
 
-    def schedule_alert(self, key, snapshot, native, ai, verdict):
-        symbol, window = snapshot["symbol"], snapshot["window"]
-        previous = self.journal.latest(symbol, window, before=snapshot["captured_at"], completed=True)
-        changed = False
-        if (ai["status"] == "ok" and previous
-                and snapshot["captured_at"] - previous[0]["captured_at"] <= HYPOTHESIS_MAX_AGE):
-            last = previous[0]
-            prior_ai = last["ai"].get("direction")
-            direction = ai.get("direction")
-            native_changed = (last["hyperdata"]["direction"] in DIRECTIONAL
-                              and last["hyperdata"]["direction"] != native["direction"])
-            model_changed = prior_ai in DIRECTIONAL and direction is not None and prior_ai != direction and direction != "INSUFFICIENT_DATA"
-            changed = native_changed or model_changed
+    def schedule_alert(self, key, snapshot, native, ai, event):
+        metrics = snapshot.get("metrics", {})
+        start, end = (fresh(metrics, name) for name in ("first_trade_price", "last_trade_price"))
+        direction = native["direction"]
+        reversal = (event.get("previous_direction") in DIRECTIONAL
+                    and direction in DIRECTIONAL and event["previous_direction"] != direction)
+        price_agrees = (start is not None and end is not None and start != end
+                        and (end > start) == (direction == "BULLISH"))
         state = "not_applicable"
-        if verdict["category"] in ALERT_CATEGORIES or changed:
+        if event.get("anomalies") or (reversal and price_agrees):
             if not self.notify:
                 state = "disabled"
             elif self.notifications.full():
                 state = "queue_full"
             else:
-                self.notifications.put_nowait((key, snapshot, native, ai, verdict))
+                self.notifications.put_nowait((key, snapshot, ai, event))
                 return
         self.journal.delivery(key, state)
 
     async def deliver(self):
         while True:
-            key, snapshot, native, ai, verdict = await self.notifications.get()
+            key, snapshot, ai, event = await self.notifications.get()
             try:
                 now = time.time()
                 last = self.journal.last_delivery(snapshot["symbol"], snapshot["window"])
@@ -326,7 +336,7 @@ class Screener:
                     self.journal.delivery(key, "expired")
                     continue
                 self.journal.delivery(key, "sending", now)
-                sent = await self.hub.alerts.send_telegram(alert_text(snapshot, native, ai, verdict))
+                sent = await self.hub.alerts.send_telegram(alert_text(snapshot, ai, event))
                 self.journal.delivery(key, "sent" if sent else "failed_or_unconfirmed",
                                       time.time() if sent else now)
             except Exception:

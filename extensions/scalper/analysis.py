@@ -10,7 +10,11 @@ DIRECTIONAL = {"BULLISH", "BEARISH"}
 AI_DIRECTIONS = ("BULLISH", "BEARISH", "NEUTRAL", "INSUFFICIENT_DATA")
 TEXT_FIELDS = ("summary", "scenario", "invalidation", "watch")
 KEY_FIELDS = ("symbol", "exchange", "contract", "window", "captured_at")
-PROMPT = """Независимо оцени данный снимок Hyperliquid perpetual для ручного наблюдения.
+PROMPT = """Опиши, что происходит в данном снимке Hyperliquid perpetual и почему инструмент стоит наблюдать.
+В summary перечисляй наблюдения, в scenario формулируй условную гипотезу отдельно.
+В watch предложи наблюдаемый признак подтверждения или ослабления. Не задавай целевую цену.
+instrument_profile, если есть, описывает историческую норму инструмента и размер выборки.
+Используй профиль как фон для сравнения, а не как доказательство текущего направления.
 Используй как доказательства только метрики с quality=ok. Ссылайся на них по metric.
 Направление требует подтверждения из нескольких независимых групп метрик.
 CVD, OFI, число сделок и скорость ленты описывают один поток. Торговый объём даёт контекст.
@@ -64,6 +68,8 @@ def blind_payload(snapshot):
     metrics = snapshot["metrics"]
     payload = {**snapshot_key(snapshot), "metrics": metrics,
                "metric_roles": {key: GROUPS[key] for key in metrics if key in GROUPS}}
+    if profile := snapshot.get("instrument_profile"):
+        payload["instrument_profile"] = profile
     for key in ("context_1m", "context_5m", "context_15m"):
         if context := snapshot.get(key):
             payload[key] = {field: context[field] for field in ("window", "captured_at", "metrics")}

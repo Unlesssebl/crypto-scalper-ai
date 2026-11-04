@@ -12,6 +12,7 @@ from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compa
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.quality import calculate_quality
+from extensions.scalper.profile import calculate_profiles, profile_context, sample_window
 from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context, with_senior_context
 from extensions.scalper.telegram import listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
@@ -136,7 +137,8 @@ async def test_provider_request_uses_json_schema_and_blind_snapshot(market):
     assert result["direction"] == "BEARISH" and result["status"] == "ok"
 
 
-async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
+async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypatch):
+    monkeypatch.setattr("extensions.scalper.service.active_anomalies", lambda snapshot: {"tape_burst"})
     now, hub, asset = market
     journal = Journal(tmp_path / "scalper.sqlite")
     sent = []
@@ -159,11 +161,11 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
         assert len(rows) == 1 and len(sent) == 2
-        assert sent[0].startswith("<b>🟢 Совпадение · вверх</b>\n<b>kPEPE-PERP</b>")
-        assert "<b>HyperData</b> — 🟢 вверх (в потоке преобладают покупки)" in sent[0]
-        assert "<b>AI</b> — 🟢 вверх" in sent[0]
-        assert "<b>Почему</b>" in sent[0] and "МСК" in sent[0]
-        assert "CONSENSUS_LONG" not in sent[0] and "OFI" not in sent[0]
+        assert sent[0].startswith("<b>🟡 kPEPE-PERP · Стоит посмотреть</b>")
+        assert "<b>📊 Что происходит</b>" in sent[0] and "Всплеск ленты" in sent[0]
+        assert "<blockquote><b>🧠 Гипотеза AI · 🟢 вверх</b>" in sent[0] and "МСК" in sent[0]
+        assert sent[0].index("Что происходит") < sent[0].index("Гипотеза AI")
+        assert "CONSENSUS_LONG" not in sent[0]
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
@@ -496,5 +498,28 @@ def test_context_trial_scores_three_arms_from_a_common_post_reply_price(tmp_path
         assert report["horizons"][1]["baseline"]["no_direction"] == 1
         assert report["horizons"][1]["senior"]["incorrect"] == 1
         assert report["horizons"][5]["senior"]["pending"] == 1
+    finally:
+        journal.close()
+
+
+def test_instrument_profiles_count_regular_windows_and_filter_missing_metrics(market, tmp_path):
+    now, hub, asset = market
+    slot = int(now // 60) * 60
+    snapshot, _ = capture(hub, asset, "1m", now)
+    snapshot["captured_at"] = slot + 4
+    sample = sample_window(snapshot, 60)
+    assert sample[:3] == (asset.symbol, "1m", slot)
+    assert sample[3] is not None
+    path = tmp_path / "profiles.sqlite"
+    journal = Journal(path)
+    try:
+        samples = [(asset.symbol, "1m", slot - i * 60, i + 1, None, 2.0, 0.0, None) for i in range(20)]
+        journal.record_instrument_samples(samples + samples)
+        profile = calculate_profiles(path, now, [asset.symbol])[(asset.symbol, "1m")]
+        period = profile["periods"][7]
+        assert period["windows"] == 20
+        assert period["metrics"]["trades"] == {"samples": 20, "median": 10.5, "p90": 18.0}
+        assert "natr" not in period["metrics"]
+        assert "trades" in profile_context(profile)["periods"][7]
     finally:
         journal.close()
