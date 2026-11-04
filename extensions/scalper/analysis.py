@@ -25,7 +25,11 @@ OI, funding и стакан по отдельности не задают нап
 Пиши по-русски. В каждом текстовом поле одна короткая фраза, до 160 символов.
 В каждом аргументе metric — ровно один точный ключ из metrics, без списков и объединений.
 Формулируй сценарий как гипотезу.
-Если есть context_5m, используй его для проверки контекста и объясни заметное расхождение окон.
+Проверяй разные роли метрик: движение цены, направленный поток, интенсивность, волатильность и ликвидность.
+Не считай несколько метрик одной роли отдельными подтверждениями.
+context_1m описывает текущий импульс; context_5m даёт более широкий поток.
+context_15m содержит фон по закрытым свечам: изменение за четыре свечи, их диапазон и положение последнего закрытия.
+Если окна заметно расходятся, объясни это; старшее окно не отменяет автоматически краткий импульс.
 В списках аргументов ссылайся только на ключи основного окна из metrics."""
 ARGUMENT = {
     "type": "object", "required": ["metric", "reason"], "additionalProperties": False,
@@ -43,10 +47,12 @@ SCHEMA = {
 }
 GROUPS = {
     "first_trade_price": "price_action", "last_trade_price": "price_action",
-    "cvd": "flow", "ofi": "flow", "volume": "flow", "trade_count": "flow",
-    "trade_rate": "flow", "activity_ratio": "flow",
+    "cvd": "flow", "ofi": "flow",
+    "volume": "intensity", "volume_24h": "intensity", "trade_count": "intensity",
+    "trade_rate": "intensity", "activity_ratio": "intensity",
     "natr": "volatility", "range_ratio": "volatility",
-    "imbalance": "book", "spread": "book", "best_bid": "book", "best_ask": "book",
+    "imbalance": "book", "spread": "liquidity", "best_bid": "liquidity", "best_ask": "liquidity",
+    "funding_rate": "positioning", "open_interest": "positioning",
 }
 
 
@@ -55,9 +61,12 @@ def snapshot_key(snapshot):
 
 
 def blind_payload(snapshot):
-    payload = {**snapshot_key(snapshot), "metrics": snapshot["metrics"]}
-    if context := snapshot.get("context_5m"):
-        payload["context_5m"] = {field: context[field] for field in ("window", "captured_at", "metrics")}
+    metrics = snapshot["metrics"]
+    payload = {**snapshot_key(snapshot), "metrics": metrics,
+               "metric_roles": {key: GROUPS[key] for key in metrics if key in GROUPS}}
+    for key in ("context_1m", "context_5m", "context_15m"):
+        if context := snapshot.get(key):
+            payload[key] = {field: context[field] for field in ("window", "captured_at", "metrics")}
     return payload
 
 

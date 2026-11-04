@@ -39,7 +39,12 @@ def candle_indicators(candles, seconds, now):
     natr = talib.NATR(high, low, close, timeperiod=14)
     previous_atr = natr[-2] * close[-2] / 100
     true_range = talib.TRANGE(high, low, close)[-1]
+    recent_high, recent_low = max(high[-4:]), min(low[-4:])
     return {
+        "return_4": float((close[-1] / close[-5] - 1) * 100),
+        "range_4": float((recent_high - recent_low) / close[-1] * 100),
+        "range_position_4": float((close[-1] - recent_low) / (recent_high - recent_low))
+                            if recent_high > recent_low else None,
         "closed_at": (times[-1] + interval) / 1000,
         "natr": float(natr[-1]),
         "range_ratio": float(true_range / previous_atr) if previous_atr > 0 else None,

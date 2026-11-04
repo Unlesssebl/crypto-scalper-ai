@@ -48,6 +48,16 @@ def report_text(report, window=None):
                 delay = group["median_delay_seconds"]
                 timing = f"{delay:g} с (n={group['delay_samples']})" if delay is not None else "—"
                 lines.append(f"{label}: {sum(group['attempts'].values())} событий · {ratios} · медиана {timing}")
+        experiment = report.get("context_experiment", {}).get(frame)
+        if experiment and experiment["attempted"]:
+            lines.extend(("", f'🔬 <b>Контекст 15m</b> · принятых пар {experiment["matched"]}/{experiment["attempted"]}'
+                              f' · вывод изменился {experiment["changed"]}'))
+            for minutes in HORIZONS:
+                arms = experiment["horizons"][minutes]
+                scores = [f'{arms[key]["correct"]}/{arms[key]["incorrect"]}'
+                          for key in ("hyperdata", "baseline", "senior")]
+                lines.append(f'{minutes} мин · HyperData {scores[0]} · AI {scores[1]} · AI с 15m {scores[2]}')
+            lines.append("<i>Верно/неверно от цены после готовности обеих оценок.</i>")
     lines.extend(("", "<i>Проверка направления mark. Комиссии и исполнение в расчёт не входят.</i>"))
     return "\n".join(lines)
 

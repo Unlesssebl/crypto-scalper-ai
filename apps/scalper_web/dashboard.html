@@ -53,6 +53,11 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <table aria-label="Результаты AI по триггерам">
 <thead><tr><th>Триггер</th><th>Событий</th><th>1 мин</th><th>5 мин</th><th>15 мин</th><th>Медиана задержки</th></tr></thead>
 <tbody id="quality-triggers"></tbody></table>
+<h3>Проверка контекста 15m</h3>
+<p id="context-pairs">Сравнение выполняется на части событий.</p>
+<table aria-label="Парное сравнение контекста">
+<thead><tr><th>Горизонт</th><th>HyperData</th><th>AI 1m + 5m</th><th>AI с 15m</th></tr></thead>
+<tbody id="context-outcomes"></tbody></table>
 <small id="quality-updated"></small>
 </details>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
@@ -251,6 +256,15 @@ async function loadDetail() {
       node("summary", stamp(event.captured_at) + " · " + (event.consensus?.category ?? event.delivery), item);
       node("p", "HyperData " + event.hyperdata.direction + " · AI " +
         (ai?.direction ?? ai?.status ?? "—") + " · " + (event.consensus?.overlap ?? "—"), item);
+      const context15m = event.snapshot.context_15m;
+      if (context15m) {
+        const metrics = context15m.metrics;
+        const position = metrics.range_position_4?.value;
+        node("p", "Фон 15m · изменение за четыре свечи " + value(metrics.return_4?.value) + "%"
+          + " · диапазон " + value(metrics.range_4?.value) + "%"
+          + (position == null ? "" : " · закрытие на " + value(position * 100) + "% диапазона")
+          + " · " + stamp(context15m.captured_at), item);
+      }
       if (ai?.summary) {
         node("p", ai.summary, item);
         for (const [key, title] of [["arguments","Аргументы"],["contradictions","Противоречия"]]) {
@@ -280,6 +294,7 @@ function renderQuality(report) {
   const result = report?.windows[window];
   $("quality-outcomes").replaceChildren();
   $("quality-triggers").replaceChildren();
+  renderContextExperiment(report?.context_experiment?.[window]);
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
     $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
@@ -310,6 +325,27 @@ function renderQuality(report) {
     }
     const delay = group.median_delay_seconds;
     node("td", delay == null ? "—" : value(delay) + " с (n=" + group.delay_samples + ")", row);
+  }
+}
+
+function renderContextExperiment(experiment) {
+  const body = $("context-outcomes");
+  body.replaceChildren();
+  $("context-pairs").textContent = experiment
+    ? "Пары с двумя принятыми ответами: " + experiment.matched + " из " + experiment.attempted
+      + " · Вывод изменился: " + experiment.changed
+      + " · Верно / неверно. Цена отсчитывается после готовности обеих оценок."
+    : "Сравнение выполняется на части событий.";
+  if (!experiment) return;
+  for (const [minutes, arms] of Object.entries(experiment.horizons)) {
+    const row = node("tr", null, body);
+    node("th", minutes + " мин", row).scope = "row";
+    for (const key of ["hyperdata", "baseline", "senior"]) {
+      const a = arms[key];
+      const cell = node("td", a.correct + " / " + a.incorrect, row);
+      node("small", "Без направления " + a.no_direction + " · без движения " + a.flat
+        + " · ждём " + a.pending + " · нет цены " + a.missing, cell);
+    }
   }
 }
 

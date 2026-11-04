@@ -12,7 +12,7 @@ from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compa
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.quality import calculate_quality
-from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context
+from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context, with_senior_context
 from extensions.scalper.telegram import listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
@@ -456,3 +456,45 @@ def test_minute_queue_prioritizes_agreement_and_deprioritizes_wide_spread(market
     assert [service.jobs.get_nowait()[3][0] for _ in range(service.jobs.qsize())] == [
         "aligned", "normal", "wide",
     ]
+
+
+def test_senior_context_uses_closed_candles_and_is_in_blind_payload(market):
+    now, hub, asset = market
+    snapshot, _ = capture(hub, asset, "1m", now)
+    latest_open = int(now // 900) * 900_000
+    bars = [{"timestamp": latest_open + i * 900_000, "high": 101, "low": 99, "close": 100}
+            for i in range(-20, 1)]
+    bars[-2].update(high=105, close=104)
+    bars[-1].update(high=190, close=190)
+    senior = candle_indicators(bars, 900, now)
+    assert senior["return_4"] == pytest.approx(4)
+    assert senior["range_position_4"] == pytest.approx(5 / 6)
+    enriched = with_senior_context(snapshot, senior)
+    payload = blind_payload(enriched)
+    assert payload["context_15m"]["metrics"]["return_4"]["value"] == pytest.approx(4)
+    assert payload["metric_roles"]["trade_rate"] == "intensity"
+    assert payload["metric_roles"]["ofi"] == "flow"
+    assert "context_15m" not in with_senior_context({**snapshot, "captured_at": now + 1800}, senior)
+    assert snapshot_key(enriched) == snapshot_key(snapshot)
+
+
+def test_context_trial_scores_three_arms_from_a_common_post_reply_price(tmp_path):
+    path = tmp_path / "scalper.sqlite"
+    journal = Journal(path)
+    try:
+        snapshot = {"symbol": "BTC", "window": "1m", "captured_at": 100,
+                    "metrics": {"price": {"quality": "ok", "value": 90}}}
+        journal.record("pair", {}, snapshot, {"direction": "BEARISH"})
+        journal.finish("pair", {"status": "ok", "direction": "BULLISH"}, {}, 103)
+        journal.record_context_trial("pair", {"status": "ok", "direction": "NEUTRAL"}, 110)
+        journal.observe(110, {"BTC": (95, 109)})
+        journal.observe(115, {"BTC": (100, 114)})
+        journal.observe(172, {"BTC": (99, 171)})
+        report = calculate_quality(path, 172, ("1m", "5m"))["context_experiment"]["1m"]
+        assert (report["attempted"], report["matched"], report["changed"]) == (1, 1, 1)
+        assert report["horizons"][1]["hyperdata"]["correct"] == 1
+        assert report["horizons"][1]["baseline"]["no_direction"] == 1
+        assert report["horizons"][1]["senior"]["incorrect"] == 1
+        assert report["horizons"][5]["senior"]["pending"] == 1
+    finally:
+        journal.close()

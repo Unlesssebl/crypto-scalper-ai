@@ -7,10 +7,10 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 
-from .activity import active_anomalies, refresh_candles
+from .activity import CANDLE_SOURCE, active_anomalies, refresh_candles
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
-from .market import WINDOWS, capture
+from .market import WINDOWS, capture, metric
 from .quality import calculate_quality
 
 LOG = logging.getLogger(__name__)
@@ -21,6 +21,8 @@ HYPOTHESIS_MAX_AGE = 900
 QUEUE_LIMIT = 20
 WIDE_SPREAD_ATR_FRACTION = 0.25
 PRIORITY_STEP_SECONDS = 15
+CONTEXT_WINDOW_SECONDS = 900
+CONTEXT_TRIAL_INTERVAL = 10
 ALERT_CATEGORIES = {"CONSENSUS_LONG", "CONSENSUS_SHORT", "DIVERGENCE"}
 
 
@@ -102,17 +104,34 @@ def five_minute_relation(native, context):
 
 
 def with_context(snapshot, context):
-    if snapshot["window"] != "1m" or not context:
+    if not context:
         return snapshot
-    longer = context["snapshot"]
-    keys = ("ofi", "cvd", "trade_count", "activity_ratio", "natr", "range_ratio",
-            "first_trade_price", "last_trade_price")
-    metrics = {name: longer["metrics"][name] for name in keys
-               if longer["metrics"][name]["quality"] == "ok"}
+    other = context["snapshot"]
+    window = other["window"]
+    if (window not in WINDOWS or window == snapshot["window"]
+            or other["symbol"] != snapshot["symbol"]
+            or other["captured_at"] != snapshot["captured_at"]):
+        return snapshot
+    keys = ("ofi", "trade_count", "activity_ratio", "natr", "range_ratio",
+            "first_trade_price", "last_trade_price", "spread", "imbalance")
+    metrics = {name: other["metrics"][name] for name in keys
+               if other["metrics"][name]["quality"] == "ok"}
     if not metrics:
         return snapshot
-    return {**snapshot, "context_5m": {"window": "5m", "captured_at": longer["captured_at"],
-                                      "metrics": metrics}}
+    return {**snapshot, f"context_{window}": {"window": window, "captured_at": other["captured_at"],
+                                            "metrics": metrics}}
+
+
+def with_senior_context(snapshot, candles):
+    if not candles:
+        return snapshot
+    closed_at = candles["closed_at"]
+    if not 0 <= snapshot["captured_at"] - closed_at <= CONTEXT_WINDOW_SECONDS + 90:
+        return snapshot
+    units = {"return_4": "%", "range_4": "%", "range_position_4": "ratio", "natr": "%"}
+    metrics = {name: metric(candles[name], CANDLE_SOURCE, closed_at, unit)
+               for name, unit in units.items() if candles[name] is not None}
+    return {**snapshot, "context_15m": {"window": "15m", "captured_at": closed_at, "metrics": metrics}}
 
 
 class Screener:
@@ -121,6 +140,7 @@ class Screener:
         self.rows = {}
         self.quality_report = None
         self.candles = {}
+        self.context_events = 0
         self.states = {}
         self.pending = set()
         self.cooldowns = {}
@@ -198,7 +218,7 @@ class Screener:
             await asyncio.sleep(5)
 
     async def refresh_activity(self):
-        await refresh_candles(self.hub, WINDOWS, self.candles)
+        await refresh_candles(self.hub, {**WINDOWS, "15m": CONTEXT_WINDOW_SECONDS}, self.candles)
 
     async def refresh_quality(self, path):
         while True:
@@ -234,8 +254,9 @@ class Screener:
                     # The original transition is obsolete. Let the next scan
                     # decide whether the new direction merits a fresh event.
                     continue
-                if candidate[1] == "1m":
-                    snapshot = with_context(snapshot, self.rows.get((candidate[0], "5m")))
+                other_window = "5m" if candidate[1] == "1m" else "1m"
+                baseline = with_context(snapshot, self.rows.get((candidate[0], other_window)))
+                snapshot = with_senior_context(baseline, self.candles.get((candidate[0], "15m")))
                 event = {**event, "analyzed_signal": native["native_signal"],
                          "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"]}
                 event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
@@ -247,6 +268,19 @@ class Screener:
                 verdict = compare(snapshot, native, ai)
                 self.journal.finish(event_id, ai, verdict, time.time())
                 self.schedule_alert(event_id, snapshot, native, ai, verdict)
+                if self.gemini.key and "context_15m" in snapshot and f"context_{other_window}" in baseline:
+                    sample = self.context_events % CONTEXT_TRIAL_INTERVAL == 0
+                    self.context_events += 1
+                    if sample:
+                        await asyncio.sleep(max(0, next_request - time.monotonic()))
+                        next_request = time.monotonic() + AI_INTERVAL
+                        try:
+                            comparison = await self.gemini.analyze(baseline)
+                            if comparison.get("snapshot") != snapshot_key(snapshot):
+                                raise ValueError("Mismatched comparison snapshot")
+                            self.journal.record_context_trial(event_id, comparison, time.time())
+                        except Exception:
+                            LOG.exception("Context comparison failed")
             except Exception:
                 LOG.exception("Event analysis failed")
                 if event_id is not None:

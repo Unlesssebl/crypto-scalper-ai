@@ -16,6 +16,16 @@ CREATE TABLE IF NOT EXISTS observations (
     observed_at REAL, price REAL, status TEXT NOT NULL DEFAULT 'pending',
     PRIMARY KEY(event_id, minutes)
 );
+CREATE TABLE IF NOT EXISTS context_trials (
+    event_id TEXT PRIMARY KEY REFERENCES analyses(id), baseline_ai TEXT NOT NULL, ready_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS context_trials_ready ON context_trials(ready_at);
+CREATE TABLE IF NOT EXISTS context_observations (
+    event_id TEXT REFERENCES context_trials(event_id), minutes INTEGER, due_at REAL NOT NULL,
+    observed_at REAL, price REAL, status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(event_id, minutes)
+);
+CREATE INDEX IF NOT EXISTS context_observations_due ON context_observations(due_at) WHERE status = 'pending';
 CREATE TABLE IF NOT EXISTS telegram_offsets (
     bot_id INTEGER PRIMARY KEY, next_update INTEGER NOT NULL
 );
@@ -109,23 +119,35 @@ class Journal:
         )]
         return data
 
+    def record_context_trial(self, key, baseline_ai, ready_at):
+        with self.db:
+            inserted = self.db.execute(
+                "INSERT OR IGNORE INTO context_trials VALUES(?,?,?)", (key, dump(baseline_ai), ready_at),
+            ).rowcount
+            if inserted:
+                self.db.executemany(
+                    "INSERT INTO context_observations(event_id,minutes,due_at) VALUES(?,?,?)",
+                    ((key, minutes, ready_at + 60 * minutes) for minutes in (0, 1, 5, 15)),
+                )
+
     def observe(self, now, prices):
         with self.db:
-            self.db.execute("UPDATE observations SET status='missed' WHERE status='pending' AND due_at<?",
-                            (now - 30,))
-            for row in self.db.execute(
-                "SELECT o.*,a.symbol FROM observations o JOIN analyses a ON o.event_id=a.id "
-                "WHERE o.status='pending' AND o.due_at<=?", (now,)
-            ).fetchall():
-                value = prices.get(row["symbol"])
-                if value is None:
-                    continue
-                price, observed_at = value
-                if row["due_at"] <= observed_at <= now:
-                    self.db.execute(
-                        "UPDATE observations SET status='observed',price=?,observed_at=? WHERE event_id=? AND minutes=?",
-                        (price, observed_at, row["event_id"], row["minutes"]),
-                    )
+            for table in ("observations", "context_observations"):
+                self.db.execute(f"UPDATE {table} SET status='missed' WHERE status='pending' AND due_at<?",
+                                (now - 30,))
+                for row in self.db.execute(
+                    f"SELECT o.*,a.symbol FROM {table} o JOIN analyses a ON o.event_id=a.id "
+                    "WHERE o.status='pending' AND o.due_at<=?", (now,)
+                ).fetchall():
+                    value = prices.get(row["symbol"])
+                    if value is None:
+                        continue
+                    price, observed_at = value
+                    if row["due_at"] <= observed_at <= now:
+                        self.db.execute(
+                            f"UPDATE {table} SET status='observed',price=?,observed_at=? WHERE event_id=? AND minutes=?",
+                            (price, observed_at, row["event_id"], row["minutes"]),
+                        )
 
     def telegram_offset(self, bot_id):
         row = self.db.execute("SELECT next_update FROM telegram_offsets WHERE bot_id=?", (bot_id,)).fetchone()

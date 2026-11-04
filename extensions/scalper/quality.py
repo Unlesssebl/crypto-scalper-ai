@@ -59,6 +59,48 @@ def attempt(row):
     return "error"
 
 
+CONTEXT_ARMS = ("hyperdata", "baseline", "senior")
+
+
+def context_quality(db, since, now, windows):
+    results = {window: {
+        "attempted": 0, "matched": 0, "changed": 0,
+        "horizons": {minutes: {arm: dict.fromkeys((*OUTCOMES, "no_direction"), 0) for arm in CONTEXT_ARMS}
+                     for minutes in HORIZONS},
+    } for window in windows}
+    rows = db.execute("""
+        SELECT a.window, a.hyperdata, a.ai, t.baseline_ai, o.minutes, o.price, o.status,
+               anchor.price AS anchor_price, anchor.status AS anchor_status
+        FROM context_trials t JOIN analyses a ON a.id = t.event_id
+        JOIN context_observations o ON o.event_id = t.event_id
+        JOIN context_observations anchor ON anchor.event_id = t.event_id AND anchor.minutes = 0
+        WHERE t.ready_at BETWEEN ? AND ?
+    """, (since, now))
+    for row in rows:
+        if row["window"] not in results:
+            continue
+        result = results[row["window"]]
+        primary, baseline = json.loads(row["ai"]), json.loads(row["baseline_ai"])
+        matched = primary["status"] == baseline["status"] == "ok"
+        if row["minutes"] == 0:
+            result["attempted"] += 1
+            result["matched"] += matched
+            result["changed"] += matched and primary["direction"] != baseline["direction"]
+            continue
+        if not matched:
+            continue
+        directions = (json.loads(row["hyperdata"])["direction"], baseline["direction"], primary["direction"])
+        for arm, direction in zip(CONTEXT_ARMS, directions):
+            if direction not in {"BULLISH", "BEARISH"}:
+                category = "no_direction"
+            elif row["anchor_status"] == "pending":
+                category = "pending"
+            else:
+                category = outcome(direction, row["anchor_price"], row["price"], row["status"])
+            result["horizons"][row["minutes"]][arm][category] += 1
+    return results
+
+
 def calculate_quality(path, now, windows):
     since = now - PERIOD_SECONDS
     results = {window: {**counters(), "triggers": {}} for window in windows}
@@ -98,6 +140,7 @@ def calculate_quality(path, now, windows):
                 result = outcome(row["direction"], row["start_price"], row["end_price"], row["observation"])
                 for target in (window, group):
                     target["horizons"][row["minutes"]][result] += 1
+        experiments = context_quality(db, since, now, windows)
     for window in results.values():
         for target in (window, *window["triggers"].values()):
             for counts in target["horizons"].values():
@@ -106,4 +149,5 @@ def calculate_quality(path, now, windows):
             delays = group.pop("delays")
             group["median_delay_seconds"] = round(median(delays), 1) if delays else None
             group["delay_samples"] = len(delays)
-    return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS}
+    return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS,
+            "context_experiment": experiments}
