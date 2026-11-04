@@ -19,6 +19,8 @@ EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
 HYPOTHESIS_MAX_AGE = 900
 QUEUE_LIMIT = 20
+WIDE_SPREAD_ATR_FRACTION = 0.25
+PRIORITY_STEP_SECONDS = 15
 ALERT_CATEGORIES = {"CONSENSUS_LONG", "CONSENSUS_SHORT", "DIVERGENCE"}
 
 
@@ -70,6 +72,47 @@ def alert_text(snapshot, native, ai, consensus):
     return "\n".join(lines)
 
 
+def minute_gate(snapshot):
+    if snapshot["window"] != "1m":
+        return "ready"
+    metrics = snapshot["metrics"]
+    if metrics["ofi"]["quality"] != "ok":
+        return "tape_unavailable"
+    if metrics["spread"]["quality"] != "ok":
+        return "book_unavailable"
+    spread, mark, natr = (metrics[name] for name in ("spread", "price", "natr"))
+    if (mark["quality"] == natr["quality"] == "ok" and mark["value"] > 0 and natr["value"] > 0
+            and 100 * spread["value"] / mark["value"] >= WIDE_SPREAD_ATR_FRACTION * natr["value"]):
+        return "wide_spread"
+    return "ready"
+
+
+def five_minute_relation(native, context):
+    if not context:
+        return "unavailable"
+    other = context["hyperdata"]["direction"]
+    if other == "NOT_AVAILABLE":
+        return "unavailable"
+    direction = native["direction"]
+    if direction in DIRECTIONAL and other in DIRECTIONAL:
+        return "aligned" if direction == other else "opposed"
+    return "neutral"
+
+
+def with_context(snapshot, context):
+    if snapshot["window"] != "1m" or not context:
+        return snapshot
+    longer = context["snapshot"]
+    keys = ("ofi", "cvd", "trade_count", "activity_ratio", "natr", "range_ratio",
+            "first_trade_price", "last_trade_price")
+    metrics = {name: longer["metrics"][name] for name in keys
+               if longer["metrics"][name]["quality"] == "ok"}
+    if not metrics:
+        return snapshot
+    return {**snapshot, "context_5m": {"window": "5m", "captured_at": longer["captured_at"],
+                                      "metrics": metrics}}
+
+
 class Screener:
     def __init__(self, hub, journal, gemini, notify):
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
@@ -92,8 +135,13 @@ class Screener:
                 snapshot, native = capture(self.hub, asset, window, now, self.candles.get(key))
                 native["snapshot"] = snapshot_key(snapshot)
                 rows[key] = {"snapshot": snapshot, "hyperdata": native}
-                if not self.hub.demo:
-                    self.detect(key, snapshot, native, now)
+        for key, row in rows.items():
+            snapshot, native = row["snapshot"], row["hyperdata"]
+            context = rows.get((key[0], "5m")) if key[1] == "1m" else None
+            row["analysis_gate"] = minute_gate(snapshot)
+            row["context_5m"] = five_minute_relation(native, context)
+            if not self.hub.demo:
+                self.detect(key, snapshot, native, now, row["analysis_gate"], row["context_5m"])
         self.rows = rows
         self.states = {key: value for key, value in self.states.items() if key in rows}
         self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
@@ -106,13 +154,13 @@ class Screener:
                       and math.isfinite(asset.mark_price) and asset.mark_price > 0}
         self.journal.observe(now, prices)
 
-    def detect(self, key, snapshot, native, now):
+    def detect(self, key, snapshot, native, now, gate, relation):
         direction = native["direction"]
         anomalies = active_anomalies(snapshot)
         previous, was_strong, previous_anomalies = self.states.get(key, (None, False, frozenset()))
         new_anomalies = anomalies - previous_anomalies
         strong = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
-        if direction == "NOT_AVAILABLE":
+        if direction == "NOT_AVAILABLE" or gate in {"tape_unavailable", "book_unavailable"}:
             return
         trigger = ((direction in DIRECTIONAL and direction != previous)
                    or (previous in DIRECTIONAL and direction == "NEUTRAL")
@@ -127,7 +175,7 @@ class Screener:
             "type": "market_activity" if new_anomalies else "orderflow_transition",
             "anomalies": sorted(new_anomalies), "previous_direction": previous,
             "direction": direction, "native_signal": native["native_signal"],
-            "source": native["source"],
+            "source": native["source"], "detected_at": now,
         }
         self.states[key] = direction, strong, anomalies
         self.pending.add(key)
@@ -135,7 +183,9 @@ class Screener:
         # New candidates in one scan have the same age. Let strong events
         # lead that batch, while older candidates retain priority over new ones.
         priority = 0 if new_anomalies else 1 if strong else 2 if direction in DIRECTIONAL else 3
-        self.jobs.put_nowait((now, priority, self.sequence, key, event))
+        # Bounded adjustments let agreement and book quality matter without starving old events.
+        order_at = now + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
+        self.jobs.put_nowait((order_at, priority, self.sequence, key, event))
 
     async def run(self):
         while True:
@@ -161,7 +211,7 @@ class Screener:
         while True:
             if self.gemini.key:
                 await asyncio.sleep(max(0, next_request - time.monotonic()))
-            detected_at, _, _, candidate, event = await self.jobs.get()
+            _, _, _, candidate, event = await self.jobs.get()
             event_id = None
             try:
                 now = time.time()
@@ -171,7 +221,8 @@ class Screener:
                 snapshot, native = row["snapshot"], row["hyperdata"]
                 if (now - snapshot["captured_at"] > 10
                         or snapshot["metrics"]["price"]["quality"] != "ok"
-                        or native["direction"] == "NOT_AVAILABLE"):
+                        or native["direction"] == "NOT_AVAILABLE"
+                        or row["analysis_gate"] in {"tape_unavailable", "book_unavailable"}):
                     self.states.pop(candidate, None)
                     continue
                 if event["anomalies"] and not active_anomalies(snapshot).intersection(event["anomalies"]):
@@ -181,7 +232,10 @@ class Screener:
                     # The original transition is obsolete. Let the next scan
                     # decide whether the new direction merits a fresh event.
                     continue
-                event = {**event, "detected_at": detected_at, "analyzed_signal": native["native_signal"]}
+                if candidate[1] == "1m":
+                    snapshot = with_context(snapshot, self.rows.get((candidate[0], "5m")))
+                event = {**event, "analyzed_signal": native["native_signal"],
+                         "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"]}
                 event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
                 if not self.journal.record(event_id, event, snapshot, native):
                     continue

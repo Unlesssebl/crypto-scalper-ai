@@ -6,7 +6,7 @@ import time
 
 import aiohttp
 
-from .quality import HORIZONS
+from .quality import HORIZONS, TRIGGERS
 
 LOG = logging.getLogger(__name__)
 REPORT = re.compile(r"/report(?:@([a-zA-Z0-9_]+))?(?:\s+(1m|5m))?", re.IGNORECASE)
@@ -31,6 +31,17 @@ def report_text(report, window=None):
                 f'{minutes} мин: верно {h["correct"]}, неверно {h["incorrect"]}, '
                 f'без движения {h["flat"]}, ждём {h["pending"]}, нет цены {h["missing"]}.'
             )
+        if data.get("triggers"):
+            lines.append("<b>По триггерам</b> · верно/неверно на 1, 5 и 15 мин")
+            for name, label in TRIGGERS.items():
+                group = data["triggers"].get(name)
+                if not group:
+                    continue
+                ratios = ", ".join(f'{group["horizons"][m]["correct"]}/{group["horizons"][m]["incorrect"]}'
+                                   for m in HORIZONS)
+                delay = group["median_delay_seconds"]
+                timing = f"{delay:g} с (n={group['delay_samples']})" if delay is not None else "—"
+                lines.append(f"{label}: {sum(group['attempts'].values())} событий · {ratios} · медиана {timing}")
     lines.extend(("", "<i>Проверка направления mark. Комиссии и исполнение в расчёт не входят.</i>"))
     return "\n".join(lines)
 

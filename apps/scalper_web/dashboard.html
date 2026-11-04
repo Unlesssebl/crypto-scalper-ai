@@ -48,6 +48,11 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <table aria-label="Проверка направления AI">
 <thead><tr><th>Горизонт</th><th>Верно</th><th>Неверно</th><th>Без изменения</th><th>Ожидается цена</th><th>Нет наблюдения</th></tr></thead>
 <tbody id="quality-outcomes"></tbody></table>
+<h3>Результаты по триггерам</h3>
+<p>В колонках горизонтов — верные и неверные направления. Задержка считается от события до завершения попытки.</p>
+<table aria-label="Результаты AI по триггерам">
+<thead><tr><th>Триггер</th><th>Событий</th><th>1 мин</th><th>5 мин</th><th>15 мин</th><th>Медиана задержки</th></tr></thead>
+<tbody id="quality-triggers"></tbody></table>
 <small id="quality-updated"></small>
 </details>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
@@ -108,13 +113,22 @@ function missingComment(ai) {
 
 function display(row) {
   const {snapshot, hyperdata, latest, accepted, queued, anomalies = []} = row, {metrics} = snapshot;
+  const notes = [];
+  if (snapshot.window === "1m") {
+    const gate = {tape_unavailable:"Лента ещё недоступна", book_unavailable:"Нет свежего стакана",
+                  wide_spread:"Широкий спред · ниже приоритет"}[row.analysis_gate];
+    const context = {aligned:"5m подтверждает", opposed:"5m расходится", neutral:"5m без согласованного направления",
+                     unavailable:"Нет направленной оценки 5m"}[row.context_5m];
+    if (gate) notes.push(gate);
+    if (context) notes.push(context);
+  }
   const current = Object.fromEntries(Object.entries(metrics).map(([key, item]) => [
     key, ["ok", "synthetic"].includes(item.quality) ? item.value : null,
   ]));
   const assessment = accepted ?? (latest?.ai?.status === "ok" ? latest : null);
   const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
     : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
-  return {...current, symbol:snapshot.symbol, native:hyperdata.direction,
+  return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes,
     anomalies: anomalies.map(name => ({tape_burst:"Лента", range_burst:"Диапазон"})[name]).join(" · ") || null,
     ai:assessment?.ai.direction, category:assessment?.consensus.category,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
@@ -182,6 +196,7 @@ function render() {
           node("small", stamp(row.captured), td);
         }
         if (key === "summary" && row.ai && row.attempt) node("small", row.attempt, td);
+        if (key === "native") for (const note of row.notes) node("small", note, td);
       }
     }
   }
@@ -264,6 +279,7 @@ function renderQuality(report) {
   const window = $("window").value;
   const result = report?.windows[window];
   $("quality-outcomes").replaceChildren();
+  $("quality-triggers").replaceChildren();
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
     $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
@@ -281,6 +297,19 @@ function renderQuality(report) {
       if (key === "correct") cell.className = "bull";
       if (key === "incorrect") cell.className = "bear";
     }
+  }
+  for (const [key, label] of Object.entries(report.trigger_labels ?? {})) {
+    const group = result.triggers?.[key];
+    if (!group) continue;
+    const row = node("tr", null, $("quality-triggers"));
+    node("th", label, row).scope = "row";
+    node("td", Object.values(group.attempts).reduce((a, b) => a + b, 0), row);
+    for (const minutes of [1, 5, 15]) {
+      const counts = group.horizons[minutes];
+      node("td", counts.correct + " / " + counts.incorrect, row);
+    }
+    const delay = group.median_delay_seconds;
+    node("td", delay == null ? "—" : value(delay) + " с (n=" + group.delay_samples + ")", row);
   }
 }
 

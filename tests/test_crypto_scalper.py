@@ -12,7 +12,7 @@ from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compa
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.quality import calculate_quality
-from extensions.scalper.service import Screener
+from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context
 from extensions.scalper.telegram import listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
@@ -169,6 +169,9 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         assert event["event"]["detected_at"] == now
         assert event["captured_at"] == now + 5
         assert event["snapshot"]["captured_at"] == event["hyperdata"]["snapshot"]["captured_at"]
+        minute = journal.latest(asset.symbol, "1m")[0]["snapshot"]
+        assert minute["context_5m"]["captured_at"] == minute["captured_at"]
+        assert "direction" not in minute["context_5m"]
         now = event["captured_at"]
         assert event["delivery"] == "sent"
         assert not journal.record(event["id"], event["event"], event["snapshot"], event["hyperdata"])
@@ -286,7 +289,10 @@ def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
     def record(key, window, at, price, status, direction=None):
         snapshot = {"symbol": key, "window": window, "captured_at": at,
                     "metrics": {"price": {"value": price, "quality": "ok"}}}
-        journal.record(key, {}, snapshot, {})
+        event = {"type": "orderflow_transition", "detected_at": at - 9}
+        if key == "long":
+            event["anomalies"] = ["tape_burst"]
+        journal.record(key, event, snapshot, {})
         if status:
             journal.finish(key, {"status": status, "direction": direction}, {}, at + 1)
 
@@ -316,6 +322,10 @@ def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
         }
         assert report["1m"]["horizons"][15]["pending"] == 2
         assert report["5m"]["horizons"][1]["missing"] == 1
+        tape = report["1m"]["triggers"]["tape_burst"]
+        assert tape["horizons"][1]["correct"] == 1
+        assert tape["horizons"][5]["incorrect"] == 1
+        assert tape["median_delay_seconds"] == 10 and tape["delay_samples"] == 1
     finally:
         journal.close()
 
@@ -409,3 +419,40 @@ async def test_telegram_listener_replies_and_advances_offset(monkeypatch, tmp_pa
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         journal.close()
+
+
+def test_minute_gate_and_blind_five_minute_context(market):
+    now, hub, asset = market
+    snapshot, native = capture(hub, asset, "1m", now)
+    longer, other = capture(hub, asset, "5m", now)
+    other["direction"] = "BEARISH"
+    row = {"snapshot": longer, "hyperdata": other}
+    assert minute_gate(snapshot) == "ready"
+    snapshot["metrics"]["natr"].update(value=0.5, quality="ok")
+    assert minute_gate(snapshot) == "wide_spread"
+    snapshot["metrics"]["spread"]["quality"] = "stale"
+    assert minute_gate(snapshot) == "book_unavailable"
+    assert minute_gate(longer) == "ready"
+    assert five_minute_relation(native, row) == "opposed"
+    other["direction"] = native["direction"]
+    assert five_minute_relation(native, row) == "aligned"
+    payload = blind_payload(with_context(snapshot, row))
+    assert payload["context_5m"]["window"] == "5m"
+    assert "ofi" in payload["context_5m"]["metrics"]
+    assert other["direction"] not in json.dumps(payload)
+
+
+def test_minute_queue_prioritizes_agreement_and_deprioritizes_wide_spread(market):
+    now, hub, asset = market
+    snapshot, native = capture(hub, asset, "1m", now)
+    service = Screener(hub, None, None, False)
+    for symbol, gate, relation in (
+        ("blocked", "book_unavailable", "aligned"),
+        ("wide", "wide_spread", "neutral"),
+        ("normal", "ready", "opposed"),
+        ("aligned", "ready", "aligned"),
+    ):
+        service.detect((symbol, "1m"), snapshot, native, now, gate, relation)
+    assert [service.jobs.get_nowait()[3][0] for _ in range(service.jobs.qsize())] == [
+        "aligned", "normal", "wide",
+    ]

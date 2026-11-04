@@ -24,7 +24,9 @@ OI, funding и стакан по отдельности не задают нап
 Не пересчитывай индикаторы, не добавляй числа или уровни, не давай команд на сделки.
 Пиши по-русски. В каждом текстовом поле одна короткая фраза, до 160 символов.
 В каждом аргументе metric — ровно один точный ключ из metrics, без списков и объединений.
-Формулируй сценарий как гипотезу."""
+Формулируй сценарий как гипотезу.
+Если есть context_5m, используй его для проверки контекста и объясни заметное расхождение окон.
+В списках аргументов ссылайся только на ключи основного окна из metrics."""
 ARGUMENT = {
     "type": "object", "required": ["metric", "reason"], "additionalProperties": False,
     "properties": {"metric": {"type": "string"}, "reason": {"type": "string", "maxLength": 240}},
@@ -53,7 +55,10 @@ def snapshot_key(snapshot):
 
 
 def blind_payload(snapshot):
-    return {**snapshot_key(snapshot), "metrics": snapshot["metrics"]}
+    payload = {**snapshot_key(snapshot), "metrics": snapshot["metrics"]}
+    if context := snapshot.get("context_5m"):
+        payload["context_5m"] = {field: context[field] for field in ("window", "captured_at", "metrics")}
+    return payload
 
 
 def response_schema(snapshot):
