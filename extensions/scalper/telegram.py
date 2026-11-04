@@ -15,12 +15,12 @@ REPORT = re.compile(r"/report(?:@([a-zA-Z0-9_]+))?(?:\s+(1m|5m))?", re.IGNORECAS
 def report_text(report, window=None):
     if report is None:
         return "Отчёт ещё рассчитывается. Повторите /report через минуту."
-    lines = ["<b>Качество AI · последние 24 часа</b>"]
+    lines = ["📊 <b>Качество AI</b> · последние 24 часа"]
     for frame in (window,) if window else report["windows"]:
         data = report["windows"][frame]
         a = data["attempts"]
         lines.extend((
-            "", f"<b>Окно {frame}</b>",
+            "", f"⏱ <b>Окно {frame}</b>",
             f'Оценки: направленных {a["directional"]}, нейтральных {a["neutral"]}, '
             f'без вывода {a["insufficient"]}.',
             f'Сбои: {a["error"]} · пропуски: {a["skipped"]} · в обработке: {a["pending"]}.',
@@ -28,11 +28,17 @@ def report_text(report, window=None):
         for minutes in HORIZONS:
             h = data["horizons"][minutes]
             lines.append(
-                f'{minutes} мин: верно {h["correct"]}, неверно {h["incorrect"]}, '
-                f'без движения {h["flat"]}, ждём {h["pending"]}, нет цены {h["missing"]}.'
+                f'<b>{minutes} мин</b> · 🟢 верно {h["correct"]} · 🔴 неверно {h["incorrect"]}'
             )
+            remaining = [
+                f'⚪ без движения {h["flat"]}' if h["flat"] else None,
+                f'🟡 ждём {h["pending"]}' if h["pending"] else None,
+                f'нет цены {h["missing"]}' if h["missing"] else None,
+            ]
+            if notes := " · ".join(item for item in remaining if item):
+                lines.append(f"<i>{notes}</i>")
         if data.get("triggers"):
-            lines.append("<b>По триггерам</b> · верно/неверно на 1, 5 и 15 мин")
+            lines.extend(("", "⚡ <b>По триггерам</b> · 🟢/🔴 на 1, 5 и 15 мин"))
             for name, label in TRIGGERS.items():
                 group = data["triggers"].get(name)
                 if not group:

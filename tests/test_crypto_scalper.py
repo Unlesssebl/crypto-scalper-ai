@@ -159,9 +159,9 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path):
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
         assert len(rows) == 1 and len(sent) == 2
-        assert "<b>kPEPE-PERP · Обе оценки указывают вверх</b>" in sent[0]
-        assert "<b>HyperData</b> — вверх (в потоке преобладают покупки)" in sent[0]
-        assert "<b>AI</b> — вверх" in sent[0]
+        assert sent[0].startswith("<b>🟢 Совпадение · вверх</b>\n<b>kPEPE-PERP</b>")
+        assert "<b>HyperData</b> — 🟢 вверх (в потоке преобладают покупки)" in sent[0]
+        assert "<b>AI</b> — 🟢 вверх" in sent[0]
         assert "<b>Почему</b>" in sent[0] and "МСК" in sent[0]
         assert "CONSENSUS_LONG" not in sent[0] and "OFI" not in sent[0]
         event = rows[0]
@@ -374,7 +374,7 @@ def test_telegram_report_is_restricted_to_configured_chat(tmp_path):
         report = calculate_quality(tmp_path / "reports.sqlite", 1000, ("1m", "5m"))
         text = report_text(report, "5m")
         assert "Окно 5m" in text and "Окно 1m" not in text
-        assert "15 мин: верно 0, неверно 0" in text
+        assert "15 мин</b> · 🟢 верно 0 · 🔴 неверно 0" in text
     finally:
         journal.close()
 
