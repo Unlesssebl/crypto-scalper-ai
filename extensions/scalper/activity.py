@@ -8,11 +8,22 @@ from statistics import median
 import numpy as np
 import talib
 
+from .profile import fresh
+
 LOG = logging.getLogger(__name__)
 CANDLE_SOURCE = "Hyperliquid candleSnapshot"
 BASELINE_BARS = 14
 BURST_RATIO = 2.0
 MIN_BURST_TRADES = 10
+WIDE_SPREAD_ATR_FRACTION = 0.25
+PRICE_CONFIRMATION_ATR_FRACTION = 0.25
+FINDING_LEVELS = (
+    ("⚪", "Нет свежих данных"),
+    ("🔵", "Фоновая"),
+    ("🟡", "Заметная"),
+    ("🟠", "Сильная"),
+    ("🔴", "Критичная"),
+)
 
 
 def candle_indicators(candles, seconds, now):
@@ -72,6 +83,53 @@ def active_anomalies(snapshot):
     if volatility.get("quality") == "ok" and volatility["value"] >= BURST_RATIO:
         active.add("range_burst")
     return frozenset(active)
+
+
+def wide_spread(snapshot):
+    metrics = snapshot["metrics"]
+    spread, mark, natr = (fresh(metrics, key) for key in ("spread", "price", "natr"))
+    return (spread is not None and mark is not None and mark > 0 and natr is not None and natr > 0
+            and 100 * spread / mark >= WIDE_SPREAD_ATR_FRACTION * natr)
+
+
+def finding_strength(snapshot, native):
+    metrics = snapshot["metrics"]
+    anomalies = active_anomalies(snapshot)
+    reasons = []
+    if "tape_burst" in anomalies:
+        reasons.append("Ускорение ленты")
+    if "range_burst" in anomalies:
+        reasons.append("Всплеск диапазона")
+
+    if fresh(metrics, "price") is None or fresh(metrics, "ofi") is None:
+        return {"rank": 0, "icon": FINDING_LEVELS[0][0], "label": FINDING_LEVELS[0][1],
+                "reasons": ["Нужны свежая цена и лента", *reasons]}
+
+    start, end, natr = (fresh(metrics, key) for key in ("first_trade_price", "last_trade_price", "natr"))
+    direction = native["direction"]
+    change = 100 * (end / start - 1) if start and end is not None else 0
+    confirms = (direction in {"BULLISH", "BEARISH"} and natr is not None and natr > 0
+                and abs(change) >= PRICE_CONFIRMATION_ATR_FRACTION * natr
+                and (change > 0) == (direction == "BULLISH"))
+    if confirms:
+        reasons.append("Цена движется вместе с потоком")
+    strong_flow = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
+    rank = 1
+    if anomalies or (strong_flow and confirms):
+        rank = 2
+    if len(anomalies) == 2 or (anomalies and confirms):
+        rank = 3
+    if len(anomalies) == 2 and confirms:
+        rank = 4
+
+    if fresh(metrics, "spread") is None:
+        rank = min(rank, 2)
+        reasons.append("Нет свежего стакана")
+    elif wide_spread(snapshot):
+        rank = min(rank, 2)
+        reasons.append("Широкий спред ограничивает приоритет")
+    icon, label = FINDING_LEVELS[rank]
+    return {"rank": rank, "icon": icon, "label": label, "reasons": reasons}
 
 
 async def refresh_candles(hub, windows, cache):

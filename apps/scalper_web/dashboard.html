@@ -33,7 +33,7 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <body><main>
 <header><div class="kicker">HYPERDATA TERMINAL / HYPERLIQUID PERPETUALS</div>
 <h1>Crypto Scalper AI</h1>
-<p>Двадцать ликвидных контрактов Hyperliquid. Сортировка по ускорению ленты. Выберите инструмент для деталей.</p>
+<p>Двадцать ликвидных контрактов Hyperliquid. Сортировка по силе находки. Выберите инструмент для деталей.</p>
 <p id="status" role="status">Подключение к HyperData…</p></header>
 <section id="overview" class="overview" aria-label="Состояние рынка"></section>
 <section aria-label="Фильтры" class="toolbar">
@@ -76,10 +76,10 @@ for (const category of categories) $("filter").add(new Option(category, category
 const number = new Intl.NumberFormat("ru-RU", {maximumSignificantDigits: 6});
 const stamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU") : "—";
 const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
-let data = [], symbol = "", sort = "activity_ratio", ascending = false, generation = 0;
+let data = [], symbol = "", sort = "strengthRank", ascending = false, generation = 0;
 let detailGeneration = 0;
 const allColumns = [
-  ["symbol","Инструмент"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
+  ["symbol","Инструмент"],["strengthRank","Сила находки"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
   ["trade_rate","Сделок/с"],["trade_count","Сделок"],["natr","NATR, %"],["anomalies","Всплески"],
   ["volume_24h","24h, USD"],["range_ratio","Диапазон к ATR"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
@@ -91,7 +91,7 @@ let columns;
 const tableRow = document.createElement("tr");
 function renderHead() {
   columns = allColumns.filter(([key]) => $("metrics").ariaPressed === "true" || !extraColumns.has(key));
-  if (!columns.some(([key]) => key === sort)) { sort = "activity_ratio"; ascending = false; }
+  if (!columns.some(([key]) => key === sort)) { sort = "strengthRank"; ascending = false; }
   tableRow.replaceChildren();
   for (const [key,label] of columns) {
     const th = tableRow.appendChild(document.createElement("th"));
@@ -135,7 +135,8 @@ function display(row) {
   const assessment = accepted ?? (latest?.ai?.status === "ok" ? latest : null);
   const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
     : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
-  return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes,
+  return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes, strength:row.strength,
+    strengthRank:row.strength?.rank ?? 0,
     anomalies: anomalies.map(name => ({tape_burst:"Лента", range_burst:"Диапазон"})[name]).join(" · ") || null,
     ai:assessment?.ai.direction, category:assessment?.consensus.category,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
@@ -160,6 +161,9 @@ function render() {
       return ((x == null) - (y == null)) || (sort === "activity_ratio" ? (b.trade_rate ?? 0) - (a.trade_rate ?? 0) : 0);
     }
     const order = typeof x === "number" ? x-y : String(x).localeCompare(String(y));
+    if (!order && sort === "strengthRank") {
+      return (b.activity_ratio ?? -1) - (a.activity_ratio ?? -1) || (b.trade_rate ?? -1) - (a.trade_rate ?? -1);
+    }
     return ascending ? order : -order;
   });
   for (const [index,[key]] of columns.entries()) {
@@ -193,6 +197,9 @@ function render() {
           loadDetail();
           $("detail").scrollIntoView({block:"nearest"});
         };
+      } else if (key === "strengthRank") {
+        node("strong", row.strength ? row.strength.icon + " " + row.strength.label : "—", td);
+        for (const reason of row.strength?.reasons ?? []) node("small", reason, td);
       } else {
         const shown = row[key];
         td.textContent = value(shown);
@@ -265,6 +272,10 @@ async function loadDetail() {
     node("button", "Закрыть", detail).onclick = () => { symbol = ""; ++detailGeneration; detail.hidden = true; };
     node("h2", row.snapshot.contract + " · " + window, detail);
     node("p", "Снимок " + stamp(row.snapshot.captured_at) + " · " + row.hyperdata.direction, detail);
+    if (row.strength) {
+      node("p", row.strength.icon + " Сила находки — " + row.strength.label, detail);
+      if (row.strength.reasons.length) node("p", row.strength.reasons.join(" · "), detail);
+    }
     node("h3", "Что происходит", detail);
     const facts = node("ul", null, detail);
     for (const fact of row.facts ?? []) node("li", fact, facts);
@@ -305,7 +316,9 @@ async function loadDetail() {
     if (!row.history.length) node("p", "Событий пока нет.", detail);
     for (const event of row.history) {
       const item = node("details", null, detail), ai = event.ai;
-      node("summary", stamp(event.captured_at) + " · " + (event.consensus?.category ?? event.delivery), item);
+      const rank = event.event.strength;
+      node("summary", stamp(event.captured_at) + " · " + (rank ? rank.icon + " " + rank.label
+        : (event.consensus?.category ?? event.delivery)), item);
       node("p", "HyperData " + event.hyperdata.direction + " · AI " +
         (ai?.direction ?? ai?.status ?? "—") + " · " + (event.consensus?.overlap ?? "—"), item);
       const context15m = event.snapshot.context_15m;

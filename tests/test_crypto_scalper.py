@@ -7,7 +7,7 @@ import pytest
 from aiohttp import ClientSession, web
 
 from apps.scalper_web.__main__ import ScalperAPI
-from extensions.scalper.activity import active_anomalies, candle_indicators, tape_baseline
+from extensions.scalper.activity import active_anomalies, candle_indicators, finding_strength, tape_baseline
 from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
@@ -163,6 +163,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         assert len(rows) == 1 and len(sent) == 2
         assert sent[0].startswith("<b>🟡 kPEPE-PERP · Стоит посмотреть</b>")
         assert "<b>📊 Что происходит</b>" in sent[0] and "Всплеск ленты" in sent[0]
+        assert "Сила находки:" in sent[0]
         assert "<blockquote><b>🧠 Гипотеза AI · 🟢 вверх</b>" in sent[0] and "МСК" in sent[0]
         assert sent[0].index("Что происходит") < sent[0].index("Гипотеза AI")
         assert "CONSENSUS_LONG" not in sent[0]
@@ -523,3 +524,29 @@ def test_instrument_profiles_count_regular_windows_and_filter_missing_metrics(ma
         assert "trades" in profile_context(profile)["periods"][7]
     finally:
         journal.close()
+
+
+def test_finding_strength_requires_price_confirmation_for_critical_rank(market):
+    now, hub, asset = market
+    snapshot, native = capture(hub, asset, "1m", now)
+    metrics = snapshot["metrics"]
+    for name, value in {
+        "spread": 0.001, "natr": 1.0, "first_trade_price": 12, "last_trade_price": 12,
+        "activity_ratio": 1, "trade_count": 20, "range_ratio": 1,
+    }.items():
+        metrics[name].update(value=value, quality="ok")
+
+    assert finding_strength(snapshot, native)["rank"] == 1
+    metrics["activity_ratio"]["value"] = 2.5
+    assert finding_strength(snapshot, native)["rank"] == 2
+    metrics["range_ratio"]["value"] = 3
+    assert finding_strength(snapshot, native)["rank"] == 3
+    metrics["last_trade_price"]["value"] = 12.05
+    assert finding_strength(snapshot, native)["rank"] == 4
+    metrics["spread"]["value"] = 0.04
+    assert finding_strength(snapshot, native)["rank"] == 2
+    metrics["spread"]["value"] = 0.001
+    metrics["spread"]["quality"] = "stale"
+    assert finding_strength(snapshot, native)["rank"] == 2
+    metrics["ofi"]["quality"] = "stale"
+    assert finding_strength(snapshot, native)["rank"] == 0

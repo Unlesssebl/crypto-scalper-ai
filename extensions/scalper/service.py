@@ -7,7 +7,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 
-from .activity import CANDLE_SOURCE, active_anomalies, refresh_candles
+from .activity import CANDLE_SOURCE, active_anomalies, finding_strength, refresh_candles, wide_spread
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
 from .market import WINDOWS, capture, metric
@@ -19,8 +19,8 @@ AI_INTERVAL = 12
 EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
 QUEUE_LIMIT = 20
-WIDE_SPREAD_ATR_FRACTION = 0.25
 PRIORITY_STEP_SECONDS = 15
+STRENGTH_STEP_SECONDS = 10
 CONTEXT_WINDOW_SECONDS = 900
 CONTEXT_TRIAL_INTERVAL = 10
 ALERT_DIRECTIONS = {
@@ -44,6 +44,9 @@ def alert_text(snapshot, ai, event):
         "<b>📊 Что происходит</b>",
         *(html.escape(fact) for fact in (event.get("facts") or situation_facts(snapshot))),
     ]
+    strength = event.get("strength")
+    if strength:
+        lines.insert(2, f'{strength["icon"]} <b>Сила находки: {html.escape(strength["label"])}</b>')
     if ai["status"] == "ok":
         direction = ALERT_DIRECTIONS.get(ai.get("direction"), ALERT_DIRECTIONS["NOT_AVAILABLE"])
         hypothesis = [f"<b>🧠 Гипотеза AI · {direction}</b>"]
@@ -68,11 +71,7 @@ def minute_gate(snapshot):
         return "tape_unavailable"
     if metrics["spread"]["quality"] != "ok":
         return "book_unavailable"
-    spread, mark, natr = (metrics[name] for name in ("spread", "price", "natr"))
-    if (mark["quality"] == natr["quality"] == "ok" and mark["value"] > 0 and natr["value"] > 0
-            and 100 * spread["value"] / mark["value"] >= WIDE_SPREAD_ATR_FRACTION * natr["value"]):
-        return "wide_spread"
-    return "ready"
+    return "wide_spread" if wide_spread(snapshot) else "ready"
 
 
 def five_minute_relation(native, context):
@@ -150,6 +149,7 @@ class Screener:
             context = rows.get((key[0], "5m")) if key[1] == "1m" else None
             profile = self.profiles.get(key)
             row["facts"] = situation_facts(snapshot, profile)
+            row["strength"] = finding_strength(snapshot, native)
             row["profile"] = profile
             row["analysis_gate"] = minute_gate(snapshot)
             row["context_5m"] = five_minute_relation(native, context)
@@ -204,7 +204,9 @@ class Screener:
         # lead that batch, while older candidates retain priority over new ones.
         priority = 0 if new_anomalies else 1 if strong else 2 if direction in DIRECTIONAL else 3
         # Bounded adjustments let agreement and book quality matter without starving old events.
-        order_at = now + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
+        strength = finding_strength(snapshot, native)["rank"]
+        order_at = (now + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
+                    - STRENGTH_STEP_SECONDS * max(0, strength - 1))
         self.jobs.put_nowait((order_at, priority, self.sequence, key, event))
 
     async def run(self):
@@ -273,7 +275,8 @@ class Screener:
                     baseline = {**baseline, "instrument_profile": profile}
                 snapshot = with_senior_context(baseline, self.candles.get((candidate[0], "15m")))
                 event = {**event, "analyzed_signal": native["native_signal"],
-                         "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"], "facts": row["facts"]}
+                         "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"],
+                         "facts": row["facts"], "strength": row["strength"]}
                 event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
                 if not self.journal.record(event_id, event, snapshot, native):
                     continue
