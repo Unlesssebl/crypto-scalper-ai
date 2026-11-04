@@ -15,6 +15,7 @@ LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
 EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
+HYPOTHESIS_MAX_AGE = 900
 QUEUE_LIMIT = 20
 ALERT_CATEGORIES = {"CONSENSUS_LONG", "CONSENSUS_SHORT", "DIVERGENCE"}
 
@@ -131,7 +132,8 @@ class Screener:
         symbol, window = snapshot["symbol"], snapshot["window"]
         previous = self.journal.latest(symbol, window, before=snapshot["captured_at"], completed=True)
         changed = False
-        if previous:
+        if (ai["status"] == "ok" and previous
+                and snapshot["captured_at"] - previous[0]["captured_at"] <= HYPOTHESIS_MAX_AGE):
             last = previous[0]
             prior_ai = last["ai"].get("direction")
             direction = ai.get("direction")

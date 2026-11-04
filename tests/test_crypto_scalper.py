@@ -231,3 +231,21 @@ async def test_openrouter_accepts_non_google_model_and_preserves_blind_analysis(
     result = await client.analyze(snapshot)
     assert result["provider"] == "openrouter"
     assert result["status"] == "ok" and result["direction"] == "BEARISH"
+
+
+def test_expired_ai_does_not_notify_about_hypothesis_change():
+    previous = {
+        "captured_at": 990, "hyperdata": {"direction": "BULLISH"},
+        "ai": {"direction": "BULLISH", "status": "ok"},
+    }
+    deliveries = []
+    journal = SimpleNamespace(
+        latest=lambda *args, **kwargs: [previous],
+        delivery=lambda key, state: deliveries.append((key, state)),
+    )
+    service = Screener(None, journal, None, True)
+    service.schedule_alert("event", {"symbol": "BTC", "window": "1m", "captured_at": 1000},
+                           {"direction": "BEARISH"}, {"status": "expired"},
+                           {"category": "HYPERDATA_ONLY"})
+    assert service.notifications.empty()
+    assert deliveries == [("event", "not_applicable")]
