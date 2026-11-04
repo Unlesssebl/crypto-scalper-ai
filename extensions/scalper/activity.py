@@ -13,16 +13,20 @@ from .profile import fresh
 LOG = logging.getLogger(__name__)
 CANDLE_SOURCE = "Hyperliquid candleSnapshot"
 BASELINE_BARS = 14
+BTC_RETURN_SAMPLES = 36
+BTC_BAR_SECONDS = 300
 BURST_RATIO = 2.0
 MIN_BURST_TRADES = 10
 WIDE_SPREAD_ATR_FRACTION = 0.25
-PRICE_CONFIRMATION_ATR_FRACTION = 0.25
+MIN_STRONG_MOVE_PCT = 0.10
+MIN_LARGE_MOVE_PCT = 0.20
+SPREAD_MULTIPLE = 4
 FINDING_LEVELS = (
     ("⚪", "Нет свежих данных"),
     ("🔵", "Фоновая"),
     ("🟡", "Заметная"),
-    ("🟠", "Сильная"),
-    ("🔴", "Критичная"),
+    ("🟠", "Выраженное движение"),
+    ("🔴", "Сильное движение"),
 )
 
 
@@ -51,7 +55,15 @@ def candle_indicators(candles, seconds, now):
     previous_atr = natr[-2] * close[-2] / 100
     true_range = talib.TRANGE(high, low, close)[-1]
     recent_high, recent_low = max(high[-4:]), min(low[-4:])
+    recent_returns = {}
+    if seconds == BTC_BAR_SECONDS:
+        recent_returns = {
+            (stamp + interval) / 1000: float(change)
+            for stamp, change in zip(times[start + 1:][-BTC_RETURN_SAMPLES:],
+                                     (100 * np.diff(close) / close[:-1])[-BTC_RETURN_SAMPLES:])
+        }
     return {
+        "returns": recent_returns,
         "return_4": float((close[-1] / close[-5] - 1) * 100),
         "range_4": float((recent_high - recent_low) / close[-1] * 100),
         "range_position_4": float((close[-1] - recent_low) / (recent_high - recent_low))
@@ -61,6 +73,26 @@ def candle_indicators(candles, seconds, now):
         "range_ratio": float(true_range / previous_atr) if previous_atr > 0 else None,
         "counts": [((bar["timestamp"] + interval) / 1000, bar.get("trade_count"))
                    for bar in bars[-(BASELINE_BARS + 2):]],
+    }
+
+
+def btc_context(asset, btc, now):
+    if not asset or not btc or asset is btc:
+        return None
+    asset_returns, btc_returns = asset["returns"], btc["returns"]
+    shared = sorted(asset_returns.keys() & btc_returns.keys())[-BTC_RETURN_SAMPLES:]
+    if (len(shared) != BTC_RETURN_SAMPLES or not 0 <= now - shared[-1] <= BTC_BAR_SECONDS + 90
+            or any(end - start != BTC_BAR_SECONDS for start, end in zip(shared, shared[1:]))):
+        return None
+    x = np.array([asset_returns[stamp] for stamp in shared])
+    y = np.array([btc_returns[stamp] for stamp in shared])
+    if not np.isfinite(x).all() or not np.isfinite(y).all() or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return None
+    return {
+        "reference": "BTC-PERP", "window": "5m", "samples": len(shared), "updated_at": shared[-1],
+        "correlation": float(np.corrcoef(x, y)[0, 1]),
+        "btc_last_return_pct": float(y[-1]), "asset_last_return_pct": float(x[-1]),
+        "relative_last_return_pp": float(x[-1] - y[-1]),
     }
 
 
@@ -108,19 +140,21 @@ def finding_strength(snapshot, native):
     start, end, natr = (fresh(metrics, key) for key in ("first_trade_price", "last_trade_price", "natr"))
     direction = native["direction"]
     change = 100 * (end / start - 1) if start and end is not None else 0
-    confirms = (direction in {"BULLISH", "BEARISH"} and natr is not None and natr > 0
-                and abs(change) >= PRICE_CONFIRMATION_ATR_FRACTION * natr
-                and (change > 0) == (direction == "BULLISH"))
+    spread, mark = (fresh(metrics, key) for key in ("spread", "price"))
+    spread_pct = 100 * spread / mark if spread is not None and mark and mark > 0 else None
+    aligned = direction in {"BULLISH", "BEARISH"} and change != 0 and (change > 0) == (direction == "BULLISH")
+    confirms = (aligned and natr is not None and natr > 0 and spread_pct is not None
+                and abs(change) >= max(MIN_STRONG_MOVE_PCT, natr, SPREAD_MULTIPLE * spread_pct))
     if confirms:
-        reasons.append("Цена движется вместе с потоком")
+        reasons.append(f"Цена уже прошла {abs(change):.2f}% в сторону потока")
     strong_flow = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
-    rank = 1
-    if anomalies or (strong_flow and confirms):
-        rank = 2
-    if len(anomalies) == 2 or (anomalies and confirms):
+    rank = 2 if anomalies or (strong_flow and confirms) else 1
+    if confirms and (anomalies or strong_flow):
         rank = 3
-    if len(anomalies) == 2 and confirms:
-        rank = 4
+        if len(anomalies) == 2 and abs(change) >= max(MIN_LARGE_MOVE_PCT, 1.5 * natr):
+            rank = 4
+    elif anomalies:
+        reasons.append("Всплеск без подтверждённого движения цены")
 
     if fresh(metrics, "spread") is None:
         rank = min(rank, 2)
@@ -136,6 +170,8 @@ async def refresh_candles(hub, windows, cache):
     due = {}
     while True:
         keys = [(asset.symbol, window) for asset in hub.get_all_assets()[:20] for window in windows]
+        if ("BTC", "5m") not in keys and "5m" in windows:
+            keys.insert(0, ("BTC", "5m"))
         active = set(keys)
         for key in due.keys() - active:
             del due[key]

@@ -6,8 +6,12 @@ import logging
 import math
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
-from .activity import CANDLE_SOURCE, active_anomalies, finding_strength, refresh_candles, wide_spread
+from hyperdata_terminal.utils.helpers import format_price, format_usd
+
+from .audit import CONTROL_INTERVAL, STRONG_RANK
+from .activity import CANDLE_SOURCE, active_anomalies, btc_context, finding_strength, refresh_candles, wide_spread
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .journal import dump
 from .market import WINDOWS, capture, metric
@@ -18,6 +22,7 @@ LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
 EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
+MAX_EVENT_AGE = {"1m": 45, "5m": 120}
 QUEUE_LIMIT = 20
 PRIORITY_STEP_SECONDS = 15
 STRENGTH_STEP_SECONDS = 10
@@ -27,40 +32,109 @@ ALERT_DIRECTIONS = {
     "BULLISH": "🟢 вверх",
     "BEARISH": "🔴 вниз",
     "NEUTRAL": "⚪ нейтрально",
-    "NOT_AVAILABLE": "⚪ оценка недоступна",
-    "INSUFFICIENT_DATA": "⚪ недостаточно данных",
+    "NOT_AVAILABLE": "оценка недоступна",
+    "INSUFFICIENT_DATA": "недостаточно данных",
 }
 MOSCOW = timezone(timedelta(hours=3), "МСК")
 
 
-def alert_text(snapshot, ai, event):
-    stamp = datetime.fromtimestamp(snapshot["captured_at"], MOSCOW).strftime("%d.%m.%Y в %H:%M:%S %Z")
+def futures_ticker(snapshot):
+    return f'HYPERLIQUID:{snapshot["symbol"].upper()}USDC.P'
+
+
+def alert_market_facts(snapshot):
+    metrics = snapshot["metrics"]
+    facts = []
+    start, end, pace, rate = (fresh(metrics, key) for key in (
+        "first_trade_price", "last_trade_price", "activity_ratio", "trade_rate",
+    ))
+    impulse = []
+    if start and end is not None:
+        change = f"{100 * (end / start - 1):+.2f}%"
+        marker = {"-": "🔻 ", "+": "🟢 "}[change[0]] if change[1:] != "0.00%" else ""
+        impulse.append(f"{marker}<b>{change}</b> за окно")
+    if pace is not None:
+        impulse.append(f"<b>{pace - 1:+.0%}</b> к обычному темпу")
+    elif rate is not None:
+        impulse.append(f"{rate:.1f} сделок/с")
+    if impulse:
+        facts.append(("Импульс", " · ".join(impulse)))
+
+    volume, cvd, ofi = (fresh(metrics, key) for key in ("volume", "cvd", "ofi"))
+    flow = []
+    if ofi is not None:
+        flow.append(f"перевес сделок <b>{ofi:+.0%}</b>")
+    if cvd is not None:
+        flow.append(f"дельта объёма {'+' if cvd > 0 else ''}{format_usd(cvd)}")
+    if volume is not None:
+        flow.append(f"объём {format_usd(volume)}")
+    if flow:
+        facts.append(("Поток", " · ".join(flow)))
+
+    spread, price, imbalance = (fresh(metrics, key) for key in ("spread", "price", "imbalance"))
+    book = []
+    if imbalance is not None:
+        book.append(f"дисбаланс <b>{imbalance:+.0%}</b>")
+    if price and spread is not None:
+        book.append(f"спред {100 * spread / price:.3f}%")
+    if book:
+        facts.append(("Стакан", " · ".join(book)))
+    return facts
+
+
+def alert_text(snapshot, native, ai, event, *, rich=False):
+    stamp = datetime.fromtimestamp(snapshot["captured_at"], MOSCOW).strftime("%H:%M:%S %Z")
     labels = {"tape_burst": "Всплеск ленты", "range_burst": "Всплеск диапазона"}
     reason = " + ".join(labels[name] for name in event.get("anomalies", ()) if name in labels)
-    lines = [
-        f'<b>🟡 {html.escape(snapshot["contract"])} · Стоит посмотреть</b>',
-        f'Hyperliquid · {html.escape(snapshot["window"])} · {reason or "Смена направления потока"}',
-        "",
-        "<b>📊 Что происходит</b>",
-        *(html.escape(fact) for fact in (event.get("facts") or situation_facts(snapshot))),
-    ]
+    ticker = futures_ticker(snapshot)
+    market_url = f'https://app.hyperliquid.xyz/trade/{quote(snapshot["symbol"], safe="")}'
+    headline = f'<b><a href="{market_url}">{html.escape(ticker)}</a></b> · {html.escape(snapshot["window"])}'
+    price = fresh(snapshot["metrics"], "price")
+    if price is not None:
+        headline += f" · Mark {format_price(price)}"
     strength = event.get("strength")
+    trigger = f'<b>Рынок</b> · {reason or "Смена направления потока"}'
     if strength:
-        lines.insert(2, f'{strength["icon"]} <b>Сила находки: {html.escape(strength["label"])}</b>')
+        trigger += f' · {html.escape(strength["icon"])} <b>Сила: {html.escape(strength["label"])}</b>'
+    hypothesis = []
+    ai_direction = ALERT_DIRECTIONS["NOT_AVAILABLE"]
     if ai["status"] == "ok":
-        direction = ALERT_DIRECTIONS.get(ai.get("direction"), ALERT_DIRECTIONS["NOT_AVAILABLE"])
-        hypothesis = [f"<b>🧠 Гипотеза AI · {direction}</b>"]
+        ai_direction = ALERT_DIRECTIONS.get(ai.get("direction"), ai_direction)
         if ai.get("scenario"):
             hypothesis.append(html.escape(ai["scenario"]))
         if ai.get("watch"):
             hypothesis.append(f'<b>Что наблюдать:</b> {html.escape(ai["watch"])}')
         if ai.get("invalidation"):
             hypothesis.append(f'<b>Когда пересмотреть:</b> {html.escape(ai["invalidation"])}')
-        lines.extend(("", "<blockquote>" + "\n".join(hypothesis) + "</blockquote>"))
-    else:
-        lines.extend(("", "<i>Гипотеза AI недоступна для этого снимка.</i>"))
-    lines.extend(("", f"🕒 <i>Снимок рынка · {stamp}</i>"))
-    return "\n".join(lines)
+    native_direction = ALERT_DIRECTIONS.get(native["direction"], ALERT_DIRECTIONS["NOT_AVAILABLE"])
+    header = [headline, f"<i>Бессрочный фьючерс · {stamp}</i>"]
+    facts = alert_market_facts(snapshot)
+    if btc := snapshot.get("btc_context"):
+        facts.append(("Фон BTC", f'BTC {btc["btc_last_return_pct"]:+.2f}% · актив {btc["asset_last_return_pct"]:+.2f}%'
+                                 f' за 5m · корреляция {btc["correlation"]:+.2f} за 3 ч'))
+    order_flow = f"<b>HyperData</b> {native_direction} · <b>AI</b> {ai_direction}"
+    if rich:
+        lines = [f"<p>{'<br>'.join(header)}</p>", "<hr/>", f"<p>{trigger}</p>"]
+        if facts:
+            table = "".join(f"<tr><th>{label}</th><td>{value}</td></tr>" for label, value in facts)
+            lines.append(f"<table striped compact>{table}</table>")
+        else:
+            lines.append("<p>Свежие метрики недоступны.</p>")
+        lines.append(f"<p>{order_flow}</p>")
+        if hypothesis:
+            lines.append("<blockquote><b>🧠 Гипотеза AI</b><br>" + "<br>".join(hypothesis) + "</blockquote>")
+        lines.append(
+            f'<tg-button-row align="left"><tg-button type="copy_text" text="{html.escape(ticker)}">'
+            'Копировать фьючерс</tg-button></tg-button-row>'
+        )
+        return "\n".join(lines)
+    market = [trigger, *(f"<b>{label}</b> · {value}" for label, value in facts)]
+    if not facts:
+        market.append("Свежие метрики недоступны.")
+    message = "\n\n".join(("\n".join(header), "\n".join(market), order_flow))
+    if hypothesis:
+        message += "\n\n<blockquote><b>🧠 Гипотеза AI</b>\n" + "\n".join(hypothesis) + "</blockquote>"
+    return message
 
 
 def minute_gate(snapshot):
@@ -124,11 +198,13 @@ class Screener:
         self.quality_report = None
         self.profiles = {}
         self.sample_slots = {}
+        self.control_slots = {}
         self.last_profile_prune = 0
         self.candles = {}
         self.context_events = 0
         self.states = {}
         self.pending = set()
+        self.candidate_seen = {}
         self.cooldowns = {}
         self.sequence = 0
         self.jobs = asyncio.PriorityQueue(maxsize=QUEUE_LIMIT)
@@ -143,27 +219,41 @@ class Screener:
                 snapshot, native = capture(self.hub, asset, window, now, self.candles.get(key))
                 native["snapshot"] = snapshot_key(snapshot)
                 rows[key] = {"snapshot": snapshot, "hyperdata": native}
-        samples = []
+        samples, controls = [], []
+        control_slot = int(now // CONTROL_INTERVAL) * CONTROL_INTERVAL
         for key, row in rows.items():
             snapshot, native = row["snapshot"], row["hyperdata"]
             context = rows.get((key[0], "5m")) if key[1] == "1m" else None
             profile = self.profiles.get(key)
             row["facts"] = situation_facts(snapshot, profile)
             row["strength"] = finding_strength(snapshot, native)
+            row["btc_context"] = btc_context(self.candles.get((key[0], "5m")),
+                                             self.candles.get(("BTC", "5m")), now)
             row["profile"] = profile
             row["analysis_gate"] = minute_gate(snapshot)
             row["context_5m"] = five_minute_relation(native, context)
             if not self.hub.demo:
                 self.detect(key, snapshot, native, now, row["analysis_gate"], row["context_5m"])
+                natr = fresh(snapshot["metrics"], "natr")
+                if (now - control_slot <= 10 and self.control_slots.get(key) != control_slot
+                        and row["strength"]["rank"] == 1 and key not in self.pending
+                        and row["analysis_gate"] == "ready" and fresh(snapshot["metrics"], "spread") is not None
+                        and not wide_spread(snapshot) and natr is not None and natr > 0):
+                    controls.append((*key, control_slot, now, natr))
                 sample = sample_window(snapshot, WINDOWS[key[1]])
                 if sample and self.sample_slots.get(key) != sample[2]:
                     samples.append(sample)
         if samples:
             self.journal.record_instrument_samples(samples)
             self.sample_slots.update({(sample[0], sample[1]): sample[2] for sample in samples})
+        if controls:
+            self.journal.record_quiet_moves(controls)
+            self.control_slots.update({(sample[0], sample[1]): sample[2] for sample in controls})
         self.sample_slots = {key: slot for key, slot in self.sample_slots.items() if key in rows}
+        self.control_slots = {key: slot for key, slot in self.control_slots.items() if key in rows}
         self.rows = rows
         self.states = {key: value for key, value in self.states.items() if key in rows}
+        self.candidate_seen = {key: value for key, value in self.candidate_seen.items() if key in rows}
         self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
 
         prices = {}
@@ -180,23 +270,48 @@ class Screener:
         previous, was_strong, previous_anomalies = self.states.get(key, (None, False, frozenset()))
         new_anomalies = anomalies - previous_anomalies
         strong = native["native_signal"] in {"STRONG_BULL", "STRONG_BEAR"}
-        if direction == "NOT_AVAILABLE" or gate in {"tape_unavailable", "book_unavailable"}:
-            return
         trigger = ((direction in DIRECTIONAL and direction != previous)
                    or (previous in DIRECTIONAL and direction == "NEUTRAL")
                    or (strong and not was_strong) or bool(new_anomalies))
         if not trigger:
-            self.states[key] = direction, strong, anomalies
+            self.candidate_seen.pop(key, None)
+            if direction != "NOT_AVAILABLE" and gate not in {"tape_unavailable", "book_unavailable"}:
+                self.states[key] = direction, strong, anomalies
             return
-        if key in self.pending or self.jobs.full() or self.cooldowns.get(key, 0) > now:
-            return
+
+        decision = "queued"
+        if gate in {"tape_unavailable", "book_unavailable"} or direction == "NOT_AVAILABLE":
+            decision = gate if gate != "ready" else "tape_unavailable"
+        elif key in self.pending:
+            decision = "already_pending"
+        elif self.jobs.full():
+            decision = "queue_full"
+        elif self.cooldowns.get(key, 0) > now:
+            decision = "cooldown"
 
         event = {
             "type": "market_activity" if new_anomalies else "orderflow_transition",
             "anomalies": sorted(new_anomalies), "previous_direction": previous,
             "direction": direction, "native_signal": native["native_signal"],
             "source": native["source"], "detected_at": now,
+            "analysis_gate": gate, "context_5m": relation, "strength": finding_strength(snapshot, native),
         }
+        signature = (direction, strong, frozenset(new_anomalies))
+        previous_candidate = self.candidate_seen.get(key)
+        if previous_candidate and previous_candidate[0] == signature:
+            candidate_id, detected_at, old_decision = previous_candidate[1:]
+            event["detected_at"] = detected_at
+            if old_decision != decision and self.journal is not None:
+                self.journal.candidate_decision(candidate_id, decision, now)
+        else:
+            candidate_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
+            detected_at = now
+            if self.journal is not None:
+                self.journal.record_candidate(candidate_id, snapshot, event, decision, now)
+        self.candidate_seen[key] = (signature, candidate_id, detected_at, decision)
+        if decision != "queued":
+            return
+        event["candidate_id"] = candidate_id
         self.states[key] = direction, strong, anomalies
         self.pending.add(key)
         self.sequence += 1
@@ -204,7 +319,7 @@ class Screener:
         # lead that batch, while older candidates retain priority over new ones.
         priority = 0 if new_anomalies else 1 if strong else 2 if direction in DIRECTIONAL else 3
         # Bounded adjustments let agreement and book quality matter without starving old events.
-        strength = finding_strength(snapshot, native)["rank"]
+        strength = event["strength"]["rank"]
         order_at = (now + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
                     - STRENGTH_STEP_SECONDS * max(0, strength - 1))
         self.jobs.put_nowait((order_at, priority, self.sequence, key, event))
@@ -249,37 +364,49 @@ class Screener:
                 await asyncio.sleep(max(0, next_request - time.monotonic()))
             _, _, _, candidate, event = await self.jobs.get()
             event_id = None
+            candidate_id = event["candidate_id"]
             try:
                 now = time.time()
                 row = self.rows.get(candidate)
                 if not row:
+                    self.journal.candidate_decision(candidate_id, "left_universe", now)
+                    continue
+                if now - event["detected_at"] > MAX_EVENT_AGE[candidate[1]]:
+                    self.journal.candidate_decision(candidate_id, "event_expired", now)
                     continue
                 snapshot, native = row["snapshot"], row["hyperdata"]
                 if (now - snapshot["captured_at"] > 10
                         or snapshot["metrics"]["price"]["quality"] != "ok"
                         or native["direction"] == "NOT_AVAILABLE"
                         or row["analysis_gate"] in {"tape_unavailable", "book_unavailable"}):
+                    self.journal.candidate_decision(candidate_id, "stale_at_dispatch", now)
                     self.states.pop(candidate, None)
                     continue
                 if event["anomalies"] and not active_anomalies(snapshot).intersection(event["anomalies"]):
+                    self.journal.candidate_decision(candidate_id, "anomaly_ended", now)
                     self.states.pop(candidate, None)
                     continue
                 if native["direction"] != event["direction"]:
                     # The original transition is obsolete. Let the next scan
                     # decide whether the new direction merits a fresh event.
+                    self.journal.candidate_decision(candidate_id, "direction_changed", now)
                     continue
                 other_window = "5m" if candidate[1] == "1m" else "1m"
                 baseline = with_context(snapshot, self.rows.get((candidate[0], other_window)))
                 profile = profile_context(self.profiles.get(candidate))
                 if profile:
                     baseline = {**baseline, "instrument_profile": profile}
+                if row["strength"]["rank"] >= STRONG_RANK and row["btc_context"]:
+                    baseline = {**baseline, "btc_context": row["btc_context"]}
                 snapshot = with_senior_context(baseline, self.candles.get((candidate[0], "15m")))
                 event = {**event, "analyzed_signal": native["native_signal"],
                          "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"],
                          "facts": row["facts"], "strength": row["strength"]}
                 event_id = hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
                 if not self.journal.record(event_id, event, snapshot, native):
+                    self.journal.candidate_decision(candidate_id, "duplicate_snapshot", now)
                     continue
+                self.journal.candidate_decision(candidate_id, "analyzing", now, event_id)
                 self.cooldowns[candidate] = now + EVENT_COOLDOWN
                 next_request = time.monotonic() + AI_INTERVAL
                 ai = await self.gemini.analyze(snapshot)
@@ -303,6 +430,8 @@ class Screener:
                 LOG.exception("Event analysis failed")
                 if event_id is not None:
                     self.journal.delivery(event_id, "error")
+                else:
+                    self.journal.candidate_decision(candidate_id, "error", time.time())
             finally:
                 self.pending.discard(candidate)
                 self.jobs.task_done()
@@ -317,29 +446,37 @@ class Screener:
                         and (end > start) == (direction == "BULLISH"))
         state = "not_applicable"
         if event.get("anomalies") or (reversal and price_agrees):
-            if not self.notify:
+            if event.get("strength", {}).get("rank", 0) < STRONG_RANK:
+                state = "below_strength"
+            elif not self.notify:
                 state = "disabled"
             elif self.notifications.full():
                 state = "queue_full"
             else:
-                self.notifications.put_nowait((key, snapshot, ai, event))
+                self.notifications.put_nowait((key, snapshot, native, ai, event))
+                if candidate_id := event.get("candidate_id"):
+                    self.journal.candidate_decision(candidate_id, "delivery_pending", time.time())
                 return
         self.journal.delivery(key, state)
 
     async def deliver(self):
         while True:
-            key, snapshot, ai, event = await self.notifications.get()
+            key, snapshot, native, ai, event = await self.notifications.get()
             try:
                 now = time.time()
                 last = self.journal.last_delivery(snapshot["symbol"], snapshot["window"])
                 if last and now - last < ALERT_COOLDOWN:
                     self.journal.delivery(key, "cooldown")
                     continue
-                if now - snapshot["captured_at"] > 120:
+                if now - event.get("detected_at", snapshot["captured_at"]) > MAX_EVENT_AGE[snapshot["window"]]:
                     self.journal.delivery(key, "expired")
                     continue
                 self.journal.delivery(key, "sending", now)
-                sent = await self.hub.alerts.send_telegram(alert_text(snapshot, ai, event))
+                sent = await self.hub.alerts.send_telegram(
+                    alert_text(snapshot, native, ai, event),
+                    rich_html=alert_text(snapshot, native, ai, event, rich=True),
+                    copy_text=futures_ticker(snapshot),
+                )
                 self.journal.delivery(key, "sent" if sent else "failed_or_unconfirmed",
                                       time.time() if sent else now)
             except Exception:

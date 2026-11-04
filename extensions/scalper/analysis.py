@@ -34,6 +34,8 @@ OI, funding и стакан по отдельности не задают нап
 context_1m описывает текущий импульс; context_5m даёт более широкий поток.
 context_15m содержит фон по закрытым свечам: изменение за четыре свечи, их диапазон и положение последнего закрытия.
 Если окна заметно расходятся, объясни это; старшее окно не отменяет автоматически краткий импульс.
+Если есть btc_context, сравни последнюю закрытую свечу инструмента с BTC.
+Корреляция доходностей описывает связь в прошедшем окне и сама не задаёт направление или причину движения.
 В списках аргументов ссылайся только на ключи основного окна из metrics."""
 ARGUMENT = {
     "type": "object", "required": ["metric", "reason"], "additionalProperties": False,
@@ -70,6 +72,11 @@ def blind_payload(snapshot):
                "metric_roles": {key: GROUPS[key] for key in metrics if key in GROUPS}}
     if profile := snapshot.get("instrument_profile"):
         payload["instrument_profile"] = profile
+    if context := snapshot.get("btc_context"):
+        payload["btc_context"] = {
+            key: context[key] for key in ("reference", "window", "samples", "updated_at", "correlation",
+                                          "btc_last_return_pct", "asset_last_return_pct", "relative_last_return_pp")
+        }
     for key in ("context_1m", "context_5m", "context_15m"):
         if context := snapshot.get(key):
             payload[key] = {field: context[field] for field in ("window", "captured_at", "metrics")}

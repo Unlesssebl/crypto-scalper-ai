@@ -60,6 +60,16 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <table aria-label="Парное сравнение контекста">
 <thead><tr><th>Горизонт</th><th>HyperData</th><th>AI 1m + 5m</th><th>AI с 15m</th></tr></thead>
 <tbody id="context-outcomes"></tbody></table>
+<h3>Проверка рангов после доставки</h3>
+<p id="finding-decisions">Журнал кандидатов ещё накапливается.</p>
+<p>Заметное движение — отклонение mark не меньше NATR снимка за 5 минут после доставки. Доля считается по завершённым наблюдениям.</p>
+<table aria-label="Движение после уведомления по рангам">
+<thead><tr><th>Версия и ранг</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Доля</th><th>Ждём / без данных</th><th>Медиана доставки</th></tr></thead>
+<tbody id="finding-outcomes"></tbody></table>
+<p id="finding-control">Контрольные окна накапливаются.</p>
+<table aria-label="Движение по задержке доставки">
+<thead><tr><th>Задержка</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / без данных</th></tr></thead>
+<tbody id="finding-delay"></tbody></table>
 <small id="quality-updated"></small>
 </details>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
@@ -80,13 +90,13 @@ let data = [], symbol = "", sort = "strengthRank", ascending = false, generation
 let detailGeneration = 0;
 const allColumns = [
   ["symbol","Инструмент"],["strengthRank","Сила находки"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
-  ["trade_rate","Сделок/с"],["trade_count","Сделок"],["natr","NATR, %"],["anomalies","Всплески"],
+  ["trade_rate","Сделок/с"],["trade_count","Сделок"],["natr","NATR, %"],["btcCorrelation","Корр. с BTC"],["anomalies","Всплески"],
   ["volume_24h","24h, USD"],["range_ratio","Диапазон к ATR"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
   ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
   ["facts","Что происходит"],["summary","Гипотеза AI"],["category","Consensus"],["quality","Данные"],
 ];
-const extraColumns = new Set(["volume_24h", "range_ratio", "volume", "cvd", "open_interest", "funding_rate", "spread", "quality", "category"]);
+const extraColumns = new Set(["btcCorrelation", "volume_24h", "range_ratio", "volume", "cvd", "open_interest", "funding_rate", "spread", "quality", "category"]);
 let columns;
 const tableRow = document.createElement("tr");
 function renderHead() {
@@ -136,7 +146,7 @@ function display(row) {
   const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
     : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
   return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes, strength:row.strength,
-    strengthRank:row.strength?.rank ?? 0,
+    strengthRank:row.strength?.rank ?? 0, btcCorrelation:row.btc_context?.correlation,
     anomalies: anomalies.map(name => ({tape_burst:"Лента", range_burst:"Диапазон"})[name]).join(" · ") || null,
     ai:assessment?.ai.direction, category:assessment?.consensus.category,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
@@ -280,6 +290,12 @@ async function loadDetail() {
     const facts = node("ul", null, detail);
     for (const fact of row.facts ?? []) node("li", fact, facts);
     if (!facts.children.length) node("li", "Свежих наблюдений пока недостаточно.", facts);
+    if (row.btc_context) {
+      const btc = row.btc_context;
+      node("p", "Корреляция с BTC: " + btc.correlation.toFixed(2) + " · " + btc.samples
+        + " закрытых окон 5m · последнее окно: BTC " + value(btc.btc_last_return_pct)
+        + "%, инструмент " + value(btc.asset_last_return_pct) + "% · " + stamp(btc.updated_at), detail);
+    }
     showProfile(row.profile, detail);
     const latestAI = row.history.find(event => event.ai?.status === "ok");
     const hypothesis = node("section", null, detail);
@@ -360,6 +376,7 @@ function renderQuality(report) {
   $("quality-outcomes").replaceChildren();
   $("quality-triggers").replaceChildren();
   renderContextExperiment(report?.context_experiment?.[window]);
+  renderFindingAudit(report?.finding_audit?.[window]);
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
     $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
@@ -410,6 +427,56 @@ function renderContextExperiment(experiment) {
       const cell = node("td", a.correct + " / " + a.incorrect, row);
       node("small", "Без направления " + a.no_direction + " · без движения " + a.flat
         + " · ждём " + a.pending + " · нет цены " + a.missing, cell);
+    }
+  }
+}
+
+function renderFindingAudit(audit) {
+  const body = $("finding-outcomes");
+  body.replaceChildren();
+  $("finding-delay").replaceChildren();
+  $("finding-control").textContent = "Контрольные окна накапливаются.";
+  if (!audit) {
+    $("finding-decisions").textContent = "Журнал кандидатов ещё накапливается.";
+    return;
+  }
+  const labels = {
+    delivered:"доставлено", queued:"в очереди", analyzing:"анализируется", delivery_pending:"готовится к отправке",
+    tape_unavailable:"нет ленты", book_unavailable:"нет стакана", already_pending:"уже есть событие в очереди",
+    queue_full:"очередь заполнена", cooldown:"пауза анализа", delivery_cooldown:"пауза доставки",
+    stale_at_dispatch:"устарели данные", event_expired:"событие устарело", delivery_below_strength:"ниже порога уведомлений", direction_changed:"направление изменилось", anomaly_ended:"всплеск закончился",
+    left_universe:"вне списка", delivery_not_applicable:"без уведомления", delivery_disabled:"Telegram выключен",
+    delivery_queue_full:"очередь уведомлений заполнена", delivery_expired:"уведомление устарело",
+    delivery_failed_or_unconfirmed:"доставка не подтверждена", interrupted:"прервано",
+    duplicate_snapshot:"повтор снимка", delivery_error:"ошибка", error:"ошибка",
+  };
+  const decisions = Object.entries(audit.decisions).map(([key, count]) => (labels[key] ?? key) + " " + count);
+  $("finding-decisions").textContent = "Кандидатов: " + audit.candidates + (decisions.length ? " · " + decisions.join(" · ") : "");
+  const control = audit.control;
+  if (control?.pairs) {
+    $("finding-control").textContent = "Сопоставимые пары: " + control.pairs + " · движение ≥ NATR после сигнала "
+      + control.signal_hits + "/" + control.pairs + " · в обычных окнах " + control.control_hits + "/" + control.pairs;
+  }
+  for (const bucket of ["0–15 с", ">15–45 с", ">45 с"]) {
+    const group = audit.delay_buckets?.[bucket];
+    if (!group) continue;
+    const row = node("tr", null, $("finding-delay"));
+    node("th", bucket, row).scope = "row";
+    node("td", group.hit ?? 0, row);
+    node("td", group.quiet ?? 0, row);
+    node("td", (group.pending ?? 0) + " / " + ((group.missing ?? 0) + (group.no_natr ?? 0)), row);
+  }
+  const ranks = ["Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная"];
+  for (const [version, groups] of Object.entries(audit.versions)) {
+    for (const [rank, group] of Object.entries(groups).reverse()) {
+      const hit = group.hit ?? 0, quiet = group.quiet ?? 0;
+      const row = node("tr", null, body);
+      node("th", version + " · " + (audit.rank_labels?.[version]?.[rank] ?? ranks[rank] ?? rank), row).scope = "row";
+      node("td", hit, row);
+      node("td", quiet, row);
+      node("td", hit + quiet ? Math.round(100 * hit / (hit + quiet)) + "%" : "—", row);
+      node("td", (group.pending ?? 0) + " / " + ((group.missing ?? 0) + (group.no_natr ?? 0)), row);
+      node("td", value(group.median_delay_seconds) + " с", row);
     }
   }
 }

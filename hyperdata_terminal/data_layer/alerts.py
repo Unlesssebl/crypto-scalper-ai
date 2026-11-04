@@ -397,23 +397,38 @@ class AlertManager:
         redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
         logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
 
-    async def send_telegram(self, message: str) -> bool:
-        """Send one HTML message and report Telegram's acceptance."""
+    async def send_telegram(self, message: str, *, rich_html: str | None = None,
+                            copy_text: str | None = None) -> bool:
+        """Send a Telegram alert, with HTML fallback on explicit Rich Message rejection."""
         if not self.telegram_token or not self.telegram_chat_id:
             return False
         if not self._session:
             self._session = aiohttp.ClientSession()
+        plain = {"text": message, "parse_mode": "HTML"}
+        if copy_text:
+            plain["link_preview_options"] = {"is_disabled": True}
+            plain["reply_markup"] = {"inline_keyboard": [[{
+                "text": "Копировать фьючерс", "copy_text": {"text": copy_text},
+            }]]}
+        attempts = [("sendMessage", plain)]
+        if rich_html is not None:
+            attempts.insert(0, ("sendRichMessage", {"rich_message": {"html": rich_html}}))
         try:
-            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-            async with self._session.post(url, json={
-                "chat_id": self.telegram_chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-            }, timeout=self._SEND_TIMEOUT, allow_redirects=False) as response:
-                if response.status == 200 and (await response.json()).get("ok") is True:
-                    logger.info("Telegram alert sent")
-                    return True
-                logger.warning("Telegram send returned %d", response.status)
+            for method, payload in attempts:
+                url = f"https://api.telegram.org/bot{self.telegram_token}/{method}"
+                async with self._session.post(
+                    url, json={"chat_id": self.telegram_chat_id, **payload},
+                    timeout=self._SEND_TIMEOUT, allow_redirects=False,
+                ) as response:
+                    if response.status == 200 and (await response.json()).get("ok") is True:
+                        logger.info("Telegram alert sent")
+                        return True
+                    if (method == "sendRichMessage" and response.status in (400, 404)
+                            and (await response.json()).get("ok") is False):
+                        logger.info("Telegram rejected rich alert (%d), using HTML", response.status)
+                        continue
+                    logger.warning("Telegram send returned %d", response.status)
+                    return False
         except Exception as exc:
             logger.warning("Telegram send failed: %s", type(exc).__name__)
         return False

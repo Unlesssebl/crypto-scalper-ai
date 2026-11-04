@@ -4,6 +4,8 @@ import json
 import sqlite3
 from statistics import median
 
+from .audit import audit_report
+
 HORIZONS = (1, 5, 15)
 PERIOD_SECONDS = 24 * 60 * 60
 OUTCOMES = ("correct", "incorrect", "flat", "pending", "missing")
@@ -141,6 +143,7 @@ def calculate_quality(path, now, windows):
                 for target in (window, group):
                     target["horizons"][row["minutes"]][result] += 1
         experiments = context_quality(db, since, now, windows)
+        audit = audit_report(db, since, now, windows)
     for window in results.values():
         for target in (window, *window["triggers"].values()):
             for counts in target["horizons"].values():
@@ -150,4 +153,4 @@ def calculate_quality(path, now, windows):
             group["median_delay_seconds"] = round(median(delays), 1) if delays else None
             group["delay_samples"] = len(delays)
     return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS,
-            "context_experiment": experiments}
+            "context_experiment": experiments, "finding_audit": audit}

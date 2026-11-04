@@ -832,6 +832,36 @@ class TestPersistenceRound2:
 
 class TestAlertsRound2:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "expected"), [(200, True), (400, True), (502, False), (None, False)])
+    async def test_rich_alert_falls_back_only_after_rejection(self, status, expected):
+        from hyperdata_terminal.data_layer.alerts import AlertManager
+
+        def response(status, ok):
+            context = MagicMock()
+            reply = context.__aenter__.return_value
+            reply.status = status
+            reply.json.return_value = {"ok": ok}
+            return context
+
+        mgr = AlertManager()
+        mgr.telegram_token, mgr.telegram_chat_id = "test", "42"
+        mgr._session = MagicMock()
+        first = response(status, status == 200) if status else TimeoutError()
+        mgr._session.post.side_effect = [first, response(200, True)]
+
+        assert await mgr.send_telegram("<code>kPEPE-PERP</code>", rich_html="<h3>kPEPE</h3>",
+                                       copy_text="kPEPE") is expected
+        calls = mgr._session.post.call_args_list
+        assert calls[0].args[0].endswith("/sendRichMessage")
+        assert calls[0].kwargs["json"] == {"chat_id": "42", "rich_message": {"html": "<h3>kPEPE</h3>"}}
+        assert len(calls) == (2 if status == 400 else 1)
+        if status == 400:
+            assert calls[1].args[0].endswith("/sendMessage")
+            payload = calls[1].kwargs["json"]
+            assert payload["parse_mode"] == "HTML"
+            assert payload["reply_markup"]["inline_keyboard"][0][0]["copy_text"] == {"text": "kPEPE"}
+
+    @pytest.mark.asyncio
     async def test_send_failure_does_not_leak_token(self, caplog):
         """aiohttp error messages can embed the request URL — which contains
         the bot token — so failure logs carry the exception type only."""

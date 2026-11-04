@@ -7,7 +7,7 @@ import pytest
 from aiohttp import ClientSession, web
 
 from apps.scalper_web.__main__ import ScalperAPI
-from extensions.scalper.activity import active_anomalies, candle_indicators, finding_strength, tape_baseline
+from extensions.scalper.activity import active_anomalies, btc_context, candle_indicators, finding_strength, tape_baseline
 from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
@@ -139,6 +139,9 @@ async def test_provider_request_uses_json_schema_and_blind_snapshot(market):
 
 async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypatch):
     monkeypatch.setattr("extensions.scalper.service.active_anomalies", lambda snapshot: {"tape_burst"})
+    monkeypatch.setattr("extensions.scalper.service.finding_strength", lambda snapshot, native: {
+        "rank": 3, "label": "Выраженное движение", "icon": "🟠", "reasons": [],
+    })
     now, hub, asset = market
     journal = Journal(tmp_path / "scalper.sqlite")
     sent = []
@@ -146,8 +149,8 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
     async def analyze(snapshot):
         return {**model_reply("BULLISH"), "snapshot": snapshot_key(snapshot), "status": "ok"}
 
-    async def send(message):
-        sent.append(message)
+    async def send(message, *, rich_html, copy_text):
+        sent.append((message, rich_html, copy_text))
         return True
 
     hub.alerts = SimpleNamespace(send_telegram=send)
@@ -161,12 +164,26 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         await asyncio.wait_for(service.notifications.join(), 2)
         rows = journal.latest(asset.symbol, "5m")
         assert len(rows) == 1 and len(sent) == 2
-        assert sent[0].startswith("<b>🟡 kPEPE-PERP · Стоит посмотреть</b>")
-        assert "<b>📊 Что происходит</b>" in sent[0] and "Всплеск ленты" in sent[0]
-        assert "Сила находки:" in sent[0]
-        assert "<blockquote><b>🧠 Гипотеза AI · 🟢 вверх</b>" in sent[0] and "МСК" in sent[0]
-        assert sent[0].index("Что происходит") < sent[0].index("Гипотеза AI")
-        assert "CONSENSUS_LONG" not in sent[0]
+        plain, rich, ticker = sent[0]
+        assert ticker == "HYPERLIQUID:KPEPEUSDC.P"
+        headline = f'<b><a href="https://app.hyperliquid.xyz/trade/kPEPE">{ticker}</a></b> · '
+        assert plain.startswith(headline)
+        assert rich.startswith("<p>" + headline)
+        assert f'<tg-button type="copy_text" text="{ticker}">' in rich
+        assert "<hr/>\n<p><b>Рынок</b>" in rich
+        assert "<table striped compact>" in rich
+        assert "<th>Стакан</th><td>дисбаланс" in rich
+        assert "<b>Стакан</b> · дисбаланс" in plain
+        assert "<blockquote><b>🧠 Гипотеза AI</b>" in rich
+        for message in (plain, rich):
+            assert "Сила:" in message and "Mark $" in message and "МСК" in message
+            assert "<b>HyperData</b> 🟢 вверх · <b>AI</b> 🟢 вверх" in message
+            assert "bid $" not in message and "ask $" not in message
+            assert "<b>Что наблюдать:</b>" in message and "<b>Когда пересмотреть:</b>" in message
+            assert "<details" not in message and "expandable" not in message
+            assert message.index("Всплеск ленты") < message.index("<b>HyperData</b>") < message.index("<blockquote>")
+        assert rich.index("Когда пересмотреть") < rich.index("Копировать фьючерс")
+        assert "CONSENSUS_LONG" not in rich
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
@@ -404,7 +421,9 @@ async def test_telegram_listener_replies_and_advances_offset(monkeypatch, tmp_pa
         assert body["offset"] == 8
         await asyncio.Future()
 
-    async def send(message):
+    async def send(message, *, rich_html):
+        assert "<table striped compact>" in rich_html
+        assert "<th>Точность</th>" in rich_html
         replies.append(message)
         sent.set()
         return True
@@ -540,8 +559,12 @@ def test_finding_strength_requires_price_confirmation_for_critical_rank(market):
     metrics["activity_ratio"]["value"] = 2.5
     assert finding_strength(snapshot, native)["rank"] == 2
     metrics["range_ratio"]["value"] = 3
-    assert finding_strength(snapshot, native)["rank"] == 3
+    assert finding_strength(snapshot, native)["rank"] == 2
     metrics["last_trade_price"]["value"] = 12.05
+    assert finding_strength(snapshot, native)["rank"] == 2
+    metrics["last_trade_price"]["value"] = 12.14
+    assert finding_strength(snapshot, native)["rank"] == 3
+    metrics["last_trade_price"]["value"] = 12.20
     assert finding_strength(snapshot, native)["rank"] == 4
     metrics["spread"]["value"] = 0.04
     assert finding_strength(snapshot, native)["rank"] == 2
@@ -550,3 +573,17 @@ def test_finding_strength_requires_price_confirmation_for_critical_rank(market):
     assert finding_strength(snapshot, native)["rank"] == 2
     metrics["ofi"]["quality"] = "stale"
     assert finding_strength(snapshot, native)["rank"] == 0
+
+
+def test_btc_context_requires_aligned_closed_returns_and_ignores_flat_series():
+    returns = {300 * i: (i % 7 - 3) / 10 for i in range(1, 37)}
+    btc = {"returns": returns}
+    asset = {"returns": {stamp: -change for stamp, change in returns.items()}}
+    context = btc_context(asset, btc, 36 * 300 + 10)
+    assert context["correlation"] == pytest.approx(-1)
+    assert context["samples"] == 36
+    assert context["relative_last_return_pp"] == pytest.approx(-2 * returns[36 * 300])
+    assert btc_context(asset, btc, 36 * 300 + 500) is None
+    assert btc_context({"returns": {stamp: 0 for stamp in returns}}, btc, 36 * 300) is None
+    assert btc_context({"returns": dict(list(returns.items())[1:])}, btc, 36 * 300) is None
+    assert btc_context(btc, btc, 36 * 300) is None

@@ -1,6 +1,9 @@
 """Durable event, assessment, delivery and forward-price journal."""
 import json
 import sqlite3
+import time
+
+from .audit import RULESET, update_move
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyses (
@@ -32,6 +35,31 @@ CREATE TABLE IF NOT EXISTS instrument_samples (
     PRIMARY KEY(symbol, window, slot)
 );
 CREATE INDEX IF NOT EXISTS instrument_samples_slot ON instrument_samples(slot);
+CREATE TABLE IF NOT EXISTS finding_candidates (
+    id TEXT PRIMARY KEY, symbol TEXT NOT NULL, window TEXT NOT NULL, detected_at REAL NOT NULL,
+    version TEXT NOT NULL, snapshot TEXT NOT NULL, event TEXT NOT NULL,
+    decision TEXT NOT NULL, analysis_id TEXT UNIQUE REFERENCES analyses(id)
+);
+CREATE INDEX IF NOT EXISTS finding_candidates_detected ON finding_candidates(detected_at);
+CREATE TABLE IF NOT EXISTS finding_decisions (
+    candidate_id TEXT REFERENCES finding_candidates(id), at REAL NOT NULL, decision TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS finding_decisions_candidate ON finding_decisions(candidate_id);
+CREATE TABLE IF NOT EXISTS delivered_moves (
+    analysis_id TEXT PRIMARY KEY REFERENCES analyses(id), delivered_at REAL NOT NULL,
+    rank INTEGER NOT NULL, target_pct REAL, anchor_price REAL, last_at REAL,
+    peak_pct REAL, gap INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS delivered_moves_delivered ON delivered_moves(delivered_at);
+CREATE INDEX IF NOT EXISTS delivered_moves_pending ON delivered_moves(analysis_id) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS quiet_moves (
+    symbol TEXT NOT NULL, window TEXT NOT NULL, slot INTEGER NOT NULL,
+    delivered_at REAL NOT NULL, target_pct REAL NOT NULL, anchor_price REAL, last_at REAL,
+    peak_pct REAL, gap INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(symbol,window,slot)
+);
+CREATE INDEX IF NOT EXISTS quiet_moves_pending ON quiet_moves(slot) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS quiet_moves_time ON quiet_moves(delivered_at);
 CREATE TABLE IF NOT EXISTS telegram_offsets (
     bot_id INTEGER PRIMARY KEY, next_update INTEGER NOT NULL
 );
@@ -71,6 +99,32 @@ class Journal:
         with self.db:
             self.db.execute("UPDATE analyses SET delivery='interrupted' WHERE delivery='pending' AND ai IS NULL")
             self.db.execute("UPDATE analyses SET delivery='unknown' WHERE delivery IN ('sending', 'pending')")
+            candidates = self.db.execute(
+                "SELECT id FROM finding_candidates WHERE decision IN ('queued','analyzing','delivery_pending')"
+            ).fetchall()
+        if candidates:
+            now = time.time()
+            for row in candidates:
+                self.candidate_decision(row["id"], "interrupted", now)
+
+    def record_candidate(self, key, snapshot, event, decision, now):
+        with self.db:
+            inserted = self.db.execute(
+                "INSERT OR IGNORE INTO finding_candidates VALUES(?,?,?,?,?,?,?,?,NULL)",
+                (key, snapshot["symbol"], snapshot["window"], now, RULESET,
+                 dump(snapshot), dump(event), decision),
+            ).rowcount
+            if inserted:
+                self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)", (key, now, decision))
+
+    def candidate_decision(self, key, decision, now, analysis_id=None):
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE finding_candidates SET decision=?,analysis_id=COALESCE(?,analysis_id) "
+                "WHERE id=? AND decision<>?", (decision, analysis_id, key, decision),
+            ).rowcount
+            if changed:
+                self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)", (key, now, decision))
 
     def record(self, key, event, snapshot, hyperdata):
         with self.db:
@@ -94,6 +148,25 @@ class Journal:
     def delivery(self, key, state, at=None):
         with self.db:
             self.db.execute("UPDATE analyses SET delivery=?,delivered_at=? WHERE id=?", (state, at, key))
+            if state != "sending":
+                decision = "delivered" if state == "sent" else "delivery_" + state
+                candidates = self.db.execute(
+                    "SELECT id FROM finding_candidates WHERE analysis_id=? AND decision<>?", (key, decision),
+                ).fetchall()
+                for candidate in candidates:
+                    self.db.execute("UPDATE finding_candidates SET decision=? WHERE id=?", (decision, candidate["id"]))
+                    self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)",
+                                    (candidate["id"], at if at is not None else time.time(), decision))
+            if state == "sent" and at is not None:
+                self.db.execute("""
+                    INSERT OR IGNORE INTO delivered_moves (analysis_id, delivered_at, rank, target_pct, status)
+                    SELECT a.id, ?, COALESCE(json_extract(a.event,'$.strength.rank'),0),
+                           json_extract(a.snapshot,'$.metrics.natr.value'),
+                           CASE WHEN json_extract(a.snapshot,'$.metrics.natr.quality')='ok'
+                                AND json_extract(a.snapshot,'$.metrics.natr.value')>0
+                                THEN 'pending' ELSE 'no_natr' END
+                    FROM analyses a JOIN finding_candidates c ON c.analysis_id=a.id WHERE a.id=?
+                """, (at, key))
 
     def latest(self, symbol, window, limit=1, *, before=None, completed=False, accepted=False):
         sql = "SELECT * FROM analyses WHERE symbol=? AND window=?"
@@ -155,6 +228,35 @@ class Journal:
                             (price, observed_at, row["event_id"], row["minutes"]),
                         )
 
+            for row in self.db.execute(
+                "SELECT m.*,a.symbol FROM delivered_moves m JOIN analyses a ON a.id=m.analysis_id "
+                "WHERE m.status='pending'"
+            ).fetchall():
+                state = update_move(row, now, prices.get(row["symbol"]))
+                previous = tuple(row[key] for key in ("anchor_price", "last_at", "peak_pct", "gap", "status"))
+                if state != previous:
+                    self.db.execute(
+                        "UPDATE delivered_moves SET anchor_price=?,last_at=?,peak_pct=?,gap=?,status=? WHERE analysis_id=?",
+                        (*state, row["analysis_id"]),
+                    )
+
+            for row in self.db.execute("SELECT * FROM quiet_moves WHERE status='pending'").fetchall():
+                state = update_move(row, now, prices.get(row["symbol"]))
+                previous = tuple(row[key] for key in ("anchor_price", "last_at", "peak_pct", "gap", "status"))
+                if state != previous:
+                    self.db.execute(
+                        "UPDATE quiet_moves SET anchor_price=?,last_at=?,peak_pct=?,gap=?,status=? "
+                        "WHERE symbol=? AND window=? AND slot=?",
+                        (*state, row["symbol"], row["window"], row["slot"]),
+                    )
+
+    def record_quiet_moves(self, samples):
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO quiet_moves(symbol,window,slot,delivered_at,target_pct) VALUES(?,?,?,?,?)",
+                samples,
+            )
+
     def record_instrument_samples(self, samples):
         with self.db:
             self.db.executemany("INSERT OR IGNORE INTO instrument_samples VALUES(?,?,?,?,?,?,?,?)", samples)
@@ -162,6 +264,7 @@ class Journal:
     def prune_instrument_samples(self, before):
         with self.db:
             self.db.execute("DELETE FROM instrument_samples WHERE slot < ?", (before,))
+            self.db.execute("DELETE FROM quiet_moves WHERE delivered_at < ?", (before,))
 
     def telegram_offset(self, bot_id):
         row = self.db.execute("SELECT next_update FROM telegram_offsets WHERE bot_id=?", (bot_id,)).fetchone()
