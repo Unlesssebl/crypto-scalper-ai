@@ -7,7 +7,7 @@ import pytest
 from aiohttp import ClientSession, web
 
 from apps.scalper_web.__main__ import ScalperAPI
-from extensions.scalper.analysis import Gemini, blind_payload, compare, snapshot_key, validate
+from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
 from extensions.scalper.service import Screener
@@ -52,6 +52,8 @@ def test_capture_uses_native_flow_and_venue_quality(market):
     snapshot, native = capture(hub, asset, "5m", now)
     assert native["native_signal"] == "STRONG_BULL"
     assert snapshot["metrics"]["cvd"]["value"] == 240
+    assert snapshot["metrics"]["first_trade_price"]["updated_at"] == now - 299
+    assert snapshot["metrics"]["last_trade_price"]["updated_at"] == now - 1
     assert snapshot["metrics"]["funding_rate"]["value"] is None
     assert snapshot["metrics"]["spread"]["value"] == 2
     assert snapshot["metrics"]["liquidations"]["quality"] == "unavailable"
@@ -191,3 +193,41 @@ def test_journal_has_one_service_owner(tmp_path):
     finally:
         journal.close()
     Journal(path).close()
+
+
+async def test_openrouter_accepts_non_google_model_and_preserves_blind_analysis(market):
+    now, hub, asset = market
+    snapshot, _ = capture(hub, asset, "5m", now)
+    snapshot["native_signal"] = "STRONG_BULL"
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def json(self):
+            return {"model": "vendor/model", "choices": [{
+                "finish_reason": "stop", "message": {"content": json.dumps(model_reply("BEARISH"))},
+            }]}
+
+    def post(url, **request):
+        assert url == "https://openrouter.ai/api/v1/chat/completions"
+        assert request["headers"] == {"Authorization": "Bearer test-key"}
+        body = request["json"]
+        assert body["model"] == "vendor/model"
+        assert body["provider"]["require_parameters"]
+        output = body["response_format"]["json_schema"]
+        assert output["strict"]
+        allowed = output["schema"]["properties"]["arguments"]["items"]["properties"]["metric"]["enum"]
+        assert "ofi" in allowed and "liquidations" not in allowed
+        assert "native_signal" not in json.loads(body["messages"][1]["content"])
+        return Response()
+
+    client = OpenRouter(SimpleNamespace(post=post), "vendor/model", "test-key")
+    result = await client.analyze(snapshot)
+    assert result["provider"] == "openrouter"
+    assert result["status"] == "ok" and result["direction"] == "BEARISH"

@@ -144,6 +144,15 @@ def capture(hub, asset, window, now):
     ):
         metrics[name] = metric(value if flow_quality != "unavailable" else None, flow_source,
                                last_trade, unit, flow_quality)
+    # These are observed trades from the same native window as OFI and CVD.
+    # Price levels provide context for the independent analysis without a new indicator.
+    if bucket and bucket.trades:
+        first_trade, closing_trade = bucket.trades[0], bucket.trades[-1]
+    else:
+        first_trade = closing_trade = None
+    for name, trade in (("first_trade_price", first_trade), ("last_trade_price", closing_trade)):
+        metrics[name] = metric(trade.price if trade and flow_quality != "unavailable" else None,
+                               flow_source, trade.timestamp if trade else None, "USD", flow_quality)
     book = hub.get_orderbook(asset.symbol)
     book_source = "HyperData demo" if hub.demo else "Hyperliquid l2Book / HyperData"
     if not book or not book.bids or not book.asks or not 0 < book.best_bid <= book.best_ask:

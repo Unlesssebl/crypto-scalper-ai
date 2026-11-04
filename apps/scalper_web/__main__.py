@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
-from extensions.scalper.analysis import Gemini
+from extensions.scalper.analysis import Gemini, OpenRouter
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, ScalperHub, orderbook_details
 from extensions.scalper.service import Screener
@@ -51,6 +51,7 @@ class ScalperAPI(HyperDataAPI):
         return web.json_response({"mode": self.hub.status.mode,
                                   "market": self.hub.status.market_data,
                                   "gemini": "configured" if self.service.gemini.key else "disabled",
+                                  "ai_provider": self.service.gemini.provider,
                                   "rows": rows})
 
     async def detail(self, request):
@@ -63,6 +64,19 @@ class ScalperAPI(HyperDataAPI):
             "book": orderbook_details(self.hub, symbol),
             "history": self.service.journal.latest(symbol, window, limit=20),
         })
+
+
+def analyst(session, demo):
+    provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
+    if provider == "openrouter":
+        model = os.getenv("OPENROUTER_MODEL", "").strip()
+        key = "" if demo or not model else os.getenv("OPENROUTER_API_KEY", "").strip()
+        return OpenRouter(session, model or "openrouter/auto", key,
+                          proxy=os.getenv("OPENROUTER_PROXY", "").strip() or None)
+    if provider == "gemini":
+        return Gemini(session, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(),
+                      "" if demo else os.getenv("GEMINI_API_KEY", "").strip())
+    raise ValueError("AI_PROVIDER must be gemini or openrouter")
 
 
 async def run(args):
@@ -80,8 +94,7 @@ async def run(args):
     tasks = []
     try:
         async with aiohttp.ClientSession() as session:
-            gemini = Gemini(session, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-                            "" if args.demo else os.getenv("GEMINI_API_KEY", ""))
+            gemini = analyst(session, args.demo)
             notify = bool(args.notify and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
             service = Screener(hub, journal, gemini, notify)
             hub._api_server = ScalperAPI(hub, service, args.port)

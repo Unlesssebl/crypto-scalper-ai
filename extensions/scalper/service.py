@@ -27,7 +27,7 @@ def alert_text(snapshot, native, ai, consensus):
     return html.escape("\n".join([
         f'{snapshot["contract"]} · Hyperliquid · {snapshot["window"]}',
         f'HyperData: {native["direction"]}{native_reason}',
-        f'Gemini: {ai.get("direction", ai["status"])}',
+        f'AI ({ai.get("provider", "—")}): {ai.get("direction", ai["status"])}',
         f'{consensus["category"]} · {consensus["overlap"]}',
         *reasons, *(["Контраргумент: " + ai["contradictions"][0]["reason"]]
                     if ai.get("contradictions") else []), stamp,

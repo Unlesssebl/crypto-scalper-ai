@@ -7,6 +7,7 @@ busy-port handling, strategy loader edge cases, and the CVD symbol labels.
 """
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 import time
@@ -474,7 +475,7 @@ def test_cvd_dashboard_labels_follow_the_symbol():
     from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
 
     dash = CVDDashboard(engine=OrderFlowEngine(symbols=["SOL"]), symbol="SOL")
-    console = Console(width=160, record=True, file=open("/dev/null", "w"))
+    console = Console(width=160, record=True, file=io.StringIO())
     console.print(dash.build_dashboard())
     text = console.export_text()
     assert "SOL CVD" in text and "BITCOIN" not in text and "BTC CVD" not in text

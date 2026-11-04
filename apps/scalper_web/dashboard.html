@@ -35,7 +35,7 @@ summary{cursor:pointer}pre{overflow:auto;font-size:13px;white-space:pre-wrap}sma
 </section>
 <div class="panel"><table aria-label="Рыночный скринер">
 <thead id="head"></thead><tbody id="rows"></tbody></table></div>
-<p class="notes">HyperData в таблице показывает текущий Order Flow. Gemini и Consensus относятся к последнему сохранённому событию, время которого указано рядом с выводом.</p>
+<p class="notes">HyperData в таблице показывает текущий Order Flow. AI и Consensus относятся к последнему сохранённому событию, время которого указано рядом с выводом.</p>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
 </main>
 <script>
@@ -52,7 +52,7 @@ const columns = [
   ["symbol","Инструмент"],["price","Mark, USD"],["volume_24h","24h, USD"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
   ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
-  ["ai","Gemini"],["category","Consensus"],["quality","Данные"],["summary","Комментарий"],
+  ["ai","AI"],["category","Consensus"],["quality","Данные"],["summary","Комментарий"],
 ];
 const tableRow = document.createElement("tr");
 for (const [key,label] of columns) {
@@ -159,7 +159,7 @@ async function loadDetail() {
     for (const event of row.history) {
       const item = node("details", null, detail), ai = event.ai;
       node("summary", stamp(event.captured_at) + " · " + (event.consensus?.category ?? event.delivery), item);
-      node("p", "HyperData " + event.hyperdata.direction + " · Gemini " +
+      node("p", "HyperData " + event.hyperdata.direction + " · AI " +
         (ai?.direction ?? ai?.status ?? "—") + " · " + (event.consensus?.overlap ?? "—"), item);
       if (ai?.summary) {
         node("p", ai.summary, item);
@@ -192,7 +192,7 @@ async function refresh() {
     if (sequence !== generation) return;
     data = result.rows;
     $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
-      " · Gemini " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
+      " · " + result.ai_provider + " " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
     render();
   } catch (error) {
     if (sequence === generation) $("status").textContent = "Обновление недоступно · " + error.message;
