@@ -695,3 +695,15 @@ def test_digest_text_renders_context_and_directional_rows():
 def test_digest_text_requires_context():
     assert digest_text({}, None) is None
     assert digest_text({}, {}) is None
+
+
+def test_alert_min_rank_defaults_and_overrides(monkeypatch):
+    from extensions.scalper.audit import STRONG_RANK
+    from extensions.scalper.service import alert_min_rank
+
+    monkeypatch.delenv("HYPERDATA_ALERT_MIN_RANK", raising=False)
+    assert alert_min_rank() == STRONG_RANK
+    monkeypatch.setenv("HYPERDATA_ALERT_MIN_RANK", "2")
+    assert alert_min_rank() == 2
+    monkeypatch.setenv("HYPERDATA_ALERT_MIN_RANK", "not-a-number")
+    assert alert_min_rank() == STRONG_RANK

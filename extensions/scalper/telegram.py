@@ -59,6 +59,30 @@ def digest_text(rows, context, *, rich=False):
     return text
 
 
+async def announce_online(service):
+    """Send one startup message once the first scan has rows.
+
+    This is the quickest way for an operator to confirm Telegram delivery
+    works end to end, instead of waiting for the first strong finding or the
+    periodic digest.
+    """
+    alerts = service.hub.alerts
+    if not (alerts.telegram_token and alerts.telegram_chat_id):
+        return
+    for _ in range(30):
+        if service.rows:
+            break
+        await asyncio.sleep(1)
+    context = getattr(service.hub, "context", None)
+    body = digest_text(service.rows, context)
+    head = "HyperData screener запущен."
+    text = f"{head}\n{body}" if body else head
+    try:
+        await alerts.send_telegram(text, rich_html=digest_text(service.rows, context, rich=True) if body else None)
+    except Exception:
+        LOG.exception("Telegram startup message failed")
+
+
 async def run_digest(session, service, interval_seconds):
     """Send the market-context digest every `interval_seconds` when enabled."""
     alerts = service.hub.alerts

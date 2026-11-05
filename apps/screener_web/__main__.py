@@ -25,7 +25,7 @@ from extensions.scalper.market import WINDOWS, orderbook_details
 from extensions.scalper.parity import Recorder
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.service import Screener
-from extensions.scalper.telegram import listen_reports, run_digest
+from extensions.scalper.telegram import announce_online, listen_reports, run_digest
 from hyperdata_terminal.api_server import (
     _make_host_guard_middleware,
     _make_rate_limit_middleware,
@@ -174,6 +174,7 @@ async def run(args: argparse.Namespace) -> None:
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
             if notify:
+                tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
                 tasks.append(asyncio.create_task(
                     run_digest(session, service, int(os.getenv("HYPERDATA_DIGEST_SECONDS", "900"))),

@@ -4,6 +4,7 @@ import hashlib
 import html
 import logging
 import math
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -46,6 +47,19 @@ ALERT_DIRECTIONS = {
     "INSUFFICIENT_DATA": "недостаточно данных",
 }
 MOSCOW = timezone(timedelta(hours=3), "МСК")
+
+
+def alert_min_rank() -> int:
+    """Minimum finding strength (rank 1-4) that triggers a Telegram alert.
+
+    Defaults to STRONG_RANK so parity-era behaviour is unchanged; an operator
+    can lower it (e.g. 2) via HYPERDATA_ALERT_MIN_RANK to receive more
+    notifications.
+    """
+    try:
+        return int(os.getenv("HYPERDATA_ALERT_MIN_RANK", STRONG_RANK))
+    except ValueError:
+        return STRONG_RANK
 
 
 def futures_ticker(snapshot):
@@ -537,7 +551,7 @@ class Screener:
         return bool(event.get("anomalies")) or (reversal and price_agrees)
 
     def enqueue_facts(self, key, snapshot, native, event, row, now):
-        if (event["strength"]["rank"] < STRONG_RANK or self.notifications.full()
+        if (event["strength"]["rank"] < alert_min_rank() or self.notifications.full()
                 or now - event["detected_at"] > MAX_EVENT_AGE[snapshot["window"]]
                 or not self.alert_reason(snapshot, native, event)):
             return
