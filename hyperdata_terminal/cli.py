@@ -140,10 +140,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _api_universe(limit: int = 100) -> list[str] | None:
+    """Top Hyperliquid symbols by 24h volume, fetched before the hub starts.
+
+    The orderflow shard plan is fixed at start(), so this is the one chance to
+    cover the current top of the book. A failed fetch falls back to
+    DEFAULT_SYMBOLS rather than delaying startup.
+    """
+    from hyperdata_terminal.data_layer.market_data import MarketData
+
+    market = MarketData()
+    try:
+        await market.refresh()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Could not prefetch the Hyperliquid universe; falling back to DEFAULT_SYMBOLS"
+        )
+        return None
+    ranked = sorted(market.assets.values(), key=lambda asset: asset.volume_24h, reverse=True)
+    symbols = [asset.symbol for asset in ranked[:limit]]
+    return symbols or None
+
+
 async def _run_api(port: int, demo: bool = False) -> int:
     from hyperdata_terminal.data_layer.hub import HyperDataHub
 
-    hub = HyperDataHub(demo=demo, api_port=port)
+    symbols = None if demo else await _api_universe(60)
+    hub = HyperDataHub(symbols=symbols, demo=demo, api_port=port)
     await hub.start()
     if "api_server" in hub.status.failed_components:
         await hub.stop()

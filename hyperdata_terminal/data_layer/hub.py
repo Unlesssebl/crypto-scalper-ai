@@ -196,7 +196,7 @@ class HyperDataHub:
         self.hlp = HLPTracker()
         self.funding = FundingRateCollector()
         self.lsr = LongShortCollector()
-        self.orderbook = OrderBookEngine()
+        self.orderbook = OrderBookEngine(symbols=self.symbols)
         self.spot = SpotPriceCollector()
         self.deribit = DeribitFeed()
         self.health = DataHealthMonitor(self)
