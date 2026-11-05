@@ -165,7 +165,11 @@ async def _api_universe(limit: int = 100) -> list[str] | None:
 async def _run_api(port: int, demo: bool = False) -> int:
     from hyperdata_terminal.data_layer.hub import HyperDataHub
 
-    symbols = None if demo else await _api_universe(60)
+    try:
+        limit = int(os.getenv("HYPERDATA_UNIVERSE_LIMIT", "60"))
+    except ValueError:
+        limit = 60
+    symbols = None if demo else await _api_universe(limit)
     hub = HyperDataHub(symbols=symbols, demo=demo, api_port=port)
     await hub.start()
     if "api_server" in hub.status.failed_components:

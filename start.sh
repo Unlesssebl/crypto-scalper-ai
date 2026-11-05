@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One-command launcher for the Crypto Scalper fork.
-# Usage: ./start.sh [--demo] [--tui] [--port 8420] [--notify] [--journal PATH]
+# Production launcher: native HyperData API + external screener.
+# Legacy fork mode: ./start.sh --legacy [old crypto-scalper flags]
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -8,6 +8,36 @@ cd "$(dirname "$0")"
 step() { printf '\033[36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[32mOK  %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m!!  %s\033[0m\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+Usage: ./start.sh [options]
+
+Starts the native HyperData API (8420) and the external screener (8421).
+
+  --demo              synthetic data; disables AI and Telegram
+  --api-port N        native API port (default 8420)
+  --port N            screener web port (default 8421)
+  --tui               also show the Rich Market Overview
+  --notify            enable Telegram delivery
+  --journal PATH      screener SQLite journal
+  --record PATH       append every scan to JSONL
+  --legacy            run the old crypto-scalper fork instead
+  --help              this help
+
+Examples:
+  ./start.sh
+  ./start.sh --demo
+  ./start.sh --tui --notify
+  ./start.sh --legacy --port 8420
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h) usage; exit 0 ;;
+    esac
+done
 
 find_python() {
     for candidate in python3.13 python3.12 python3 python; do
@@ -20,6 +50,11 @@ find_python() {
     return 1
 }
 
+legacy=0
+for arg in "$@"; do
+    [ "$arg" = "--legacy" ] && legacy=1
+done
+
 if command -v uv >/dev/null 2>&1; then
     ok "Using $(uv --version)"
     RUNNER=(uv run python)
@@ -30,20 +65,16 @@ else
         echo "    Install uv (https://docs.astral.sh/uv/) or Python 3.12+ and run this script again."
         exit 1
     fi
-
     ok "Using $("$PYTHON" --version)"
-
     if [ ! -x .venv/bin/python ]; then
         step "Creating the virtual environment in .venv"
         "$PYTHON" -m venv .venv
     fi
-
-    if ! .venv/bin/python -c 'import hyperdata_terminal, extensions.scalper, apps.scalper_web' 2>/dev/null; then
+    if ! .venv/bin/python -c 'import hyperdata_terminal, extensions.scalper, apps.scalper_web, apps.screener_web' 2>/dev/null; then
         step "Installing dependencies (the first run can take a minute)"
         .venv/bin/python -m pip install --upgrade pip
         .venv/bin/python -m pip install -e .
     fi
-
     RUNNER=(.venv/bin/python)
 fi
 
@@ -51,30 +82,33 @@ if [ ! -f .env ]; then
     cp .env.example .env
     warn "Created .env from .env.example."
     echo "    Add GEMINI_API_KEY (or configure OpenRouter) to enable AI analysis."
-    echo "    Without a key the dashboard still runs; signals stay HYPERDATA_ONLY."
 fi
 
-PORT=8420
-expect_port=0
-help_requested=0
-for arg in "$@"; do
-    if [ "$expect_port" = 1 ]; then
-        PORT="$arg"
-        expect_port=0
-        continue
+if [ "$legacy" = 1 ]; then
+    forward=()
+    for arg in "$@"; do
+        [ "$arg" = "--legacy" ] || forward+=("$arg")
+    done
+    step "Starting legacy crypto-scalper"
+    if command -v uv >/dev/null 2>&1; then
+        exec uv run crypto-scalper "${forward[@]}"
+    else
+        exec .venv/bin/python -m apps.scalper_web "${forward[@]}"
     fi
-    case "$arg" in
-        --port) expect_port=1 ;;
-        --port=*) PORT="${arg#--port=}" ;;
-        --help|-h) help_requested=1 ;;
+fi
+
+serve_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port)
+            serve_args+=(--web-port "${2:-8421}")
+            shift 2 || shift
+            ;;
+        *)
+            serve_args+=("$1")
+            shift
+            ;;
     esac
 done
 
-if [ "$help_requested" = 0 ]; then
-    step "Starting Crypto Scalper"
-    echo "    Dashboard: http://127.0.0.1:$PORT/scalper"
-    echo "    Stop with Ctrl+C"
-    echo "    Other modes: ./start.sh --demo | --tui | --port 8500 | --notify"
-fi
-
-exec "${RUNNER[@]}" -m apps.scalper_web "$@"
+exec "${RUNNER[@]}" scripts/serve.py "${serve_args[@]}"

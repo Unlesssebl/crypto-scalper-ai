@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
-# One-command launcher for the Crypto Scalper fork.
-# Usage: .\start.ps1 [--demo] [--tui] [--port 8420] [--notify] [--journal PATH]
+# Production launcher: native HyperData API + external screener.
+# Legacy fork mode: .\start.ps1 --legacy [old crypto-scalper flags]
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -8,6 +8,34 @@ Set-Location $PSScriptRoot
 function Write-Step { param($Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok { param($Message) Write-Host "OK  $Message" -ForegroundColor Green }
 function Write-Warn { param($Message) Write-Host "!!  $Message" -ForegroundColor Yellow }
+function Show-Usage {
+    Write-Host @"
+Usage: .\start.ps1 [options]
+
+Starts the native HyperData API (8420) and the external screener (8421).
+
+  --demo              synthetic data; disables AI and Telegram
+  --api-port N        native API port (default 8420)
+  --port N            screener web port (default 8421)
+  --tui               also show the Rich Market Overview
+  --notify            enable Telegram delivery
+  --journal PATH      screener SQLite journal
+  --record PATH       append every scan to JSONL
+  --legacy            run the old crypto-scalper fork instead
+  --help              this help
+
+Examples:
+  .\start.ps1
+  .\start.ps1 --demo
+  .\start.ps1 --tui --notify
+  .\start.ps1 --legacy --port 8420
+"@
+}
+
+if ($args -contains "--help" -or $args -contains "-h") {
+    Show-Usage
+    exit 0
+}
 
 function Test-Python {
     param($Command, [string[]]$Prefix)
@@ -32,7 +60,6 @@ function Find-Python {
 
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 $venvPython = $null
-
 if ($uv) {
     Write-Ok "Using $(& uv --version)"
 } else {
@@ -42,24 +69,19 @@ if ($uv) {
         Write-Host "    Install uv (https://docs.astral.sh/uv/) or Python 3.12+ and run this script again."
         exit 1
     }
-
-    $version = & $python.Command @($python.Prefix + @("--version"))
-    Write-Ok "Using $version"
-
+    Write-Ok "Using $(& $python.Command @($python.Prefix + @('--version')))"
     $onWindows = ($env:OS -eq "Windows_NT")
     $venvPython = if ($onWindows) {
         Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
     } else {
         Join-Path $PSScriptRoot ".venv/bin/python"
     }
-
     if (-not (Test-Path $venvPython)) {
         Write-Step "Creating the virtual environment in .venv"
         & $python.Command @($python.Prefix + @("-m", "venv", ".venv"))
         if ($LASTEXITCODE -ne 0) { throw "Could not create .venv" }
     }
-
-    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.scalper_web" 2>$null
+    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.scalper_web, apps.screener_web" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Step "Installing dependencies (the first run can take a minute)"
         & $venvPython -m pip install --upgrade pip
@@ -74,29 +96,34 @@ if (-not (Test-Path $envFile)) {
     Copy-Item (Join-Path $PSScriptRoot ".env.example") $envFile
     Write-Warn "Created .env from .env.example."
     Write-Host "    Add GEMINI_API_KEY (or configure OpenRouter) to enable AI analysis."
-    Write-Host "    Without a key the dashboard still runs; signals stay HYPERDATA_ONLY."
 }
 
-$port = 8420
+$legacy = $args -contains "--legacy"
+if ($legacy) {
+    $forward = @($args | Where-Object { $_ -ne "--legacy" })
+    Write-Step "Starting legacy crypto-scalper"
+    if ($uv) {
+        & uv run crypto-scalper @forward
+    } else {
+        & $venvPython -m apps.scalper_web @forward
+    }
+    exit $LASTEXITCODE
+}
+
+# Keep the old --port spelling for the screener web port.
+$serveArgs = @()
 for ($i = 0; $i -lt $args.Count; $i++) {
-    if ($args[$i] -eq "--port" -and $i + 1 -lt $args.Count) {
-        $port = $args[$i + 1]
-    } elseif ($args[$i] -like "--port=*") {
-        $port = $args[$i].Substring("--port=".Length)
+    if ($args[$i] -eq "--port") {
+        $serveArgs += "--web-port"
+        if ($i + 1 -lt $args.Count) { $serveArgs += $args[$i + 1]; $i++ }
+    } else {
+        $serveArgs += $args[$i]
     }
 }
 
-$helpRequested = $args -contains "--help" -or $args -contains "-h"
-if (-not $helpRequested) {
-    Write-Step "Starting Crypto Scalper"
-    Write-Host "    Dashboard: http://127.0.0.1:$port/scalper"
-    Write-Host "    Stop with Ctrl+C"
-    Write-Host "    Other modes: .\start.ps1 --demo | --tui | --port 8500 | --notify"
-}
-
 if ($uv) {
-    & uv run python -m apps.scalper_web @args
+    & uv run python scripts/serve.py @serveArgs
 } else {
-    & $venvPython -m apps.scalper_web @args
+    & $venvPython scripts/serve.py @serveArgs
 }
 exit $LASTEXITCODE
