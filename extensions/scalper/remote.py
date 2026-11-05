@@ -204,7 +204,14 @@ class RemoteHub:
             for item in assets
         }
         self.market.observed_fields = {}
-        orderflow = RemoteOrderFlow()
+        # The screener holds `RemoteHub.orderflow` for the process lifetime and
+        # reads it on every scan. Rebuild the buckets in place: replacing the
+        # whole `RemoteOrderFlow` here would orphan references (and churn the
+        # GC) every 5s poll with no benefit.
+        orderflow = self.orderflow
+        orderflow.buckets.clear()
+        orderflow.recent_trades.clear()
+        orderflow._connected_at.clear()
         books: dict[str, OrderBookSnapshot] = {}
         for row in payload.get("rows", []):
             symbol, window = row["symbol"], row["window"]
@@ -246,7 +253,6 @@ class RemoteHub:
                     best_bid=best_bid, best_ask=best_ask,
                     spread=float(book.get("spread") or (best_ask - best_bid)),
                 )
-        self.orderflow = orderflow
         self._books = books
 
     # -- HyperDataHub-shaped accessors --------------------------------------

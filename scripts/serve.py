@@ -108,17 +108,18 @@ def run(args: argparse.Namespace) -> int:
 
     screener = start_screener(args.api_port, args.web_port, args.forwarded)
     LOG.info("Dashboard: http://127.0.0.1:%d/scalper", args.web_port)
-    restarts: list[float] = []
+    native_restarts: list[float] = []
+    screener_restarts: list[float] = []
     try:
         while True:
+            now = time.monotonic()
             if native is not None and native.poll() is not None:
-                now = time.monotonic()
-                restarts = [stamp for stamp in restarts if now - stamp < RESTART_WINDOW]
-                if len(restarts) >= MAX_RESTARTS:
-                    LOG.error("Native API restarted %d times in %.0fs; giving up", len(restarts), RESTART_WINDOW)
+                native_restarts = [stamp for stamp in native_restarts if now - stamp < RESTART_WINDOW]
+                if len(native_restarts) >= MAX_RESTARTS:
+                    LOG.error("Native API restarted %d times in %.0fs; giving up", len(native_restarts), RESTART_WINDOW)
                     stop(screener, "screener")
                     return 1
-                restarts.append(now)
+                native_restarts.append(now)
                 LOG.warning("Native API exited with %s; restarting", native.returncode)
                 native = start_native(args.api_port, args.demo)
                 if not wait_for_health(args.api_port):
@@ -126,8 +127,13 @@ def run(args: argparse.Namespace) -> int:
                     stop(screener, "screener")
                     return 1
             if screener.poll() is not None:
-                LOG.info("Screener exited with %s", screener.returncode)
-                return screener.returncode or 0
+                screener_restarts = [stamp for stamp in screener_restarts if now - stamp < RESTART_WINDOW]
+                if len(screener_restarts) >= MAX_RESTARTS:
+                    LOG.error("Screener restarted %d times in %.0fs; giving up", len(screener_restarts), RESTART_WINDOW)
+                    return 1
+                screener_restarts.append(time.monotonic())
+                LOG.warning("Screener exited with %s; restarting", screener.returncode)
+                screener = start_screener(args.api_port, args.web_port, args.forwarded)
             time.sleep(2)
     except KeyboardInterrupt:
         LOG.info("Interrupted")

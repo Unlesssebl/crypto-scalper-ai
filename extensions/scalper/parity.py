@@ -60,8 +60,10 @@ SKIP_QUALITIES = {"warming_up", "stale"}
 # are allowed a higher rate; flow/signal mismatches are the ones that matter.
 CORE_PREFIXES = ("flow.",)
 CORE_NAMES = {"signal", "direction"}
-CORE_FIELDS = 7      # cvd, ofi, volume, trade_count, trade_rate, signal, direction
-SECONDARY_FIELDS = 10  # market(4) + book(4) + candles(2)
+# Rates are computed against comparison SLOTS actually exercised (a value slot
+# plus its quality slot per field), not a hand-tuned field count: the old
+# `compared * CORE_FIELDS` denominator diverged from the numerator's slot
+# accounting and silently skewed the headline rate.
 CORE_RATE = 0.10
 SECONDARY_RATE = 0.30
 SIGNAL_AGREEMENT = 0.95
@@ -196,6 +198,8 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
     stale_skipped = 0
     signal_compared = 0
     signal_mismatches = 0
+    core_slots = 0
+    secondary_slots = 0
     for left, right in pairs:
         base_rows, cand_rows = _rows(left), _rows(right)
         for key in sorted(base_rows.keys() & cand_rows.keys()):
@@ -206,6 +210,7 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
             flow_quality_right = _quality(cand_row, "flow", "cvd")
             flow_warming = "warming_up" in (flow_quality_left, flow_quality_right)
             for group, fields in GROUPS.items():
+                is_core = group == "flow"
                 for field in fields:
                     lq, rq = _quality(base_row, group, field), _quality(cand_row, group, field)
                     if lq == "warming_up" or rq == "warming_up":
@@ -214,6 +219,12 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
                     if lq in SKIP_QUALITIES or rq in SKIP_QUALITIES:
                         stale_skipped += 1
                         continue
+                    # One value slot + one quality slot per field, only for
+                    # slots actually exercised (not skipped above).
+                    if is_core:
+                        core_slots += 2
+                    else:
+                        secondary_slots += 2
                     lv, rv = _value(base_row, group, field), _value(cand_row, group, field)
                     if not _matches(field, lv, rv):
                         name = f"{group}.{field}"
@@ -228,6 +239,8 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
             if flow_warming or flow_quality_left in SKIP_QUALITIES or flow_quality_right in SKIP_QUALITIES:
                 warmup_skipped += 1
                 continue
+            # signal + direction are core slots.
+            core_slots += 2
             signal_compared += 1
             ls, rs = _signal(base_row), _signal(cand_row)
             if ls != rs:
@@ -243,8 +256,8 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
     core = sum(count for name, count in by_field.items()
                if name.startswith(CORE_PREFIXES) or name in CORE_NAMES)
     secondary = len(mismatches) - core
-    core_rate = core / (compared * CORE_FIELDS) if compared else 1.0
-    secondary_rate = secondary / (compared * SECONDARY_FIELDS) if compared else 1.0
+    core_rate = core / core_slots if core_slots else 1.0
+    secondary_rate = secondary / secondary_slots if secondary_slots else 1.0
     signal_agreement = (1 - signal_mismatches / signal_compared) if signal_compared else 1.0
     passed = (
         bool(pairs)
@@ -263,6 +276,8 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
         "mismatches": len(mismatches),
         "core_mismatches": core,
         "secondary_mismatches": secondary,
+        "core_slots": core_slots,
+        "secondary_slots": secondary_slots,
         "core_mismatch_rate": round(core_rate, 4),
         "secondary_mismatch_rate": round(secondary_rate, 4),
         "signal_compared": signal_compared,
