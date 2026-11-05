@@ -373,6 +373,9 @@ class Screener:
     async def run(self):
         while True:
             try:
+                refresh = getattr(self.hub, "refresh_snapshot", None)
+                if refresh is not None:
+                    await refresh()
                 self.scan(time.time())
             except Exception:
                 LOG.exception("Screener scan failed")
