@@ -10,7 +10,15 @@ from urllib.parse import quote
 
 from hyperdata_terminal.utils.helpers import format_price, format_usd
 
-from .activity import CANDLE_SOURCE, active_anomalies, btc_context, finding_strength, refresh_candles, wide_spread
+from .activity import (
+    CANDLE_SOURCE,
+    active_anomalies,
+    btc_context,
+    finding_strength,
+    market_risk_context,
+    refresh_candles,
+    wide_spread,
+)
 from .analysis import DIRECTIONAL, compare, snapshot_key
 from .audit import CONTROL_INTERVAL, STRONG_RANK
 from .journal import dump
@@ -250,6 +258,7 @@ class Screener:
         self.control_slots = {}
         self.last_profile_prune = 0
         self.candles = {}
+        self.market_context: list[str] = []
         self.context_events = 0
         self.states = {}
         self.pending = set()
@@ -261,6 +270,7 @@ class Screener:
 
     def scan(self, now):
         assets = self.hub.get_all_assets()
+        self.market_context = market_risk_context(getattr(self.hub, "context", None))
         rows = {}
         for asset in assets[:20]:
             for window in WINDOWS:
@@ -275,6 +285,8 @@ class Screener:
             context = rows.get((key[0], "5m")) if key[1] == "1m" else None
             profile = self.profiles.get(key)
             row["facts"] = situation_facts(snapshot, profile)
+            if self.market_context:
+                row["facts"] = [*row["facts"], *self.market_context]
             row["strength"] = finding_strength(snapshot, native)
             row["movement_phase"] = self.phases.observe(key, snapshot, native, WINDOWS[key[1]])
             row["btc_context"] = btc_context(self.candles.get((key[0], "5m")),

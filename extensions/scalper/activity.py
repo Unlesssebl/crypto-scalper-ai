@@ -36,8 +36,41 @@ __all__ = [
     "CANDLE_SOURCE", "FINDING_LEVELS", "MIN_BURST_TRADES", "MIN_LARGE_MOVE_PCT",
     "MIN_STRONG_MOVE_PCT", "SPREAD_MULTIPLE", "WIDE_SPREAD_ATR_FRACTION",
     "active_anomalies", "btc_context", "candle_indicators", "finding_strength",
-    "refresh_candles", "tape_baseline", "wide_spread",
+    "market_risk_context", "refresh_candles", "tape_baseline", "wide_spread",
 ]
+
+
+def market_risk_context(context):
+    """Human-readable risk-appetite notes from the snapshot's market context.
+
+    `context` is the ``/v1/snapshot`` ``context`` block (L/S, basis, IV,
+    extreme funding). Returns a list of short strings for the dashboard and
+    notification facts; empty when the block is absent. Pure and side-effect
+    free so the fork (which passes None) degrades gracefully.
+    """
+    if not context:
+        return []
+    notes = []
+    if lsr := context.get("lsr", {}).get("BTC"):
+        ratio = lsr.get("long_short_ratio")
+        if ratio is not None:
+            if ratio >= 1.5:
+                notes.append(f"L/S BTC {ratio:.2f} — перекос в лонг ({lsr.get('source', '')})")
+            elif ratio <= 0.7:
+                notes.append(f"L/S BTC {ratio:.2f} — перекос в шорт ({lsr.get('source', '')})")
+    if iv := context.get("iv", {}).get("BTC"):
+        mark = iv.get("mark_iv")
+        if mark is not None and mark >= 60:
+            notes.append(f"IV BTC {mark:.0f}% — повышенная подразумеваемая волатильность")
+    if basis := context.get("basis", {}).get("BTC"):
+        bp = basis.get("basis_pct")
+        if bp is not None and abs(bp) >= 0.5:
+            notes.append(f"Базис BTC {bp:+.2f}% ({basis.get('source', '')})")
+    if liquidations := context.get("liquidations"):
+        count = liquidations.get("confirmed_count")
+        if count and count >= 5:
+            notes.append(f"Ликвидации за час: {count} ({int(liquidations.get('confirmed_volume_usd', 0)):,} USD)")
+    return notes
 
 
 def active_anomalies(snapshot, *, tape_ratio=BURST_RATIO):

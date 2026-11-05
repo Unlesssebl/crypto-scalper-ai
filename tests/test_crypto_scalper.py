@@ -4,16 +4,30 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from aiohttp import ClientSession, web
+from aiohttp import web
 
 from apps.scalper_web.__main__ import ScalperAPI
-from extensions.scalper.activity import active_anomalies, btc_context, candle_indicators, finding_strength, tape_baseline
+from extensions.scalper.activity import (
+    active_anomalies,
+    btc_context,
+    candle_indicators,
+    finding_strength,
+    market_risk_context,
+    tape_baseline,
+)
 from extensions.scalper.analysis import Gemini, OpenRouter, blind_payload, compare, snapshot_key, validate
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import capture
-from extensions.scalper.quality import calculate_quality
 from extensions.scalper.profile import calculate_profiles, profile_context, sample_window
-from extensions.scalper.service import Screener, five_minute_relation, minute_gate, with_context, with_movement_context, with_senior_context
+from extensions.scalper.quality import calculate_quality
+from extensions.scalper.service import (
+    Screener,
+    five_minute_relation,
+    minute_gate,
+    with_context,
+    with_movement_context,
+    with_senior_context,
+)
 from extensions.scalper.telegram import listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
@@ -626,3 +640,30 @@ def test_blind_context_distinguishes_warming_flow_and_observed_impulse(market):
     missing = blind_payload(with_context(minute, None))
     assert missing["context_5m"]["flow_quality"] == {"ofi": "unavailable", "cvd": "unavailable"}
     assert missing["context_5m"]["metrics"] == {}
+
+
+def test_market_risk_context_flags_skew_and_iv():
+    context = {
+        "lsr": {"BTC": {"long_short_ratio": 1.8, "source": "okx"}},
+        "iv": {"BTC": {"mark_iv": 65.0}},
+        "basis": {"BTC": {"basis_pct": -0.6, "source": "coinbase"}},
+        "liquidations": {"confirmed_count": 7, "confirmed_volume_usd": 500_000},
+    }
+    notes = market_risk_context(context)
+    assert any("L/S BTC" in note for note in notes)
+    assert any("IV BTC" in note for note in notes)
+    assert any("Базис BTC" in note for note in notes)
+    assert any("Ликвидации" in note for note in notes)
+
+
+def test_market_risk_context_is_empty_without_context():
+    assert market_risk_context(None) == []
+    assert market_risk_context({}) == []
+
+
+def test_blind_payload_carries_market_context_when_present(market):
+    now, hub, asset = market
+    snapshot, _ = capture(hub, asset, "1m", now)
+    snapshot["market_context"] = {"lsr": {"BTC": {"long_short_ratio": 1.2}}}
+    payload = blind_payload(snapshot)
+    assert payload["market_context"]["lsr"]["BTC"]["long_short_ratio"] == 1.2
