@@ -2,20 +2,66 @@
 
 Локальный форк [HyperData Terminal](https://github.com/Co-Messi/HyperData-Terminal) на ветке `crypto-scalper`. Базовый коммит `5fd1f0264391de1b65b18014049ea61161d82d51` закреплён тегом `scalper-upstream-base`. Для просмотра обновлений upstream выполните `git fetch upstream` и `git log --oneline scalper-upstream-base..upstream/main`.
 
-## Установка и запуск
+## Быстрый старт
 
-Python 3.12 или новее. Команды PowerShell из каталога форка.
+Нужен Python 3.12 или новее. Из каталога форка выполните одну команду:
+
+```powershell
+.\start.ps1
+```
+
+Скрипт сам подготовит окружение, установит пакет, скопирует `.env.example` в `.env` и запустит приложение. Откройте [панель Crypto Scalper](http://127.0.0.1:8420/scalper).
+
+На Linux и macOS используйте `./start.sh`.
+
+Если установлен [uv](https://docs.astral.sh/uv/), скрипт использует его: окружение и зависимости готовит uv, а не `pip`. Без uv всё работает через `.venv`.
+
+### Режимы
+
+| Команда | Что получится |
+|---|---|
+| `.\start.ps1` | Веб-панель на `http://127.0.0.1:8420/scalper` |
+| `.\start.ps1 --tui` | Веб-панель плюс Rich Market Overview в терминале |
+| `.\start.ps1 --demo` | Синтетические данные, отдельный журнал, без Gemini и Telegram |
+| `.\start.ps1 --port 8500` | Другой порт |
+| `.\start.ps1 --notify` | Telegram-уведомления, если заданы токен и chat id |
+| `.\start.ps1 --help` | Все флаги приложения |
+
+Колонки 1M AI и 5M AI показывают итог сравнения и возраст принятого снимка.
+
+### Вариант с uv
+
+Если uv установлен, можно запускать без скрипта:
+
+```powershell
+uv run crypto-scalper
+```
+
+Первый запуск создаст окружение; версии зависимостей зафиксированы в `uv.lock`. Флаги передаются так же: `uv run crypto-scalper --demo`, `uv run crypto-scalper --tui`.
+
+### Настройка AI
+
+Укажите `GEMINI_API_KEY` в `.env`, чтобы включить независимый анализ. Модель выбирается через `GEMINI_MODEL`. Без Gemini направленный штатный сигнал сохраняется как `HYPERDATA_ONLY`, и панель продолжает работать.
+
+Telegram включается флагом `--notify` при наличии `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`. Для обычного браузерного запуска используйте локальный адрес и оставьте `HYPERDATA_API_KEY` пустым. При включённой аутентификации ко всем маршрутам, включая HTML, необходимо передавать заголовок `X-API-Key`.
+
+### Ручная установка
+
+Если скрипт не подходит, те же шаги можно выполнить вручную:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
-.\.venv\Scripts\crypto-scalper.exe --tui
+.\.venv\Scripts\crypto-scalper.exe
 ```
 
-Откройте [панель Crypto Scalper](http://127.0.0.1:8420/scalper). Флаг `--tui` включает Rich Market Overview в том же процессе. Колонки 1M AI и 5M AI показывают итог сравнения и возраст принятого снимка. Без флага работает веб-панель. Для демо используйте `--demo`. Demo использует синтетические данные и отдельный журнал, Gemini и Telegram выключены. При необходимости укажите `--port` и `--journal`.
+### Если что-то не так
 
-Укажите `GEMINI_API_KEY` в `.env`, чтобы включить независимый анализ. Модель выбирается через `GEMINI_MODEL`. Telegram включается флагом `--notify` при наличии `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`. Без Gemini направленный штатный сигнал сохраняется как `HYPERDATA_ONLY`. Для обычного браузерного запуска используйте локальный адрес и оставьте `HYPERDATA_API_KEY` пустым. При включённой аутентификации ко всем маршрутам, включая HTML, необходимо передавать заголовок `X-API-Key`.
+- `Python 3.12+ not found` — установите Python с [python.org](https://www.python.org/downloads/) и откройте новый терминал.
+- Порт занят — запустите с другим портом: `.\start.ps1 --port 8500`.
+- Нет сигналов AI — проверьте `GEMINI_API_KEY` в `.env` и перезапустите приложение.
+- Нужен чистый журнал — укажите `.\start.ps1 --journal .\scalper-test.sqlite`.
 
 Для OpenRouter задайте в локальном `.env`:
 

@@ -157,11 +157,16 @@ async def run(args):
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8420)
-    parser.add_argument("--journal", type=Path)
-    parser.add_argument("--demo", action="store_true")
-    parser.add_argument("--tui", action="store_true")
-    parser.add_argument("--notify", action="store_true", help="Enable Telegram delivery")
+    parser.add_argument("--port", type=int, default=8420,
+                        help="Web and API port (default: 8420)")
+    parser.add_argument("--journal", type=Path,
+                        help="SQLite journal path (default: <data dir>/scalper.sqlite)")
+    parser.add_argument("--demo", action="store_true",
+                        help="Use synthetic data; disables Gemini and Telegram")
+    parser.add_argument("--tui", action="store_true",
+                        help="Also show the Rich Market Overview in this terminal")
+    parser.add_argument("--notify", action="store_true",
+                        help="Enable Telegram delivery when token and chat id are set")
     args = parser.parse_args()
     if args.journal is None:
         args.journal = DATA_DIR / ("scalper-demo.sqlite" if args.demo else "scalper.sqlite")
