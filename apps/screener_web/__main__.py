@@ -22,6 +22,7 @@ from apps.scalper_web.__main__ import analyst, terminal_signals
 from extensions.scalper.activity import active_anomalies
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, orderbook_details
+from extensions.scalper.parity import Recorder
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.service import Screener
 from extensions.scalper.telegram import listen_reports
@@ -122,6 +123,7 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
 
 async def run(args: argparse.Namespace) -> None:
     journal = Journal(args.journal)
+    recorder = Recorder(args.record) if args.record else None
     hub = RemoteHub(args.api_url, timeout=args.timeout)
     runner: web.AppRunner | None = None
     tasks: list[asyncio.Task] = []
@@ -130,7 +132,7 @@ async def run(args: argparse.Namespace) -> None:
         async with aiohttp.ClientSession() as session:
             gemini = analyst(session, hub.demo)
             notify = bool(args.notify and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
-            service = Screener(hub, journal, gemini, notify)
+            service = Screener(hub, journal, gemini, notify, recorder=recorder)
             app = build_app(hub, service)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -160,6 +162,8 @@ async def run(args: argparse.Namespace) -> None:
         if runner is not None:
             await runner.cleanup()
         await hub.stop()
+        if recorder is not None:
+            recorder.close()
         journal.close()
 
 
@@ -174,6 +178,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=10.0, help="native API timeout in seconds")
     parser.add_argument("--tui", action="store_true", help="also show the Rich Market Overview")
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
+    parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()
     if args.journal is None:
         args.journal = data_dir() / "scalper.sqlite"

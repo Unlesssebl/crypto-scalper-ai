@@ -226,8 +226,9 @@ def with_senior_context(snapshot, candles):
 
 
 class Screener:
-    def __init__(self, hub, journal, gemini, notify):
+    def __init__(self, hub, journal, gemini, notify, recorder=None):
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
+        self.recorder = recorder
         self.rows = {}
         self.quality_report = None
         self.profiles = {}
@@ -296,6 +297,8 @@ class Screener:
         self.control_slots = {key: slot for key, slot in self.control_slots.items() if key in rows}
         self.phases.keep(rows)
         self.rows = rows
+        if self.recorder is not None:
+            self.recorder.record(now, rows)
         self.states = {key: value for key, value in self.states.items() if key in rows}
         self.candidate_seen = {key: value for key, value in self.candidate_seen.items() if key in rows}
         self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}

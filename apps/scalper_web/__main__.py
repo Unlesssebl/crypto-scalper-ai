@@ -14,6 +14,7 @@ from extensions.scalper.activity import active_anomalies
 from extensions.scalper.analysis import Gemini, OpenRouter
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, ScalperHub, orderbook_details
+from extensions.scalper.parity import Recorder
 from extensions.scalper.service import Screener
 from extensions.scalper.telegram import listen_reports
 from hyperdata_terminal.api_server import HyperDataAPI
@@ -107,10 +108,13 @@ def analyst(session, demo):
 
 async def run(args):
     journal = Journal(args.journal)
+    recorder = Recorder(args.record) if args.record else None
     try:
         hub = ScalperHub(demo=args.demo)
     except BaseException:
         journal.close()
+        if recorder is not None:
+            recorder.close()
         raise
     if args.demo:
         hub.alerts.telegram_token = ""
@@ -122,7 +126,7 @@ async def run(args):
         async with aiohttp.ClientSession() as session:
             gemini = analyst(session, args.demo)
             notify = bool(args.notify and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
-            service = Screener(hub, journal, gemini, notify)
+            service = Screener(hub, journal, gemini, notify, recorder=recorder)
             hub._api_server = ScalperAPI(hub, service, args.port)
             try:
                 await hub._api_server.start()
@@ -151,6 +155,8 @@ async def run(args):
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await hub.stop()
     finally:
+        if recorder is not None:
+            recorder.close()
         journal.close()
 
 
@@ -167,6 +173,7 @@ def main():
                         help="Also show the Rich Market Overview in this terminal")
     parser.add_argument("--notify", action="store_true",
                         help="Enable Telegram delivery when token and chat id are set")
+    parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()
     if args.journal is None:
         args.journal = DATA_DIR / ("scalper-demo.sqlite" if args.demo else "scalper.sqlite")
