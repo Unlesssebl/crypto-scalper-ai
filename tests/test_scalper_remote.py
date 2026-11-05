@@ -162,9 +162,15 @@ async def test_remote_hub_fetches_native_panels(monkeypatch) -> None:
     await hub.fetch_liquidation_stats(60)
     await hub.fetch_danger_zone(5.0)
     await hub.fetch_whales(250_000.0, 10)
+    await hub.fetch_hlp()
+    await hub.fetch_heatmap("BTC", 20)
+    await hub.fetch_smart_money()
     assert calls[0] == ("/v1/liquidations/stats", {"minutes": 60, "include_estimated": "false"})
     assert calls[1] == ("/v1/positions/danger-zone", {"threshold": 5.0})
     assert calls[2] == ("/v1/whales", {"min_size": 250_000.0, "limit": 10})
+    assert calls[3] == ("/v1/hlp", {})
+    assert calls[4] == ("/v1/positions/heatmap", {"symbol": "BTC", "buckets": 20})
+    assert calls[5] == ("/v1/smart-money", {})
 
 
 @pytest.mark.asyncio

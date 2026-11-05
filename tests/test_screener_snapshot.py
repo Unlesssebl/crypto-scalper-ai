@@ -243,17 +243,54 @@ class _ExtraHub:
                     "by_exchange": {}, "by_symbol": {}}
 
     class _Pos:
+        market_prices = {"BTC": 100000.0}
+        positions = []
+
         def get_danger_zone(self, threshold_pct=5.0):
             return []
+
+        def scan_age_seconds(self):
+            return 1.0
+
+    class _HLP:
+        def get_stats(self):
+            return {"account_value": 400_000_000.0, "num_positions": 1,
+                    "net_delta": 1.0, "delta_zscore": 0.0, "total_exposure": 1.0,
+                    "session_pnl": 0.0, "pnl_known": True, "total_trades": 0}
+
+        def get_latest_snapshot(self):
+            return object()
+
+        def get_top_positions(self, n):
+            return []
+
+        def get_liquidation_absorptions(self, minutes):
+            return []
+
+    class _SM:
+        def get_stats(self):
+            return {"total_wallets": 0, "ranked_wallets": 0,
+                    "smart_wallets": 0, "dumb_wallets": 0}
 
     orderflow = _OF()
     liquidations = _Liq()
     positions = _Pos()
+    hlp = _HLP()
+    smart_money = _SM()
 
     def get_all_assets(self):
         return [SimpleNamespace(symbol="BTC")]
 
     def get_whale_positions(self, min_size_usd=250_000.0):
+        return []
+
+    def get_smart_money(self, n=20):
+        return []
+
+    def get_dumb_money(self, n=20):
+        return []
+
+    def get_smart_money_signals(self, n=50):
         return []
 
 
@@ -264,6 +301,9 @@ def test_build_extra_collects_native_panels() -> None:
     assert extra["orderflow"][0]["quality"] == "ok"
     assert extra["liquidations"]["confirmed_count"] == 1
     assert extra["danger_zone"]["positions"] == []
+    assert extra["hlp"]["account_value"] == 400_000_000.0
+    assert extra["heatmap"]["symbol"] == "BTC"
+    assert extra["smart_money"]["stats"]["total_wallets"] == 0
 
 
 def test_build_health_reports_feeds_and_venues() -> None:

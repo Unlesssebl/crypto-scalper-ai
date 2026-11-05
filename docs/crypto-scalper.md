@@ -37,13 +37,17 @@
 - **шапку с health badge и меткой потока**: `✓ LIVE` / `⚠ PARTIAL` / `⚠ STALE`, `Flow: HL` или `HL + BN`;
 - таблицу топ-инструментов с колонками AI;
 - панель **ORDER FLOW** — CVD/OFI и `venue=combined` из `/v1/orderflow`;
-- панель **NATIVE CONTEXT** — L/S, basis, IV, ликвидации, whales, funding;
-- панели **LIQUIDATIONS**, **DANGER ZONE**, **LARGEST POSITIONS**.
+- панель **NATIVE CONTEXT** — L/S, basis, IV, ликвидации, whales, funding
+  (это же покрывает нативную панель Market Intel);
+- панели **LIQUIDATIONS**, **DANGER ZONE**, **LARGEST POSITIONS**;
+- **HLP VAULT** — AUM, PnL, net delta и Z-score, позиции, поглощения;
+- **LIQ HEATMAP** — USD ликвидаций по ценовым уровням вокруг цены;
+- **SMART MONEY** — агрегаты кошельков и последние follow/fade-сигналы
+  (без адресов: только ранг, win rate, confidence, PnL).
 
 Сигналы скринера считаются по Hyperliquid-окну (parity), а панель ORDER FLOW
 показывает combined-окно из `/v1/orderflow`. Когда Binance даёт сделки, CVD
-там может отличаться — метка `venue` это явно показывает. HLP и smart money
-в TUI не выводятся: их данных нет в REST API (smart money вырезан из OSS-сборки).
+там может отличаться — метка `venue` это явно показывает.
 
 ### Вариант с uv
 

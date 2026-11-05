@@ -148,7 +148,12 @@ flow/market/book-значения и сигналы. Код возврата `0`
 - карточки риск-аппетита (L/S BTC, IV BTC, базис BTC, ликвидации) в
   `dashboard.html`.
 - детект дрейфа universe: `/v1/snapshot` сообщает в `warnings`, если
-  top-volume-активы не имеют orderflow-подписки (`universe drifted`).
+  top-volume-активы не имеют orderflow-подписки (`universe drifted`);
+- нативный TUI: health badge и метка venue, панели ORDER FLOW, NATIVE CONTEXT,
+  LIQUIDATIONS, DANGER ZONE, LARGEST POSITIONS, HLP VAULT, LIQ HEATMAP,
+  SMART MONEY;
+- REST для этих панелей: `/v1/hlp`, `/v1/positions/heatmap`, `/v1/smart-money`
+  (агрегаты без адресов кошельков).
 
 ## Universe: ротация и рестарт
 

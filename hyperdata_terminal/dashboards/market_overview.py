@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import pyfiglet
 from rich import box
 from rich.align import Align
+from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -25,8 +26,11 @@ from rich.text import Text
 
 from hyperdata_terminal.dashboards.native_panels import (
     danger_zone_panel,
+    heatmap_panel,
+    hlp_panel,
     liquidations_panel,
     orderflow_panel,
+    smart_money_panel,
     whales_panel,
 )
 
@@ -484,23 +488,32 @@ class MarketOverviewDashboard:
             content = Group(Align.center(header), Text(""), scanning)
         else:
             extra = self.extra or {}
-            panels = [
+            wide = [
                 orderflow_panel(extra.get("orderflow") or []),
                 self.build_context_panel(self.context),
+            ]
+            grid = [
                 liquidations_panel(extra.get("liquidations")),
                 danger_zone_panel(extra.get("danger_zone")),
                 whales_panel(extra.get("whales")),
+                hlp_panel(extra.get("hlp")),
+                heatmap_panel(extra.get("heatmap")),
+                smart_money_panel(extra.get("smart_money")),
             ]
-            panels = [panel for panel in panels if panel is not None]
+            wide = [panel for panel in wide if panel is not None]
+            grid = [panel for panel in grid if panel is not None]
             # Native panels make the view taller; trim the two long tables so
             # the whole screen still fits a normal terminal.
-            assets_table = self.build_assets_table(self.assets, limit=10 if panels else 20)
-            extreme_table = self.build_extreme_funding(self.assets, limit=5 if panels else 10)
+            compact = bool(wide or grid)
+            assets_table = self.build_assets_table(self.assets, limit=8 if compact else 20)
+            extreme_table = self.build_extreme_funding(self.assets, limit=3 if compact else 10)
             stats = self.build_stats_bar()
 
             sections = [Align.center(header), Text(""), assets_table, Text("")]
-            for panel in panels:
+            for panel in wide:
                 sections.extend([panel, Text("")])
+            for start in range(0, len(grid), 3):
+                sections.extend([Columns(grid[start:start + 3], equal=True, expand=True), Text("")])
             sections.extend([extreme_table, Text(""), stats, Text("")])
             content = Group(*sections)
 

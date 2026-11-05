@@ -274,12 +274,18 @@ def build_context(hub, now: float | None = None) -> dict:
     return _context_block(hub, now if now is not None else time.time())
 
 
-def build_extra(hub, symbols: int = 6) -> dict:
+def build_extra(hub, symbols: int = 6, heatmap_symbol: str = "BTC") -> dict:
     """Native panels payload for the in-process TUI (danger zone, whales...).
 
     Shapes match the REST endpoints so the same Rich builders serve both the
     in-process hub and `RemoteHub`.
     """
+    from hyperdata_terminal.native_payloads import (
+        heatmap_payload,
+        hlp_payload,
+        smart_money_payload,
+    )
+
     flow = []
     for asset in hub.get_all_assets()[:symbols]:
         snapshot = hub.orderflow.get_snapshot(asset.symbol, "1m")
@@ -303,9 +309,22 @@ def build_extra(hub, symbols: int = 6) -> dict:
         whales = {"positions": list(hub.get_whale_positions(min_size_usd=250_000)[:10])}
     except Exception:
         whales = None
+    try:
+        hlp = hlp_payload(hub)
+    except Exception:
+        hlp = None
+    try:
+        heatmap = heatmap_payload(hub, heatmap_symbol, buckets=20, range_pct=10.0)
+    except Exception:
+        heatmap = None
+    try:
+        smart = smart_money_payload(hub)
+    except Exception:
+        smart = None
     return {
         "orderflow": flow, "liquidations": liquidations,
         "danger_zone": danger, "whales": whales,
+        "hlp": hlp, "heatmap": heatmap, "smart_money": smart,
     }
 
 

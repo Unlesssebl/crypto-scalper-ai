@@ -213,8 +213,21 @@ async def run(args: argparse.Namespace) -> None:
                         whales = await hub.fetch_whales(250_000.0, 10)
                     except Exception:
                         whales = None
+                    try:
+                        hlp = await hub.fetch_hlp()
+                    except Exception:
+                        hlp = None
+                    try:
+                        heatmap = await hub.fetch_heatmap("BTC", 20)
+                    except Exception:
+                        heatmap = None
+                    try:
+                        smart = await hub.fetch_smart_money()
+                    except Exception:
+                        smart = None
                     return {"orderflow": flows, "liquidations": liquidations,
-                            "danger_zone": danger, "whales": whales}
+                            "danger_zone": danger, "whales": whales,
+                            "hlp": hlp, "heatmap": heatmap, "smart_money": smart}
 
                 dashboard_view = MarketOverviewDashboard(
                     market_data=None, demo=hub.demo, asset_reader=hub.get_all_assets,

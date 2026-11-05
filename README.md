@@ -133,6 +133,9 @@ curl http://localhost:8420/v1/positions/danger-zone
 | `GET /v1/orderbook/{symbol}` | Orderbook snapshot |
 | `GET /v1/whales` | Top whale positions |
 | `GET /v1/positions/danger-zone` | Positions closest to liquidation |
+| `GET /v1/positions/heatmap` | Liquidation USD per price bucket (`symbol`, `buckets`, `range_pct`) |
+| `GET /v1/hlp` | HLP vault state, top positions and absorbed liquidations |
+| `GET /v1/smart-money` | Wallet-tier aggregates and recent follow/fade signals (no addresses) |
 | `GET /v1/public/metrics` | Server metrics and component health |
 | `WS /v1/ws` | Event stream: liquidations, trades, signals |
 

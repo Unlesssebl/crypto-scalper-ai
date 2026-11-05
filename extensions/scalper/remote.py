@@ -224,6 +224,16 @@ class RemoteHub:
     async def fetch_whales(self, min_size: float = 250_000.0, limit: int = 10) -> dict:
         return await self._get("/v1/whales", min_size=min_size, limit=limit)
 
+    async def fetch_hlp(self) -> dict:
+        return await self._get("/v1/hlp")
+
+    async def fetch_heatmap(self, symbol: str = "BTC", buckets: int = 20) -> dict:
+        resolved = self._resolve_symbol(symbol)
+        return await self._get("/v1/positions/heatmap", symbol=resolved, buckets=buckets)
+
+    async def fetch_smart_money(self) -> dict:
+        return await self._get("/v1/smart-money")
+
     def _apply(self, payload: dict, assets: list[dict]) -> None:
         now = float(payload.get("as_of") or time.time())
         self._as_of = now
