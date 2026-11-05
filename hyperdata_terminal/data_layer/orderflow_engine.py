@@ -240,6 +240,11 @@ class TimeframeBucket:
 
     # -- queries ------------------------------------------------------------
 
+    def window_trades(self, now: float | None = None) -> tuple[Trade, ...]:
+        """Trades still inside the rolling window (oldest first)."""
+        self._expire_old(now)
+        return tuple(self.trades)
+
     def get_snapshot(self, now: float | None = None) -> CVDSnapshot:
         """Return the current state of this bucket as a CVDSnapshot."""
         if now is None:
@@ -839,6 +844,14 @@ class OrderFlowEngine:
     def venue_recent_trades(self, symbol: str, venue: str = "hyperliquid") -> tuple[Trade, ...]:
         """Most recent trades for one venue (oldest first)."""
         return tuple(self.recent_trades_by_venue.get(venue, {}).get(symbol, ()))
+
+    def venue_window_trades(
+        self, symbol: str, timeframe: str, venue: str = "hyperliquid",
+        now: float | None = None,
+    ) -> tuple[Trade, ...]:
+        """Trades currently inside one venue's rolling window (oldest first)."""
+        bucket = self.venue_buckets.get(venue, {}).get(symbol, {}).get(timeframe)
+        return bucket.window_trades(now) if bucket else ()
 
     def venue_last_trade_at(self, symbol: str, venue: str = "hyperliquid") -> float:
         """Exchange timestamp of the last trade from one venue, or 0.0."""

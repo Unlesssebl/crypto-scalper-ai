@@ -48,6 +48,11 @@ from aiohttp import WSMsgType, web
 
 from hyperdata_terminal import __version__
 from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
+from hyperdata_terminal.screener_snapshot import (
+    SNAPSHOT_WINDOWS,
+    build_candles,
+    build_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -411,6 +416,8 @@ class HyperDataAPI:
             ("GET", "/v1/market", self.handle_market),
             ("GET", "/v1/market/{symbol}", self.handle_market_symbol),
             ("GET", "/v1/orderflow/{symbol}", self.handle_orderflow),
+            ("GET", "/v1/snapshot", self.handle_snapshot),
+            ("GET", "/v1/candles", self.handle_candles),
             ("GET", "/v1/liquidations", self.handle_liquidations),
             ("GET", "/v1/liquidations/stats", self.handle_liquidation_stats),
             ("GET", "/v1/funding-rates", self.handle_funding_rates),
@@ -945,6 +952,40 @@ class HyperDataAPI:
             "trades_per_second": tps, "aggregate_signal": agg,
             "timeframes": result,
         })
+
+    async def handle_snapshot(self, request: web.Request) -> web.Response:
+        raw_symbols = request.query.get("symbols")
+        symbols = raw_symbols.split(",") if raw_symbols else None
+        raw_windows = request.query.get("windows", "1m,5m")
+        windows = [window.strip() for window in raw_windows.split(",") if window.strip()]
+        bad = [window for window in windows if window not in SNAPSHOT_WINDOWS]
+        if bad:
+            raise web.HTTPBadRequest(text=f"Unsupported windows: {', '.join(bad)}")
+        try:
+            payload = await build_snapshot(
+                self.hub, symbols=symbols, windows=windows,
+                include_candles=request.query.get("include_candles", "1").lower()
+                not in ("0", "false", "no"),
+            )
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        return web.json_response(payload)
+
+    async def handle_candles(self, request: web.Request) -> web.Response:
+        raw_symbols = request.query.get("symbols", "")
+        symbols = [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
+        if not symbols:
+            raise web.HTTPBadRequest(text="symbols is required")
+        interval = request.query.get("interval", "5m")
+        try:
+            bars = int(request.query.get("bars", "36"))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="bars must be an integer") from exc
+        try:
+            payload = await build_candles(self.hub, symbols, interval=interval, bars=bars)
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        return web.json_response(payload)
 
     async def handle_liquidations(self, request: web.Request) -> web.Response:
         limit = _int_param(request, "limit", 100, minimum=1, maximum=1000)
