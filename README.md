@@ -1,4 +1,4 @@
-> **Crypto Scalper AI** · Быстрый старт: `.\start.ps1` · [Установка, режимы и архитектура](docs/crypto-scalper.md)
+> **Crypto Scalper AI** · Быстрый старт: `.\start.ps1` · [Установка, режимы и архитектура](docs/crypto-scalper.md) · [Переход на нативный API](docs/native-migration.md)
 
 <div align="center">
 

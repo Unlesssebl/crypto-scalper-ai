@@ -39,6 +39,17 @@ uv run crypto-scalper
 
 Первый запуск создаст окружение; версии зависимостей зафиксированы в `uv.lock`. Флаги передаются так же: `uv run crypto-scalper --demo`, `uv run crypto-scalper --tui`.
 
+### Внешний screener на нативном API
+
+Вместо форка можно запускать нативный hub и отдельный screener:
+
+```powershell
+uv run hyperdata api --port 8420
+uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421
+```
+
+Screener читает `/v1/snapshot` и `/v1/candles`, не открывает собственные биржевые сокеты и использует тот же журнал и AI-логику. Подробности, parity-прогон и статус миграции: [native-migration.md](native-migration.md).
+
 ### Настройка AI
 
 Укажите `GEMINI_API_KEY` в `.env`, чтобы включить независимый анализ. Модель выбирается через `GEMINI_MODEL`. Без Gemini направленный штатный сигнал сохраняется как `HYPERDATA_ONLY`, и панель продолжает работать.
