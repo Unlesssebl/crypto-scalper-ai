@@ -144,7 +144,7 @@ flow/market/book-значения и сигналы. Код возврата `0`
   extreme funding (`context`-блок), доступен screener, AI и дашборду;
 - риск-аппетит-заметки (`market_risk_context`) в находках и уведомлениях;
 - периодический Telegram-дайджест рынка (`run_digest`, env
-  `HYPERDATA_DIGEST_SECONDS`, по умолчанию 900 с);
+  `HYPERDATA_DIGEST_SECONDS`, по умолчанию 0 — выключен);
 - карточки риск-аппетита (L/S BTC, IV BTC, базис BTC, ликвидации) в
   `dashboard.html`.
 - детект дрейфа universe: `/v1/snapshot` сообщает в `warnings`, если

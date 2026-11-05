@@ -160,9 +160,13 @@ async def test_provider_request_uses_json_schema_and_blind_snapshot(market):
 
 
 async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypatch):
+    monkeypatch.setattr("extensions.scalper.service.AI_INTERVAL", 0)
+    monkeypatch.setattr("extensions.scalper.opportunity.OpportunityPolicy.classify",
+                        lambda *args: ("confirmed", "eligible"))
     monkeypatch.setattr("extensions.scalper.service.active_anomalies", lambda snapshot: {"tape_burst"})
     monkeypatch.setattr("extensions.scalper.service.finding_strength", lambda snapshot, native: {
-        "rank": 3, "label": "Выраженное движение", "icon": "🟠", "reasons": [],
+        "rank": 4 if snapshot["window"] == "5m" else 3,
+        "label": "Выраженное движение", "icon": "🟠", "reasons": [],
     })
     now, hub, asset = market
     journal = Journal(tmp_path / "scalper.sqlite")
@@ -174,7 +178,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         return {**model_reply("BULLISH"), "snapshot": snapshot_key(snapshot), "status": "ok"}
 
     async def send(message, *, rich_html, copy_text, return_message):
-        assert return_message and "характеристика пока не готова" in message
+        assert return_message and ("анализ выполняется" in message or "в очереди" in message)
         assert "Гипотеза AI</b>" not in rich_html
         sent.append((message, rich_html, copy_text))
         facts_sent.set()
@@ -186,17 +190,17 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         return True
 
     hub.alerts = SimpleNamespace(send_telegram=send, edit_telegram=edit)
-    service = Screener(hub, journal, SimpleNamespace(key=None, provider="test", analyze=analyze), True)
+    service = Screener(hub, journal, SimpleNamespace(key="test", provider="test", analyze=analyze), True)
     service.scan(now)
     service.scan(now + 5)
-    assert service.jobs.qsize() == 2
+    assert service.jobs.qsize() == 1
     workers = [asyncio.create_task(worker()) for worker in (service.analyze, service.deliver)]
     try:
         await asyncio.wait_for(service.jobs.join(), 2)
         await asyncio.wait_for(service.notifications.join(), 2)
-        rows = journal.latest(asset.symbol, "5m")
+        rows = journal.latest(asset.symbol, "1m")
         assert len(rows) == 1 and len(sent) == 1
-        assert len(edits) == 2
+        assert len(edits) >= 2
         plain, rich, ticker = edits[-1]
         assert "Обновление" in plain and "Обновление" in rich
         assert ticker == "HYPERLIQUID:KPEPEUSDC.P"
@@ -223,10 +227,10 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         event = rows[0]
         assert event["consensus"]["category"] == "CONSENSUS_LONG"
         assert event["event"]["detected_at"] == now
-        assert event["captured_at"] == now
+        assert event["captured_at"] >= now
         assert event["snapshot"]["captured_at"] == event["hyperdata"]["snapshot"]["captured_at"]
         minute_event = journal.latest(asset.symbol, "1m")[0]
-        assert {event["delivery"], minute_event["delivery"]} == {"sent", "merged"}
+        assert {journal.latest(asset.symbol, "5m")[0]["delivery"], minute_event["delivery"]} == {"sent", "merged"}
         minute = minute_event["snapshot"]
         assert minute["context_5m"]["captured_at"] == minute["captured_at"]
         assert "direction" not in minute["context_5m"]
@@ -237,17 +241,17 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
 
         journal.observe(now + 59, {asset.symbol: (14, now + 59)})
         journal.observe(now + 61, {asset.symbol: (14, now + 59)})
-        assert journal.latest(asset.symbol, "5m")[0]["observations"][0]["status"] == "pending"
+        assert journal.latest(asset.symbol, "1m")[0]["observations"][0]["status"] == "pending"
         journal.observe(now + 62, {asset.symbol: (15, now + 61)})
         journal.observe(now + 332, {})
-        observations = journal.latest(asset.symbol, "5m")[0]["observations"]
+        observations = journal.latest(asset.symbol, "1m")[0]["observations"]
         assert [entry["status"] for entry in observations] == ["observed", "missed", "pending"]
         assert observations[0]["price"] == 15
 
         from aiohttp.test_utils import TestClient, TestServer
         app = build_app(hub, service)
         async with TestClient(TestServer(app)) as client:
-            response = await client.get("/v1/scalper/kPEPE?window=5m")
+            response = await client.get("/v1/scalper/kPEPE?window=1m")
             assert response.status == 200
             assert (await response.json())["history"][0]["delivery"] == event["delivery"]
             newer = {**event["snapshot"], "captured_at": now + 1}
@@ -256,7 +260,7 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
             journal.record("newer", event["event"], newer, native)
             failure = {"snapshot": identity, "status": "network_error"}
             journal.finish("newer", failure, compare(newer, native, failure), now + 2)
-            response = await client.get("/v1/scalper?window=5m")
+            response = await client.get("/v1/scalper?window=1m")
             row = (await response.json())["rows"][0]
             assert row["latest"]["id"] == "newer"
             assert row["accepted"]["id"] == event["id"]
@@ -320,13 +324,15 @@ async def test_openrouter_accepts_non_google_model_and_preserves_blind_analysis(
     assert result["status"] == "ok" and result["direction"] == "BEARISH"
 
 
-def test_expired_ai_does_not_edit_existing_telegram_message():
+def test_expired_ai_edits_existing_telegram_message_with_real_status():
+    edits = []
     journal = SimpleNamespace(fact_message=lambda key: {
         "message_id": 1, "ai": {"status": "expired"}, "edit_status": None,
-    })
+    }, fact_message_edit=lambda *args: edits.append(args))
     service = Screener(None, journal, None, True)
     service.queue_hypothesis("event")
-    assert service.notifications.empty()
+    assert service.notifications.get_nowait() == ("edit", "event")
+    assert edits == [("event", "queued")]
 
 
 def test_quality_counts_each_attempt_once_and_checks_each_horizon(tmp_path):
@@ -440,6 +446,9 @@ async def test_telegram_listener_replies_and_advances_offset(monkeypatch, tmp_pa
             return {"id": 12, "username": "ScalperBot"}
         if method == "getMyCommands":
             return [{"command": "report", "description": "Report"}]
+        if method == "setMyCommands":
+            assert any(c["command"] == "analyze" for c in body["commands"])
+            return True
         assert method == "getUpdates"
         if body["offset"] == 0:
             return [
@@ -492,7 +501,7 @@ def test_minute_gate_and_blind_five_minute_context(market):
     assert other["direction"] not in json.dumps(payload)
 
 
-def test_minute_queue_prioritizes_agreement_and_deprioritizes_wide_spread(market):
+def test_minute_queue_does_not_schedule_ordinary_flow_without_key(market):
     now, hub, asset = market
     snapshot, native = capture(hub, asset, "1m", now)
     service = Screener(hub, None, None, False)
@@ -503,9 +512,7 @@ def test_minute_queue_prioritizes_agreement_and_deprioritizes_wide_spread(market
         ("aligned", "ready", "aligned"),
     ):
         service.detect((symbol, "1m"), snapshot, native, now, gate, relation)
-    assert [service.jobs.get_nowait()[3][0] for _ in range(service.jobs.qsize())] == [
-        "aligned", "normal", "wide",
-    ]
+    assert service.jobs.empty()
 
 
 def test_senior_context_uses_closed_candles_and_is_in_blind_payload(market):

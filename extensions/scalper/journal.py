@@ -6,6 +6,22 @@ import time
 from .audit import RULESET, update_move
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS scalper_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ai_selection (
+    candidate_id TEXT PRIMARY KEY, at REAL NOT NULL, kind TEXT, reason TEXT NOT NULL,
+    admitted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ai_requests (
+    id INTEGER PRIMARY KEY, candidate_id TEXT NOT NULL, symbol TEXT NOT NULL,
+    at REAL NOT NULL, purpose TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ai_requests_at ON ai_requests(at);
+CREATE TABLE IF NOT EXISTS candidate_observations (
+    event_id TEXT NOT NULL, minutes INTEGER, due_at REAL NOT NULL,
+    observed_at REAL, price REAL, status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(event_id, minutes)
+);
+CREATE INDEX IF NOT EXISTS candidate_observations_due ON candidate_observations(due_at) WHERE status='pending';
 CREATE TABLE IF NOT EXISTS analyses (
     id TEXT PRIMARY KEY, symbol TEXT NOT NULL, window TEXT NOT NULL,
     captured_at REAL NOT NULL, event TEXT NOT NULL, snapshot TEXT NOT NULL,
@@ -89,6 +105,47 @@ def dump(data):
 
 
 class Journal:
+    def load_policy(self):
+        row = self.db.execute("SELECT value FROM scalper_settings WHERE name='ai_policy'").fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_policy(self, policy):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO scalper_settings VALUES('ai_policy',?)", (dump(policy),))
+
+    def select_ai(self, key, now, kind, reason):
+        with self.db:
+            self.db.execute("""INSERT INTO ai_selection VALUES(?,?,?,?,?)
+                ON CONFLICT(candidate_id) DO UPDATE SET reason=excluded.reason,
+                admitted=MAX(ai_selection.admitted,excluded.admitted)
+            """, (key, now, kind, reason, int(reason == "queued")))
+
+    def ai_reason(self, key):
+        row = self.db.execute("SELECT reason FROM ai_selection WHERE candidate_id=?", (key,)).fetchone()
+        return row[0] if row else "not_selected"
+
+    def request_block(self, symbol, now, policy, *, experiment=False):
+        used = self.db.execute("SELECT COUNT(*) FROM ai_requests WHERE at>?", (now - 3600,)).fetchone()[0]
+        if used >= policy.hourly_limit:
+            return "hourly_limit"
+        if not experiment and self.db.execute(
+            "SELECT 1 FROM ai_requests WHERE symbol=? AND at>? LIMIT 1",
+            (symbol, now - policy.cooldown_seconds),
+        ).fetchone():
+            return "cooldown"
+        return None
+
+    def reserve_request(self, key, symbol, now, policy, *, experiment=False):
+        # One service owns this journal; transaction also makes check+charge indivisible.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            reason = self.request_block(symbol, now, policy, experiment=experiment)
+            if reason:
+                return reason
+            self.db.execute("INSERT INTO ai_requests(candidate_id,symbol,at,purpose) VALUES(?,?,?,?)",
+                            (key, symbol, now, "experiment" if experiment else "primary"))
+        return None
+
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         # A separate SQLite lock allows readers of the WAL journal while
@@ -117,12 +174,18 @@ class Journal:
             self.db.execute("UPDATE analyses SET delivery='interrupted' WHERE delivery='pending' AND ai IS NULL")
             self.db.execute("UPDATE analyses SET delivery='unknown' WHERE delivery IN ('sending', 'pending')")
             candidates = self.db.execute(
-                "SELECT id FROM finding_candidates WHERE decision IN ('queued','analyzing','delivery_pending')"
+                "SELECT id FROM finding_candidates WHERE decision IN ('queued','analyzing','delivery_pending') "
+                "UNION SELECT candidate_id FROM ai_selection WHERE reason IN ('queued','analyzing')"
             ).fetchall()
         if candidates:
             now = time.time()
             for row in candidates:
                 self.candidate_decision(row["id"], "interrupted", now)
+                self.select_ai(row["id"], now, None, "interrupted")
+                with self.db:
+                    self.db.execute("UPDATE analyses SET ai=? WHERE id=? AND ai IS NULL",
+                                    (dump({"status": "skipped", "reason": "interrupted"}), row["id"]))
+        return [row["id"] for row in candidates]
 
     def record_candidate(self, key, snapshot, event, decision, now):
         with self.db:
@@ -133,12 +196,15 @@ class Journal:
             ).rowcount
             if inserted:
                 self.db.execute("INSERT INTO finding_decisions VALUES(?,?,?)", (key, now, decision))
+                self.db.executemany("INSERT INTO candidate_observations(event_id,minutes,due_at) VALUES(?,?,?)",
+                                    ((key, minutes, now + 60 * minutes) for minutes in (1, 5, 15)))
 
     def candidate_decision(self, key, decision, now, analysis_id=None):
         with self.db:
             changed = self.db.execute(
                 "UPDATE finding_candidates SET decision=?,analysis_id=COALESCE(?,analysis_id) "
-                "WHERE id=? AND decision<>? AND decision NOT IN ('delivered','delivery_merged','delivery_merge_failed')",
+                "WHERE id=? AND decision<>? "
+                "AND decision NOT IN ('delivered','delivery_merged','delivery_merge_failed')",
                 (decision, analysis_id, key, decision),
             ).rowcount
             if changed:
@@ -192,7 +258,10 @@ class Journal:
 
     def save_fact_analysis_input(self, key, snapshot):
         with self.db:
-            self.db.execute("UPDATE analyses SET snapshot=? WHERE id=?", (dump(snapshot), key))
+            self.db.execute("UPDATE analyses SET snapshot=?,captured_at=? WHERE id=?",
+                            (dump(snapshot), snapshot["captured_at"], key))
+            self.db.execute("UPDATE observations SET due_at=? + 60 * minutes WHERE event_id=? AND status='pending'",
+                            (snapshot["captured_at"], key))
 
     def record(self, key, event, snapshot, hyperdata):
         with self.db:
@@ -285,6 +354,16 @@ class Journal:
 
     def observe(self, now, prices):
         with self.db:
+            self.db.execute("UPDATE candidate_observations SET status='missed' WHERE status='pending' AND due_at<?",
+                            (now - 30,))
+            for row in self.db.execute("""
+                SELECT o.*,c.symbol FROM candidate_observations o
+                JOIN finding_candidates c ON c.id=o.event_id WHERE o.status='pending' AND o.due_at<=?
+            """, (now,)).fetchall():
+                value = prices.get(row["symbol"])
+                if value is not None and row["due_at"] <= value[1] <= now:
+                    self.db.execute("""UPDATE candidate_observations SET status='observed',price=?,observed_at=?
+                        WHERE event_id=? AND minutes=?""", (*value, row["event_id"], row["minutes"]))
             for table in ("observations", "context_observations"):
                 self.db.execute(f"UPDATE {table} SET status='missed' WHERE status='pending' AND due_at<?",
                                 (now - 30,))
@@ -298,7 +377,8 @@ class Journal:
                     price, observed_at = value
                     if row["due_at"] <= observed_at <= now:
                         self.db.execute(
-                            f"UPDATE {table} SET status='observed',price=?,observed_at=? WHERE event_id=? AND minutes=?",
+                            f"UPDATE {table} SET status='observed',price=?,observed_at=? "
+                            "WHERE event_id=? AND minutes=?",
                             (price, observed_at, row["event_id"], row["minutes"]),
                         )
 
@@ -310,7 +390,8 @@ class Journal:
                 previous = tuple(row[key] for key in ("anchor_price", "last_at", "peak_pct", "gap", "status"))
                 if state != previous:
                     self.db.execute(
-                        "UPDATE delivered_moves SET anchor_price=?,last_at=?,peak_pct=?,gap=?,status=? WHERE analysis_id=?",
+                        "UPDATE delivered_moves SET anchor_price=?,last_at=?,peak_pct=?,gap=?,status=? "
+                        "WHERE analysis_id=?",
                         (*state, row["analysis_id"]),
                     )
 
@@ -368,7 +449,8 @@ class Journal:
     def save_telegram_offset(self, bot_id, offset):
         with self.db:
             self.db.execute(
-                "INSERT INTO telegram_offsets VALUES(?,?) ON CONFLICT(bot_id) DO UPDATE SET next_update=excluded.next_update",
+                "INSERT INTO telegram_offsets VALUES(?,?) "
+                "ON CONFLICT(bot_id) DO UPDATE SET next_update=excluded.next_update",
                 (bot_id, offset),
             )
 

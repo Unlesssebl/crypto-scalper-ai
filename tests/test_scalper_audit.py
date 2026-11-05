@@ -20,7 +20,7 @@ def snapshot(at, natr=1.0):
     }
 
 
-def test_blocked_candidate_is_logged_once_then_updates_when_queued(tmp_path: Path):
+def test_invalid_candidate_is_logged_once_without_ai(tmp_path: Path):
     journal = Journal(tmp_path / "audit.sqlite")
     try:
         service = Screener(SimpleNamespace(), journal, None, False)
@@ -30,10 +30,10 @@ def test_blocked_candidate_is_logged_once_then_updates_when_queued(tmp_path: Pat
         service.detect(key, snapshot(105), native, 105, "book_unavailable", "neutral")
         service.detect(key, snapshot(110), native, 110, "ready", "neutral")
         rows = journal.db.execute("SELECT detected_at, decision FROM finding_candidates").fetchall()
-        assert [tuple(row) for row in rows] == [(100, "queued")]
+        assert [tuple(row) for row in rows] == [(100, "book_unavailable")]
         transitions = journal.db.execute("SELECT at, decision FROM finding_decisions ORDER BY at")
-        assert [tuple(row) for row in transitions] == [(100, "book_unavailable"), (110, "queued")]
-        assert service.jobs.get_nowait()[4]["detected_at"] == 100
+        assert [tuple(row) for row in transitions] == [(100, "book_unavailable")]
+        assert service.jobs.empty()
     finally:
         journal.close()
 
@@ -146,7 +146,9 @@ def test_fact_enqueue_does_not_require_an_ai_slot(tmp_path, monkeypatch):
     path = tmp_path / "audit.sqlite"
     journal = Journal(path)
     try:
-        service = Screener(SimpleNamespace(), journal, None, True)
+        service = Screener(SimpleNamespace(), journal, SimpleNamespace(key="test"), True)
+        monkeypatch.setattr("extensions.scalper.opportunity.OpportunityPolicy.classify",
+                            lambda *args: ("confirmed", "eligible"))
         for i in range(service.jobs.maxsize):
             service.jobs.put_nowait((i,))
         monkeypatch.setattr("extensions.scalper.service.active_anomalies", lambda snapshot: {"tape_burst"})
@@ -156,7 +158,7 @@ def test_fact_enqueue_does_not_require_an_ai_slot(tmp_path, monkeypatch):
         row = {"facts": ["наблюдение"], "movement_phase": None, "other": None, "btc_context": None}
         service.detect(("BTC", "1m"), snap, native, 100, "ready", "neutral", row)
         action, key = service.notifications.get_nowait()
-        assert action == "facts" and journal.fact_message(key)["ai"] is None
+        assert action == "facts" and journal.fact_message(key)["ai"]["status"] == "skipped"
         assert journal.db.execute("SELECT decision FROM finding_candidates").fetchone()[0] == "queue_full"
     finally:
         journal.close()

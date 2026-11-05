@@ -24,6 +24,7 @@ from .analysis import DIRECTIONAL, compare, snapshot_key
 from .audit import CONTROL_INTERVAL, STRONG_RANK
 from .journal import dump
 from .market import WINDOWS, capture, metric
+from .opportunity import MAX_AGE, REASON_LABELS, OpportunityPolicy
 from .phase import PhaseTracker
 from .profile import DAY, calculate_profiles, fresh, profile_context, sample_window, situation_facts
 from .quality import calculate_quality
@@ -31,9 +32,8 @@ from .shadow import ShadowDetector
 
 LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
-EVENT_COOLDOWN = 60
 ALERT_COOLDOWN = 300
-MAX_EVENT_AGE = {"1m": 45, "5m": 120}
+MAX_EVENT_AGE = MAX_AGE
 QUEUE_LIMIT = 20
 PRIORITY_STEP_SECONDS = 15
 STRENGTH_STEP_SECONDS = 10
@@ -120,6 +120,8 @@ def alert_text(snapshot, native, ai, event, *, rich=False, updates=()):
     trigger = f'<b>Рынок</b> · {reason or "Смена направления потока"}'
     if strength:
         trigger += f' · {html.escape(strength["icon"])} <b>Сила: {html.escape(strength["label"])}</b>'
+    if event.get("opportunity_kind") == "early":
+        trigger = "<b>Ранний импульс</b> · " + trigger
     phase = event.get("movement_phase")
     if phase and phase["phase"] not in {"unavailable", "untracked"}:
         trigger += (f'<br><b>Фаза:</b> {html.escape(phase["label"])}'
@@ -134,7 +136,15 @@ def alert_text(snapshot, native, ai, event, *, rich=False, updates=()):
         characterization = ai.get("summary")
         hypothesis = ai.get("scenario")
     if ai["status"] == "pending":
-        ai_direction = "характеристика пока не готова"
+        ai_direction = "анализ выполняется"
+    elif ai["status"] == "queued":
+        ai_direction = "в очереди; запрос ещё не отправлен"
+    elif ai["status"] != "ok":
+        reason = ai.get("reason", ai["status"])
+        labels = REASON_LABELS
+        ai_direction = "пропущен — " + labels.get(reason, reason)
+        if ai["status"] not in {"skipped", "unconfigured", "queued"}:
+            ai_direction = "ошибка — " + labels.get(reason, reason)
     native_direction = ALERT_DIRECTIONS.get(native["direction"], ALERT_DIRECTIONS["NOT_AVAILABLE"])
     header = [headline, f"<i>Бессрочный фьючерс · {stamp}</i>"]
     facts = alert_market_facts(snapshot)
@@ -262,6 +272,9 @@ class Screener:
     def __init__(self, hub, journal, gemini, notify, recorder=None):
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.recorder = recorder
+        saved_policy = journal.load_policy() if journal is not None and hasattr(journal, "load_policy") else None
+        self.policy = OpportunityPolicy(**saved_policy) if saved_policy else OpportunityPolicy.from_env()
+        self.opportunities = {}
         self.rows = {}
         self.quality_report = None
         self.profiles = {}
@@ -276,7 +289,6 @@ class Screener:
         self.states = {}
         self.pending = set()
         self.candidate_seen = {}
-        self.cooldowns = {}
         self.sequence = 0
         self.jobs = asyncio.PriorityQueue(maxsize=QUEUE_LIMIT)
         self.notifications = asyncio.Queue(maxsize=QUEUE_LIMIT)
@@ -337,8 +349,8 @@ class Screener:
         if self.recorder is not None:
             self.recorder.record(now, rows)
         self.states = {key: value for key, value in self.states.items() if key in rows}
+        self.opportunities = {key: value for key, value in self.opportunities.items() if key in rows}
         self.candidate_seen = {key: value for key, value in self.candidate_seen.items() if key in rows}
-        self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
 
         prices = {}
         market_at = self.hub.market_timestamp()
@@ -357,21 +369,31 @@ class Screener:
         trigger = ((direction in DIRECTIONAL and direction != previous)
                    or (previous in DIRECTIONAL and direction == "NEUTRAL")
                    or (strong and not was_strong) or bool(new_anomalies))
+        kind, filter_reason = self.policy.classify(snapshot, native, now)
+        previous_kind = self.opportunities.get(key)
+        self.opportunities[key] = kind
+        trigger = trigger or (kind is not None and kind != previous_kind)
         if not trigger:
             self.candidate_seen.pop(key, None)
             if direction != "NOT_AVAILABLE" and gate not in {"tape_unavailable", "book_unavailable"}:
                 self.states[key] = direction, strong, anomalies
             return
 
-        decision = "queued"
-        if gate in {"tape_unavailable", "book_unavailable"} or direction == "NOT_AVAILABLE":
-            decision = gate if gate != "ready" else "tape_unavailable"
-        elif key in self.pending:
-            decision = "already_pending"
-        elif self.jobs.full():
-            decision = "queue_full"
-        elif self.cooldowns.get(key, 0) > now:
-            decision = "cooldown"
+        decision = "queued" if kind else filter_reason
+        if kind and not getattr(self.gemini, "key", None):
+            decision = "unconfigured"
+        elif kind and self.journal is not None:
+            decision = self.journal.request_block(key[0], now, self.policy) or "queued"
+        if gate != "ready":
+            decision = gate
+        if decision == "queued":
+            if any(pending[0] == key[0] for pending in self.pending):
+                decision = "episode_pending"
+            elif self.jobs.full():
+                decision = "queue_full"
+        # Detection state advances even for rejected events: a stable background
+        # situation is one event, not a fresh candidate every five seconds.
+        self.states[key] = direction, strong, anomalies
 
         event = {
             "type": "market_activity" if new_anomalies else "orderflow_transition",
@@ -379,8 +401,9 @@ class Screener:
             "direction": direction, "native_signal": native["native_signal"],
             "source": native["source"], "detected_at": now,
             "analysis_gate": gate, "context_5m": relation, "strength": finding_strength(snapshot, native),
+            "opportunity_kind": kind, "ai_selection": decision,
         }
-        signature = (direction, strong, frozenset(new_anomalies))
+        signature = (direction, strong, frozenset(new_anomalies), kind)
         previous_candidate = self.candidate_seen.get(key)
         if previous_candidate and previous_candidate[0] == signature:
             candidate_id, detected_at, old_decision = previous_candidate[1:]
@@ -396,6 +419,16 @@ class Screener:
         event["candidate_id"] = candidate_id
         if self.notify and self.journal is not None and row and gate not in {"book_unavailable", "tape_unavailable"}:
             self.enqueue_facts(candidate_id, snapshot, native, event, row, now)
+        if self.journal is not None:
+            self.journal.select_ai(candidate_id, now, kind, decision)
+            self.journal.record(candidate_id, event, snapshot, native)
+            if not self.journal.fact_message(candidate_id):
+                with self.journal.db:
+                    self.journal.db.execute("UPDATE analyses SET delivery='not_applicable' WHERE id=?", (candidate_id,))
+            self.journal.candidate_decision(candidate_id, decision, now, candidate_id)
+            if decision != "queued":
+                self.journal.finish(candidate_id, {"status": "skipped", "reason": decision,
+                                    "snapshot": snapshot_key(snapshot)}, None, now)
         if decision != "queued":
             return
         self.states[key] = direction, strong, anomalies
@@ -403,10 +436,11 @@ class Screener:
         self.sequence += 1
         # New candidates in one scan have the same age. Let strong events
         # lead that batch, while older candidates retain priority over new ones.
-        priority = 0 if new_anomalies else 1 if strong else 2 if direction in DIRECTIONAL else 3
+        priority = 0 if kind == "early" else 1
         # Bounded adjustments let agreement and book quality matter without starving old events.
         strength = event["strength"]["rank"]
-        order_at = (now + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
+        order_at = (now - (30 if kind == "early" else 0)
+                    + PRIORITY_STEP_SECONDS * ((gate == "wide_spread") - (relation == "aligned"))
                     - STRENGTH_STEP_SECONDS * max(0, strength - 1))
         self.jobs.put_nowait((order_at, priority, self.sequence, key, event))
 
@@ -446,6 +480,52 @@ class Screener:
                 LOG.exception("AI quality report refresh failed")
             await asyncio.sleep(60)
 
+    def skip_ai(self, key, reason, now):
+        self.journal.select_ai(key, now, None, reason)
+        self.journal.candidate_decision(key, reason, now)
+        row = self.journal.db.execute("SELECT snapshot FROM analyses WHERE id=?", (key,)).fetchone()
+        if row:
+            import json
+            snapshot = json.loads(row[0])
+            self.journal.finish(key, {"status": "error" if reason == "error" else "skipped", "reason": reason,
+                                     "snapshot": snapshot_key(snapshot)}, None, now)
+        self.queue_hypothesis(key)
+
+    def request_analysis(self, symbol, window, now):
+        """Manual requests bypass significance, but never data quality or budget."""
+        matches = [key for key in self.rows if key[0].casefold() == symbol.casefold() and key[1] == window]
+        if not matches:
+            return "Инструмент или окно отсутствует в текущем Top-20."
+        key = matches[0]
+        row = self.rows[key]
+        snapshot, native = row["snapshot"], row["hyperdata"]
+        _, reason = self.policy.classify(snapshot, native, now)
+        if self.hub.demo or reason in {"stale_snapshot", "stale_data", "wide_spread"}:
+            return "AI: пропущен — " + ("деморежим" if self.hub.demo else REASON_LABELS.get(reason, reason))
+        if not self.gemini.key:
+            return "AI: пропущен — нет API-ключа"
+        block = self.journal.request_block(key[0], now, self.policy)
+        if block or any(p[0] == key[0] for p in self.pending) or self.jobs.full():
+            return "AI: пропущен — " + REASON_LABELS.get(block, "эпизод уже в очереди или очередь заполнена")
+        if self.notify and self.notifications.full():
+            return "AI: пропущен — очередь уведомлений заполнена"
+        event_id = hashlib.sha256(f"manual:{key}:{now}".encode()).hexdigest()
+        event = {"type": "manual", "manual": True, "candidate_id": event_id, "detected_at": now,
+                 "direction": native["direction"], "anomalies": [], "strength": row["strength"],
+                 "ai_selection": "queued", "opportunity_kind": "manual"}
+        self.journal.record_candidate(event_id, snapshot, event, "queued", now)
+        self.journal.select_ai(event_id, now, "manual", "queued")
+        # Manual invocation explicitly opts this single message into Telegram.
+        if self.notify and self.journal.register_fact_message(event_id, snapshot, event, native):
+            self.notifications.put_nowait(("facts", event_id))
+        else:
+            self.journal.record(event_id, event, snapshot, native)
+        self.journal.candidate_decision(event_id, "queued", now, event_id)
+        self.pending.add(key)
+        self.sequence += 1
+        self.jobs.put_nowait((now - 30, 0, self.sequence, key, event))
+        return "AI: запрос принят в очередь; лимиты и свежесть будут проверены перед отправкой."
+
     async def analyze(self):
         next_request = 0
         while True:
@@ -458,33 +538,39 @@ class Screener:
                 now = time.time()
                 row = self.rows.get(candidate)
                 if not row:
-                    self.journal.candidate_decision(candidate_id, "left_universe", now)
+                    self.skip_ai(candidate_id, "left_universe", now)
                     continue
                 if now - event["detected_at"] > MAX_EVENT_AGE[candidate[1]]:
-                    self.journal.candidate_decision(candidate_id, "event_expired", now)
+                    self.skip_ai(candidate_id, "event_expired", now)
                     continue
                 snapshot, native = row["snapshot"], row["hyperdata"]
                 if (now - snapshot["captured_at"] > 10
                         or snapshot["metrics"]["price"]["quality"] != "ok"
                         or native["direction"] == "NOT_AVAILABLE"
                         or row["analysis_gate"] in {"tape_unavailable", "book_unavailable"}):
-                    self.journal.candidate_decision(candidate_id, "stale_at_dispatch", now)
+                    self.skip_ai(candidate_id, "stale_at_dispatch", now)
                     self.states.pop(candidate, None)
                     continue
                 if event["anomalies"] and not active_anomalies(snapshot).intersection(event["anomalies"]):
-                    self.journal.candidate_decision(candidate_id, "anomaly_ended", now)
+                    self.skip_ai(candidate_id, "anomaly_ended", now)
                     self.states.pop(candidate, None)
                     continue
                 if native["direction"] != event["direction"]:
                     # The original transition is obsolete. Let the next scan
                     # decide whether the new direction merits a fresh event.
-                    self.journal.candidate_decision(candidate_id, "direction_changed", now)
+                    self.skip_ai(candidate_id, "direction_changed", now)
+                    continue
+                kind, reason = self.policy.classify(snapshot, native, now)
+                if reason in {"stale_snapshot", "stale_data", "wide_spread"} or (not event.get("manual") and not kind):
+                    self.skip_ai(candidate_id, reason, now)
+                    continue
+                if not self.gemini.key:
+                    self.skip_ai(candidate_id, "unconfigured", now)
                     continue
                 fact = self.journal.fact_message(candidate_id)
-                if fact:
-                    snapshot, native = fact["snapshot"], fact["hyperdata"]
-                else:
-                    snapshot = with_movement_context(snapshot, row["movement_phase"])
+                # Analyze the current validated snapshot, even if the fact message
+                # was queued earlier. Never spend budget interpreting expired input.
+                snapshot = with_movement_context(snapshot, row["movement_phase"])
                 other_window = "5m" if candidate[1] == "1m" else "1m"
                 baseline = with_context(snapshot, self.rows.get((candidate[0], other_window)))
                 profile = profile_context(self.profiles.get(candidate))
@@ -498,28 +584,41 @@ class Screener:
                 event = {**event, "analyzed_signal": native["native_signal"],
                          "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"],
                          "facts": row["facts"], "strength": row["strength"], "movement_phase": row["movement_phase"]}
-                event_id = candidate_id if fact else hashlib.sha256(dump(snapshot_key(snapshot)).encode()).hexdigest()
-                if fact:
-                    self.journal.save_fact_analysis_input(event_id, snapshot)
-                elif not self.journal.record(event_id, event, snapshot, native):
-                    self.journal.candidate_decision(candidate_id, "duplicate_snapshot", now)
+                event_id = candidate_id
+                self.journal.save_fact_analysis_input(event_id, snapshot)
+                # Align the independent native vote with the actual model input.
+                with self.journal.db:
+                    self.journal.db.execute("UPDATE analyses SET hyperdata=?,event=? WHERE id=?",
+                                            (dump(native), dump(event), event_id))
+                block = self.journal.reserve_request(candidate_id, candidate[0], now, self.policy)
+                if block:
+                    self.skip_ai(candidate_id, block, now)
                     continue
+                self.journal.select_ai(candidate_id, now, event.get("opportunity_kind"), "analyzing")
                 self.journal.candidate_decision(candidate_id, "analyzing", now, event_id)
-                self.cooldowns[candidate] = now + EVENT_COOLDOWN
                 next_request = time.monotonic() + AI_INTERVAL
+                self.queue_hypothesis(event_id)
                 ai = await self.gemini.analyze(snapshot)
                 verdict = compare(snapshot, native, ai)
                 self.journal.finish(event_id, ai, verdict, time.time())
+                self.journal.select_ai(candidate_id, time.time(), event.get("opportunity_kind"), ai["status"])
                 if fact:
                     self.queue_hypothesis(event_id)
                 else:
                     self.journal.delivery(event_id, "not_applicable")
-                if (self.gemini.key and "context_15m" in snapshot
+                if (self.policy.experiments and self.gemini.key and ai["status"] == "ok"
+                        and "context_15m" in snapshot
                         and baseline.get(f"context_{other_window}", {}).get("metrics")):
                     sample = self.context_events % CONTEXT_TRIAL_INTERVAL == 0
                     self.context_events += 1
                     if sample:
                         await asyncio.sleep(max(0, next_request - time.monotonic()))
+                        trial_now = time.time()
+                        if (not self.policy.experiments or not self.gemini.key
+                                or trial_now - snapshot["captured_at"] > MAX_EVENT_AGE[candidate[1]]
+                                or self.journal.reserve_request(event_id, candidate[0], trial_now,
+                                                                self.policy, experiment=True)):
+                            continue
                         next_request = time.monotonic() + AI_INTERVAL
                         try:
                             comparison = await self.gemini.analyze(baseline)
@@ -530,10 +629,7 @@ class Screener:
                             LOG.exception("Context comparison failed")
             except Exception:
                 LOG.exception("Event analysis failed")
-                if event_id is not None and not self.journal.fact_message(event_id):
-                    self.journal.delivery(event_id, "error")
-                else:
-                    self.journal.candidate_decision(candidate_id, "error", time.time())
+                self.skip_ai(candidate_id, "error", time.time())
             finally:
                 self.pending.discard(candidate)
                 self.jobs.task_done()
@@ -550,7 +646,8 @@ class Screener:
         return bool(event.get("anomalies")) or (reversal and price_agrees)
 
     def enqueue_facts(self, key, snapshot, native, event, row, now):
-        if (event["strength"]["rank"] < alert_min_rank() or self.notifications.full()
+        if ((event["strength"]["rank"] < max(3, alert_min_rank()) and event.get("opportunity_kind") != "early")
+                or self.notifications.full()
                 or now - event["detected_at"] > MAX_EVENT_AGE[snapshot["window"]]
                 or not self.alert_reason(snapshot, native, event)):
             return
@@ -563,16 +660,29 @@ class Screener:
             self.notifications.put_nowait(("facts", key))
 
     def queue_hypothesis(self, key):
+        if not self.notify:
+            return
         fact = self.journal.fact_message(key)
-        if (fact and fact["message_id"] is not None and fact["ai"]
-                and fact["ai"]["status"] == "ok" and fact["edit_status"] is None
+        if (fact and fact["message_id"] is not None
+                and (fact["ai"] or self.journal.ai_reason(key) == "analyzing")
+                and fact["edit_status"] != "queued"
                 and not self.notifications.full()):
             self.journal.fact_message_edit(key, "queued")
             self.notifications.put_nowait(("edit", key))
 
+    def ai_display(self, row):
+        if row["ai"]:
+            return row["ai"]
+        reason = self.journal.ai_reason(row["id"])
+        if reason == "analyzing":
+            return {"status": "pending"}
+        if reason == "queued":
+            return {"status": "queued", "reason": "queued"}
+        return {"status": "skipped", "reason": reason}
+
     async def edit_alert(self, row, updates, *, include_ai):
         snapshot, native, event = row["snapshot"], row["hyperdata"], row["event"]
-        ai = row["ai"] if include_ai else {"status": "pending"}
+        ai = self.ai_display(row)
         return await self.hub.alerts.edit_telegram(
             row["message_id"], alert_text(snapshot, native, ai, event, updates=updates),
             rich_html=alert_text(snapshot, native, ai, event, rich=True, updates=updates) if row["rich"] else None,
@@ -589,15 +699,20 @@ class Screener:
                 snapshot, native, event = row["snapshot"], row["hyperdata"], row["event"]
                 ticker = futures_ticker(snapshot)
                 if action == "edit":
+                    display = self.ai_display(row)
                     edited = await self.edit_alert(row, self.journal.fact_updates(key).values(), include_ai=True)
                     self.journal.fact_message_edit(key, "edited" if edited else "failed")
+                    latest = self.journal.fact_message(key)
+                    if latest and display != self.ai_display(latest):
+                        self.queue_hypothesis(key)
                     continue
 
                 now = time.time()
                 if now - event["detected_at"] > MAX_EVENT_AGE[snapshot["window"]]:
                     self.journal.delivery(key, "expired")
                     continue
-                parent = self.journal.recent_fact_message(snapshot["symbol"], now - ALERT_COOLDOWN)
+                parent = (None if event.get("manual") else
+                          self.journal.recent_fact_message(snapshot["symbol"], now - ALERT_COOLDOWN))
                 if parent:
                     updates = self.journal.fact_updates(parent["id"])
                     previous = updates.get(row["window"])
@@ -613,11 +728,11 @@ class Screener:
                         self.journal.delivery(key, "merge_failed")
                     continue
                 last = self.journal.last_delivery(snapshot["symbol"], snapshot["window"])
-                if last and now - last < ALERT_COOLDOWN:
+                if not event.get("manual") and last and now - last < ALERT_COOLDOWN:
                     self.journal.delivery(key, "cooldown")
                     continue
                 self.journal.delivery(key, "sending", now)
-                pending = {"status": "pending"}
+                pending = self.ai_display(row)
                 result = await self.hub.alerts.send_telegram(
                     alert_text(snapshot, native, pending, event),
                     rich_html=alert_text(snapshot, native, pending, event, rich=True),

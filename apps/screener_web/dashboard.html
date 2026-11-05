@@ -44,6 +44,22 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <button id="refresh" type="button">Обновить</button>
 </section>
 <details class="panel quality-report">
+<summary>Отбор AI и общий бюджет</summary>
+<form id="ai-policy" class="toolbar">
+<label>Режим<select id="ai-mode"><option value="economical">Экономный</option><option value="balanced">Сбалансированный</option><option value="research">Исследовательский</option></select></label>
+<label>Запросов в час<input id="ai-limit" type="number" min="0" step="1" required></label>
+<label>Cooldown, минут<input id="ai-cooldown" type="number" min="1" step="1" required></label>
+<label><span>Ранние импульсы</span><input id="ai-early" type="checkbox"></label>
+<label><span>Контрольные запросы</span><input id="ai-experiments" type="checkbox"></label>
+<button type="submit">Сохранить политику</button>
+</form>
+<p id="ai-policy-status" role="status"></p>
+<p id="ai-selection">Статистика отбора ещё рассчитывается.</p>
+<p id="ai-reasons"></p>
+<table aria-label="Результаты отбора AI"><thead><tr><th>Группа</th><th>Горизонт</th><th>Верно / неверно</th><th>Без движения / направления</th><th>Ждём / нет данных</th><th>Средний |ход| / ≥ NATR</th></tr></thead><tbody id="ai-outcomes"></tbody></table>
+<p>Отклонённые события тоже проверяются через 1/5/15 минут. Направление оценивается от цены обнаружения; сравнение AI, Rule Engine и Consensus — на одних событиях с успешным ответом AI, от цены снимка анализа, без комиссий и исполнения.</p>
+</details>
+<details class="panel quality-report">
 <summary>Качество анализов AI за последние 24 часа</summary>
 <p>Верно — цена пошла в сторону оценки AI. Ошибки запросов и оценки без направления считаются отдельно.</p>
 <p id="quality-attempts" role="status">Фоновый расчёт ещё не готов.</p>
@@ -128,6 +144,7 @@ function missingComment(ai) {
     invalid_response: "Ответ AI не прошёл проверку формата",
     network_error: "Провайдер не ответил вовремя или недоступен",
     unconfigured: "На момент события AI не был настроен",
+    skipped: "AI пропущен: " + (aiReasonLabels[ai.reason] ?? ai.reason ?? "не выбран фильтром"),
     insufficient_market_data: "Недостаточно свежих рыночных данных",
     incomplete: "Провайдер вернул неполный ответ",
   };
@@ -542,6 +559,58 @@ function renderShadow(variants) {
   }
 }
 
+let policyLoaded = false;
+let aiReasonLabels = {};
+function renderSelection(result) {
+  aiReasonLabels = result.ai_reasons ?? {};
+  const policy = result.ai_policy;
+  if (policy && !policyLoaded) {
+    $("ai-mode").value = policy.mode;
+    $("ai-limit").value = policy.hourly_limit;
+    $("ai-cooldown").value = policy.cooldown_seconds / 60;
+    $("ai-early").checked = policy.early;
+    $("ai-experiments").checked = policy.experiments;
+    policyLoaded = true;
+  }
+  if (policy) $("ai-policy-status").textContent = policy.hourly_limit + " запросов/час · cooldown " +
+    policy.cooldown_seconds / 60 + " мин · максимум " + policy.hourly_limit * 24 + " запросов за 24 часа при постоянной нагрузке";
+  const stats = result.quality_report?.selection;
+  if (!stats) return;
+  $("ai-selection").textContent = "За 24 ч: событий " + stats.detected + " · допущено " + stats.admitted +
+    " · запросов (включая контрольные и ошибки) " + stats.requests + " · отфильтровано " +
+    (stats.detected ? Math.round(100 * (stats.detected - stats.admitted) / stats.detected) : 0) + "%";
+  $("ai-reasons").textContent = Object.entries(stats.reasons).map(([reason, count]) => (aiReasonLabels[reason] ?? reason) + ": " + count).join(" · ");
+  const body = $("ai-outcomes");
+  body.replaceChildren();
+  function score(label, minutes, counts, movement) {
+    const row = node("tr", null, body);
+    node("th", label, row).scope = "row";
+    node("td", minutes + " мин", row);
+    node("td", (counts.correct ?? 0) + " / " + (counts.incorrect ?? 0), row);
+    node("td", (counts.flat ?? 0) + " / " + (counts.no_direction ?? 0), row);
+    node("td", (counts.pending ?? 0) + " / " + (counts.missing ?? 0), row);
+    node("td", movement?.samples ? (movement.sum_abs_pct / movement.samples).toFixed(3) + "% · " +
+      movement.natr_hits + "/" + movement.natr_samples : "—", row);
+  }
+  for (const [minutes, groups] of Object.entries(stats.outcomes)) {
+    for (const [group, counts] of Object.entries(groups)) score(group === "admitted" ? "Допущены" : "Отклонены", minutes, counts, stats.movements?.[minutes]?.[group]);
+  }
+  for (const [arm, horizons] of Object.entries(stats.arms ?? {})) {
+    for (const [minutes, counts] of Object.entries(horizons)) score({ai:"AI",rule:"Rule Engine",consensus:"Consensus"}[arm], minutes, counts);
+  }
+}
+$("ai-policy").onsubmit = async event => {
+  event.preventDefault();
+  const policy = {mode: $("ai-mode").value, hourly_limit: Number($("ai-limit").value),
+    cooldown_seconds: Number($("ai-cooldown").value) * 60,
+    early: $("ai-early").checked, experiments: $("ai-experiments").checked};
+  try {
+    const response = await fetch("/v1/scalper/policy", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(policy)});
+    if (!response.ok) throw new Error(await response.text());
+    $("ai-policy-status").textContent = "Политика сохранена. Лимиты применяются также к текущей очереди.";
+  } catch (error) { $("ai-policy-status").textContent = "Не удалось сохранить: " + error.message; }
+};
+
 async function refresh() {
   const sequence = ++generation;
   try {
@@ -549,6 +618,7 @@ async function refresh() {
     if (sequence !== generation) return;
     data = result.rows;
     renderQuality(result.quality_report);
+    renderSelection(result);
     renderMarketContext(result.context);
     $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
       " · " + result.ai_provider + " " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");

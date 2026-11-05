@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from extensions.scalper.activity import active_anomalies
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, orderbook_details
+from extensions.scalper.opportunity import REASON_LABELS, OpportunityPolicy
 from extensions.scalper.parity import Recorder
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.runtime import analyst, terminal_signals
@@ -91,6 +92,8 @@ async def screener(request: web.Request) -> web.Response:
         "gemini": "configured" if service.gemini.key else "disabled",
         "ai_provider": service.gemini.provider,
         "quality_report": service.quality_report,
+        "ai_policy": asdict(service.policy),
+        "ai_reasons": REASON_LABELS,
         "context": getattr(hub, "context", {}),
         "rows": rows,
     })
@@ -110,6 +113,27 @@ async def detail(request: web.Request) -> web.Response:
         "book": asdict(book) if book else orderbook_details(hub, symbol),
         "history": service.journal.latest(symbol, window, limit=20),
     })
+
+
+async def update_policy(request: web.Request) -> web.Response:
+    if request.content_type != "application/json":
+        raise web.HTTPUnsupportedMediaType()
+    if request.headers.get("Origin") and request.headers["Origin"] != f"{request.scheme}://{request.host}":
+        raise web.HTTPForbidden()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) != set(OpportunityPolicy.__dataclass_fields__):
+            raise ValueError("Expected all AI policy fields")
+        if (type(body["hourly_limit"]) is not int or type(body["cooldown_seconds"]) is not int
+                or type(body["early"]) is not bool or type(body["experiments"]) is not bool):
+            raise ValueError("Invalid policy field types")
+        policy = OpportunityPolicy(**body)
+    except (ValueError, TypeError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    service = request.app["service"]
+    service.journal.save_policy(asdict(policy))
+    service.policy = policy
+    return web.json_response(asdict(policy))
 
 
 async def healthz(request: web.Request) -> web.Response:
@@ -137,6 +161,7 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
     app["service"] = service
     app.router.add_get("/scalper", dashboard)
     app.router.add_get("/v1/scalper", screener)
+    app.router.add_post("/v1/scalper/policy", update_policy)
     app.router.add_get("/v1/scalper/{symbol}", detail)
     app.router.add_get("/healthz", healthz)
     return app
@@ -167,7 +192,8 @@ async def run(args: argparse.Namespace) -> None:
             await runner.setup()
             site = web.TCPSite(runner, "127.0.0.1", args.port)
             await site.start()
-            journal.recover()
+            for interrupted in journal.recover():
+                service.queue_hypothesis(interrupted)
             tasks.extend(asyncio.create_task(worker()) for worker in
                          (service.run, service.analyze, service.deliver))
             tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
@@ -177,10 +203,11 @@ async def run(args: argparse.Namespace) -> None:
             if notify:
                 tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
-                tasks.append(asyncio.create_task(
-                    run_digest(session, service, int(os.getenv("HYPERDATA_DIGEST_SECONDS", "900"))),
-                    name="telegram-digest",
-                ))
+                digest_seconds = int(os.getenv("HYPERDATA_DIGEST_SECONDS", "0"))
+                if digest_seconds > 0:
+                    tasks.append(asyncio.create_task(
+                        run_digest(session, service, digest_seconds), name="telegram-digest",
+                    ))
             LOG.info("Dashboard: http://127.0.0.1:%d/scalper (native %s)", args.port, args.api_url)
             if args.tui:
                 async def native_panels():

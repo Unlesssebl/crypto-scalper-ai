@@ -1,9 +1,9 @@
 """Summarize AI direction against subsequent Hyperliquid mark prices."""
+import json
+import sqlite3
 from bisect import bisect_left
 from collections import defaultdict
 from contextlib import closing
-import json
-import sqlite3
 from statistics import median
 
 from .audit import audit_report
@@ -57,7 +57,7 @@ def attempt(row):
     if row["status"] == "ok":
         return {"BULLISH": "directional", "BEARISH": "directional",
                 "NEUTRAL": "neutral", "INSUFFICIENT_DATA": "insufficient"}.get(row["direction"], "error")
-    if row["status"] in ("expired", "unconfigured", "insufficient_market_data", "facts_only"):
+    if row["status"] in ("expired", "unconfigured", "insufficient_market_data", "facts_only", "skipped"):
         return "skipped"
     if row["status"] is None and row["effective_delivery"] == "pending":
         return "pending"
@@ -143,7 +143,8 @@ def calculate_quality(path, now, windows):
             SELECT a.id, a.window, a.delivery, a.event, a.analyzed_at,
                    CASE WHEN a.ai IS NULL AND f.event_id IS NOT NULL AND a.captured_at <= ? THEN 'facts_only'
                         ELSE json_extract(a.ai, '$.status') END AS status,
-                   CASE WHEN a.ai IS NULL AND f.event_id IS NOT NULL THEN 'pending' ELSE a.delivery END AS effective_delivery,
+                   CASE WHEN a.ai IS NULL AND f.event_id IS NOT NULL THEN 'pending'
+                        ELSE a.delivery END AS effective_delivery,
                    json_extract(a.ai, '$.direction') AS direction,
                    CASE WHEN json_extract(a.snapshot, '$.metrics.price.quality') = 'ok'
                         THEN json_extract(a.snapshot, '$.metrics.price.value') END AS start_price,
@@ -175,6 +176,7 @@ def calculate_quality(path, now, windows):
                 result = outcome(row["direction"], row["start_price"], row["end_price"], row["observation"])
                 for target in (window, group):
                     target["horizons"][row["minutes"]][result] += 1
+        selection = selection_quality(db, since, now)
         experiments = context_quality(db, since, now, windows)
         audit = audit_report(db, since, now, windows)
         minute_shadow = minute_shadow_comparison(db, since, now)
@@ -194,6 +196,68 @@ def calculate_quality(path, now, windows):
             delays = group.pop("delays")
             group["median_delay_seconds"] = round(median(delays), 1) if delays else None
             group["delay_samples"] = len(delays)
-    return {"calculated_at": now, "since": since, "windows": results, "trigger_labels": TRIGGERS,
+    return {"selection": selection, "calculated_at": now, "since": since, "windows": results,
+            "trigger_labels": TRIGGERS,
             "context_experiment": experiments, "finding_audit": audit, "shadow": shadow,
             "minute_shadow": minute_shadow}
+
+
+
+def selection_quality(db, since, now):
+    """Evaluate the full detector population, including rejected opportunities."""
+    result = {"detected": 0, "admitted": 0, "requests": 0, "reasons": {}, "outcomes": {}, "movements": {}}
+    rows = db.execute("""
+        SELECT s.*, c.snapshot, c.event FROM ai_selection s
+        JOIN finding_candidates c ON c.id=s.candidate_id WHERE s.at BETWEEN ? AND ?
+    """, (since, now)).fetchall()
+    for row in rows:
+        result["detected"] += 1
+        result["admitted"] += row["admitted"]
+        reason = row["reason"]
+        result["reasons"][reason] = result["reasons"].get(reason, 0) + 1
+        snapshot, event = json.loads(row["snapshot"]), json.loads(row["event"])
+        mark = snapshot["metrics"].get("price", {})
+        start = mark.get("value") if mark.get("quality") == "ok" else None
+        group = "admitted" if row["admitted"] else "rejected"
+        for obs in db.execute("SELECT * FROM candidate_observations WHERE event_id=?", (row["candidate_id"],)):
+            horizon = result["outcomes"].setdefault(str(obs["minutes"]), {})
+            counts = horizon.setdefault(group, dict.fromkeys((*OUTCOMES, "no_direction"), 0))
+            direction = event.get("direction")
+            score = (outcome(direction, start, obs["price"], obs["status"])
+                     if direction in {"BULLISH", "BEARISH"} else "no_direction")
+            counts[score] += 1
+            movement = result["movements"].setdefault(str(obs["minutes"]), {}).setdefault(
+                group, {"samples": 0, "sum_abs_pct": 0, "max_abs_pct": 0, "natr_samples": 0, "natr_hits": 0},
+            )
+            if obs["status"] == "observed" and positive_price(start) and positive_price(obs["price"]):
+                change = abs(100 * (obs["price"] / start - 1))
+                movement["samples"] += 1
+                movement["sum_abs_pct"] += change
+                movement["max_abs_pct"] = max(movement["max_abs_pct"], change)
+                natr = snapshot["metrics"].get("natr", {})
+                if natr.get("quality") == "ok" and positive_price(natr.get("value")):
+                    movement["natr_samples"] += 1
+                    movement["natr_hits"] += change >= natr["value"]
+    result["requests"] = db.execute("SELECT COUNT(*) FROM ai_requests WHERE at BETWEEN ? AND ?",
+                                     (since, now)).fetchone()[0]
+    # Compare independent decisions against their actual input snapshot.
+    result["arms"] = {arm: {str(m): dict.fromkeys((*OUTCOMES, "no_direction"), 0) for m in HORIZONS}
+                      for arm in ("ai", "rule", "consensus")}
+    for row in db.execute("""
+        SELECT a.*, o.minutes, o.price AS end_price, o.status AS observation
+        FROM analyses a JOIN ai_selection s ON s.candidate_id=a.id
+        JOIN observations o ON o.event_id=a.id WHERE s.at BETWEEN ? AND ?
+        AND json_extract(a.ai,'$.status')='ok'
+    """, (since, now)):
+        snap, native = json.loads(row["snapshot"]), json.loads(row["hyperdata"])
+        ai = json.loads(row["ai"]) if row["ai"] else {}
+        verdict = (json.loads(row["consensus"]) or {}) if row["consensus"] else {}
+        category = verdict.get("category")
+        consensus = {"CONSENSUS_LONG": "BULLISH", "CONSENSUS_SHORT": "BEARISH"}.get(category)
+        for arm, direction in (("ai", ai.get("direction") if ai.get("status") == "ok" else None),
+                               ("rule", native.get("direction")), ("consensus", consensus)):
+            score = (outcome(direction, snap["metrics"].get("price", {}).get("value"),
+                             row["end_price"], row["observation"])
+                     if direction in {"BULLISH", "BEARISH"} else "no_direction")
+            result["arms"][arm][str(row["minutes"])][score] += 1
+    return result

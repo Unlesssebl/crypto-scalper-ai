@@ -11,6 +11,7 @@ from .quality import HORIZONS, TRIGGERS
 
 LOG = logging.getLogger(__name__)
 REPORT = re.compile(r"/report(?:@([a-zA-Z0-9_]+))?(?:\s+(1m|5m))?", re.IGNORECASE)
+ANALYZE = re.compile(r"/analyze(?:@([a-zA-Z0-9_]+))?\s+([a-zA-Z0-9_.:-]{1,40})\s+(1m|5m)", re.IGNORECASE)
 
 
 def digest_text(rows, context, *, rich=False):
@@ -164,7 +165,8 @@ def report_text(report, window=None, *, rich=False):
                 arms = experiment["horizons"][minutes]
                 scores = [f'{arms[key]["correct"]}/{arms[key]["incorrect"]}'
                           for key in ("hyperdata", "baseline", "senior")]
-                comparison.append(f'<b>{minutes} мин</b> · HyperData {scores[0]} · AI {scores[1]} · AI с 15m {scores[2]}')
+                comparison.append(f'<b>{minutes} мин</b> · HyperData {scores[0]} · AI {scores[1]}'
+                                  f' · AI с 15m {scores[2]}')
             comparison.append("<i>Верно/неверно от цены после готовности обеих оценок.</i>")
             if not rich:
                 lines.append("")
@@ -173,7 +175,8 @@ def report_text(report, window=None, *, rich=False):
         if audit and audit["candidates"]:
             delivered = audit["decisions"].get("delivered", 0)
             merged = audit["decisions"].get("delivery_merged", 0)
-            finding_lines = [f'<b>Находки</b> · кандидатов {audit["candidates"]} · доставлено {delivered} · объединено {merged}']
+            finding_lines = [f'<b>Находки</b> · кандидатов {audit["candidates"]}'
+                             f' · доставлено {delivered} · объединено {merged}']
             labels = ("Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная")
             for version, ranks in audit["versions"].items():
                 for rank, counts in sorted(ranks.items(), reverse=True):
@@ -181,7 +184,8 @@ def report_text(report, window=None, *, rich=False):
                     pending = counts.get("pending", 0)
                     missing = counts.get("missing", 0) + counts.get("no_natr", 0)
                     finding_lines.append(
-                        f'{html.escape(version)} · {audit.get("rank_labels", {}).get(version, labels)[int(rank)]} · {hits}/{hits + quiet} '
+                        f'{html.escape(version)} · {audit.get("rank_labels", {}).get(version, labels)[int(rank)]}'
+                        f' · {hits}/{hits + quiet} '
                         f'движений ≥ NATR · ждём {pending} · без данных {missing}'
                     )
             if not rich:
@@ -200,7 +204,8 @@ def report_text(report, window=None, *, rich=False):
                 f'Без строгого сигнала в пределах ±60 с · {comparison["missed_moves"]} из '
                 f'{comparison["baseline_moves"]} базовых событий с движением ≥ 0,5% за 5 минут.',
             ))
-    lines.append(paragraph("<i>Точность — верные среди верных и неверных. Проверка по mark без комиссий и исполнения.</i>"))
+    lines.append(paragraph("<i>Точность — верные среди верных и неверных. "
+                           "Проверка по mark без комиссий и исполнения.</i>"))
     return "\n".join(lines)
 
 
@@ -218,6 +223,22 @@ def report_command(update, chat_id, username, now):
     if target and target.casefold() != username.casefold():
         return None
     return (window.lower() if window else None,)
+
+
+def analyze_command(update, chat_id, username, now):
+    message = update.get("message", {})
+    if str(message.get("chat", {}).get("id")) != str(chat_id):
+        return None
+    stamp = message.get("date")
+    if not isinstance(stamp, int) or not 0 <= now - stamp <= 120:
+        return None
+    match = ANALYZE.fullmatch((message.get("text") or "").strip())
+    if not match:
+        return None
+    target, symbol, window = match.groups()
+    if target and target.casefold() != username.casefold():
+        return None
+    return symbol, window.lower()
 
 
 async def telegram_call(session, token, method, body=None, timeout=10):
@@ -253,10 +274,14 @@ async def listen_reports(session, service):
     commands = await telegram_call(session, token, "getMyCommands", {"scope": scope})
     if commands == []:
         commands = await telegram_call(session, token, "getMyCommands")
-    if commands is not None and not any(command["command"] == "report" for command in commands):
+    additions = [item for item in (
+        {"command": "report", "description": "Качество анализов AI за 24 часа"},
+        {"command": "analyze", "description": "Анализ: /analyze BTC 1m"},
+    ) if commands is not None and not any(c["command"] == item["command"] for c in commands)]
+    if additions:
         await telegram_call(session, token, "setMyCommands", {
             "scope": scope,
-            "commands": [*commands, {"command": "report", "description": "Качество анализов AI за 24 часа"}],
+            "commands": [*commands, *additions],
         })
 
     offset = service.journal.telegram_offset(bot["id"])
@@ -271,6 +296,9 @@ async def listen_reports(session, service):
             offset = update["update_id"] + 1
             command = report_command(update, chat_id, bot["username"], time.time())
             service.journal.save_telegram_offset(bot["id"], offset)
+            manual = analyze_command(update, chat_id, bot["username"], time.time())
+            if manual is not None:
+                await alerts.send_telegram(service.request_analysis(*manual, time.time()))
             if command is not None:
                 report = service.quality_report
                 await alerts.send_telegram(
