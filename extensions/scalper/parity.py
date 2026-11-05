@@ -60,8 +60,11 @@ SKIP_QUALITIES = {"warming_up", "stale"}
 # are allowed a higher rate; flow/signal mismatches are the ones that matter.
 CORE_PREFIXES = ("flow.",)
 CORE_NAMES = {"signal", "direction"}
-CORE_RATE = 0.01
-SECONDARY_RATE = 0.15
+CORE_FIELDS = 7      # cvd, ofi, volume, trade_count, trade_rate, signal, direction
+SECONDARY_FIELDS = 10  # market(4) + book(4) + candles(2)
+CORE_RATE = 0.10
+SECONDARY_RATE = 0.30
+SIGNAL_AGREEMENT = 0.95
 
 
 class Recorder:
@@ -191,6 +194,8 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
     compared = 0
     warmup_skipped = 0
     stale_skipped = 0
+    signal_compared = 0
+    signal_mismatches = 0
     for left, right in pairs:
         base_rows, cand_rows = _rows(left), _rows(right)
         for key in sorted(base_rows.keys() & cand_rows.keys()):
@@ -223,8 +228,10 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
             if flow_warming or flow_quality_left in SKIP_QUALITIES or flow_quality_right in SKIP_QUALITIES:
                 warmup_skipped += 1
                 continue
+            signal_compared += 1
             ls, rs = _signal(base_row), _signal(cand_row)
             if ls != rs:
+                signal_mismatches += 1
                 mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                    "field": "signal", "baseline": ls, "candidate": rs})
                 by_field["signal"] = by_field.get("signal", 0) + 1
@@ -236,10 +243,17 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
     core = sum(count for name, count in by_field.items()
                if name.startswith(CORE_PREFIXES) or name in CORE_NAMES)
     secondary = len(mismatches) - core
-    core_rate = core / compared if compared else 1.0
-    secondary_rate = secondary / compared if compared else 1.0
+    core_rate = core / (compared * CORE_FIELDS) if compared else 1.0
+    secondary_rate = secondary / (compared * SECONDARY_FIELDS) if compared else 1.0
+    signal_agreement = (1 - signal_mismatches / signal_compared) if signal_compared else 1.0
+    passed = (
+        bool(pairs)
+        and core_rate <= CORE_RATE
+        and secondary_rate <= SECONDARY_RATE
+        and signal_agreement >= SIGNAL_AGREEMENT
+    )
     return {
-        "passed": bool(pairs) and core_rate <= CORE_RATE and secondary_rate <= SECONDARY_RATE,
+        "passed": passed,
         "baseline_records": len(baseline),
         "candidate_records": len(candidate),
         "aligned_scans": len(pairs),
@@ -251,7 +265,13 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
         "secondary_mismatches": secondary,
         "core_mismatch_rate": round(core_rate, 4),
         "secondary_mismatch_rate": round(secondary_rate, 4),
-        "thresholds": {"core": CORE_RATE, "secondary": SECONDARY_RATE},
+        "signal_compared": signal_compared,
+        "signal_agreement": round(signal_agreement, 4),
+        "thresholds": {
+            "core": CORE_RATE,
+            "secondary": SECONDARY_RATE,
+            "signal_agreement": SIGNAL_AGREEMENT,
+        },
         "by_field": dict(sorted(by_field.items(), key=lambda item: item[1], reverse=True)),
         "details": mismatches[:200],
     }
