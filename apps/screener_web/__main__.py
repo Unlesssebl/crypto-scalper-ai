@@ -100,13 +100,15 @@ async def detail(request: web.Request) -> web.Response:
 async def healthz(request: web.Request) -> web.Response:
     hub: RemoteHub = request.app["hub"]
     ready = bool(hub.ready)
+    healthy = ready and hub.last_error is None and hub.status.market_data in ("connected", "synthetic")
     return web.json_response({
         "ready": ready,
+        "healthy": healthy,
         "last_error": hub.last_error,
         "mode": hub.status.mode,
         "market": hub.status.market_data,
         "warnings": hub.warnings,
-    }, status=200 if ready else 503)
+    }, status=200 if healthy else 503)
 
 
 def build_app(hub: RemoteHub, service: Screener) -> web.Application:

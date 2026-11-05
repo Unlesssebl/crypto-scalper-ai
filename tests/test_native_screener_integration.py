@@ -68,6 +68,31 @@ class FakeHub:
 
 
 @pytest.mark.asyncio
+async def test_healthz_rejects_stale_or_failed_native_feed() -> None:
+    from apps.screener_web.__main__ import healthz
+
+    hub = SimpleNamespace(
+        ready=True, last_error=None,
+        status=SimpleNamespace(mode="live", market_data="connected"),
+        warnings=[],
+    )
+    app = web.Application()
+    app["hub"] = hub
+    app.router.add_get("/healthz", healthz)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        assert (await client.get("/healthz")).status == 200
+        hub.status.market_data = "error"
+        assert (await client.get("/healthz")).status == 503
+        hub.status.market_data = "connected"
+        hub.last_error = "boom"
+        assert (await client.get("/healthz")).status == 503
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) -> None:
     now = time.time()
     fake = FakeHub(now)
