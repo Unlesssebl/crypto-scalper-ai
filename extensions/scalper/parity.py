@@ -2,8 +2,14 @@
 
 Both the in-process fork and the external screener can write one JSONL line
 per scan with `--record`. `compare` aligns those lines by scan time and checks
-the fields that matter for parity: quality labels, flow/market/book values and
-signal direction.
+the fields that matter for parity: per-metric quality labels, metric values and
+the native signal direction.
+
+Two row shapes are understood:
+
+* the screener's internal `{"snapshot": {"metrics": ...}, "hyperdata": ...}`;
+* the flat `/v1/snapshot` shape (`{"market": ..., "flow": ...}`), useful when
+  comparing raw API payloads.
 """
 from __future__ import annotations
 
@@ -12,18 +18,29 @@ import json
 import sys
 from pathlib import Path
 
-QUALITY_EXACT = ("market", "flow", "book", "candles")
+GROUPS = {
+    "market": ("price", "volume_24h", "open_interest", "funding_rate"),
+    "flow": ("cvd", "ofi", "volume", "trade_count", "trade_rate",
+             "first_trade_price", "last_trade_price"),
+    "book": ("spread", "imbalance", "best_bid", "best_ask"),
+    "candles": ("natr", "range_ratio"),
+}
+FIELD_ALIASES = {
+    "trade_rate": ("trade_rate", "trades_per_second"),
+    "trades_per_second": ("trades_per_second", "trade_rate"),
+}
 VALUE_TOLERANCE = {
     "cvd": ("rel", 0.005),
     "ofi": ("abs", 0.001),
     "volume": ("rel", 0.005),
     "trade_count": ("abs", 0.0),
+    "trade_rate": ("abs", 1e-6),
     "trades_per_second": ("abs", 1e-6),
-    "coverage": ("abs", 0.01),
     "price": ("abs", 1e-8),
     "best_bid": ("abs", 1e-8),
     "best_ask": ("abs", 1e-8),
     "spread": ("abs", 1e-8),
+    "imbalance": ("abs", 0.001),
     "first_trade_price": ("abs", 1e-8),
     "last_trade_price": ("abs", 1e-8),
     "natr": ("abs", 0.01),
@@ -78,8 +95,42 @@ def _rows(record: dict) -> dict[tuple[str, str], dict]:
     }
 
 
+def _metric(row: dict, group: str, field: str):
+    metrics = (row.get("snapshot") or {}).get("metrics")
+    names = FIELD_ALIASES.get(field, (field,))
+    if metrics is not None:
+        for name in names:
+            if name in metrics:
+                return metrics[name]
+        return None
+    flat = row.get(group) or {}
+    for name in names:
+        if name in flat:
+            return flat[name]
+    return None
+
+
 def _value(row: dict, group: str, field: str):
-    return (row.get(group) or {}).get(field)
+    metric = _metric(row, group, field)
+    return metric.get("value") if isinstance(metric, dict) else metric
+
+
+def _quality(row: dict, group: str, field: str):
+    metric = _metric(row, group, field)
+    if isinstance(metric, dict):
+        return metric.get("quality")
+    return (row.get(group) or {}).get("quality")
+
+
+def _signal(row: dict):
+    hyperdata = row.get("hyperdata") or {}
+    if "native_signal" in hyperdata:
+        return hyperdata.get("native_signal")
+    return (row.get("flow") or {}).get("signal")
+
+
+def _direction(row: dict):
+    return (row.get("hyperdata") or {}).get("direction")
 
 
 def _matches(name: str, left, right) -> bool:
@@ -105,22 +156,26 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
         for key in sorted(base_rows.keys() & cand_rows.keys()):
             compared += 1
             left, right = base_rows[key], cand_rows[key]
-            for group in QUALITY_EXACT:
-                lq, rq = _value(left, group, "quality"), _value(right, group, "quality")
-                if lq != rq:
-                    mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
-                                       "field": f"{group}.quality", "baseline": lq, "candidate": rq})
-            for group, fields in (
-                ("flow", ("cvd", "ofi", "volume", "trade_count", "trades_per_second",
-                          "coverage", "signal", "first_trade_price", "last_trade_price")),
-                ("market", ("price", "best_bid", "best_ask", "spread", "natr", "range_ratio")),
-                ("book", ("best_bid", "best_ask", "spread", "imbalance")),
-            ):
+            for group, fields in GROUPS.items():
                 for field in fields:
                     lv, rv = _value(left, group, field), _value(right, group, field)
                     if not _matches(field, lv, rv):
                         mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
-                                           "field": f"{group}.{field}", "baseline": lv, "candidate": rv})
+                                           "field": f"{group}.{field}",
+                                           "baseline": lv, "candidate": rv})
+                    lq, rq = _quality(left, group, field), _quality(right, group, field)
+                    if lq != rq:
+                        mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
+                                           "field": f"{group}.{field}.quality",
+                                           "baseline": lq, "candidate": rq})
+            ls, rs = _signal(left), _signal(right)
+            if ls != rs:
+                mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
+                                   "field": "signal", "baseline": ls, "candidate": rs})
+            ld, rd = _direction(left), _direction(right)
+            if ld != rd:
+                mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
+                                   "field": "direction", "baseline": ld, "candidate": rd})
     return {
         "passed": not mismatches and bool(shared),
         "baseline_records": len(baseline),
