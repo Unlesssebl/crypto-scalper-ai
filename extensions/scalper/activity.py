@@ -3,18 +3,20 @@ import asyncio
 import logging
 import math
 import time
-from statistics import median
 
-import numpy as np
-import talib
+from hyperdata_terminal.indicators import (
+    BASELINE_BARS,
+    BTC_BAR_SECONDS,
+    BTC_RETURN_SAMPLES,
+    CANDLE_SOURCE,
+    btc_context,
+    candle_indicators,
+    tape_baseline,
+)
 
 from .profile import fresh
 
 LOG = logging.getLogger(__name__)
-CANDLE_SOURCE = "Hyperliquid candleSnapshot"
-BASELINE_BARS = 14
-BTC_RETURN_SAMPLES = 36
-BTC_BAR_SECONDS = 300
 BURST_RATIO = 2.0
 MIN_BURST_TRADES = 10
 WIDE_SPREAD_ATR_FRACTION = 0.25
@@ -29,79 +31,13 @@ FINDING_LEVELS = (
     ("🔴", "Сильное движение"),
 )
 
-
-def candle_indicators(candles, seconds, now):
-    interval = seconds * 1000
-    closed = {bar["timestamp"]: bar for bar in candles if isinstance(bar.get("timestamp"), int)
-              and bar["timestamp"] + interval <= now * 1000}
-    times = sorted(closed)
-    if len(times) < 16:
-        return None
-    # Work from the newest contiguous segment. Missing candles are never
-    # bridged as if their prices were observed.
-    start = len(times) - 1
-    while start > 0 and times[start] - times[start - 1] == interval:
-        start -= 1
-    bars = [closed[stamp] for stamp in times[start:]]
-    if len(bars) < 16:
-        return None
-    high, low, close = (np.array([bar[name] for bar in bars], dtype=float)
-                        for name in ("high", "low", "close"))
-    if not all(np.isfinite(array).all() and (array > 0).all() for array in (high, low, close)):
-        return None
-    if not ((high >= close) & (close >= low)).all():
-        return None
-    natr = talib.NATR(high, low, close, timeperiod=14)
-    previous_atr = natr[-2] * close[-2] / 100
-    true_range = talib.TRANGE(high, low, close)[-1]
-    recent_high, recent_low = max(high[-4:]), min(low[-4:])
-    recent_returns = {}
-    if seconds == BTC_BAR_SECONDS:
-        recent_returns = {
-            (stamp + interval) / 1000: float(change)
-            for stamp, change in zip(times[start + 1:][-BTC_RETURN_SAMPLES:],
-                                     (100 * np.diff(close) / close[:-1])[-BTC_RETURN_SAMPLES:])
-        }
-    return {
-        "returns": recent_returns,
-        "return_4": float((close[-1] / close[-5] - 1) * 100),
-        "range_4": float((recent_high - recent_low) / close[-1] * 100),
-        "range_position_4": float((close[-1] - recent_low) / (recent_high - recent_low))
-                            if recent_high > recent_low else None,
-        "closed_at": (times[-1] + interval) / 1000,
-        "natr": float(natr[-1]),
-        "range_ratio": float(true_range / previous_atr) if previous_atr > 0 else None,
-        "counts": [((bar["timestamp"] + interval) / 1000, bar.get("trade_count"))
-                   for bar in bars[-(BASELINE_BARS + 2):]],
-    }
-
-
-def btc_context(asset, btc, now):
-    if not asset or not btc or asset is btc:
-        return None
-    asset_returns, btc_returns = asset["returns"], btc["returns"]
-    shared = sorted(asset_returns.keys() & btc_returns.keys())[-BTC_RETURN_SAMPLES:]
-    if (len(shared) != BTC_RETURN_SAMPLES or not 0 <= now - shared[-1] <= BTC_BAR_SECONDS + 90
-            or any(end - start != BTC_BAR_SECONDS for start, end in zip(shared, shared[1:]))):
-        return None
-    x = np.array([asset_returns[stamp] for stamp in shared])
-    y = np.array([btc_returns[stamp] for stamp in shared])
-    if not np.isfinite(x).all() or not np.isfinite(y).all() or np.ptp(x) == 0 or np.ptp(y) == 0:
-        return None
-    return {
-        "reference": "BTC-PERP", "window": "5m", "samples": len(shared), "updated_at": shared[-1],
-        "correlation": float(np.corrcoef(x, y)[0, 1]),
-        "btc_last_return_pct": float(y[-1]), "asset_last_return_pct": float(x[-1]),
-        "relative_last_return_pp": float(x[-1] - y[-1]),
-    }
-
-
-def tape_baseline(indicators, now, seconds):
-    # Exclude any candle overlapping the rolling live window.
-    samples = [count for end, count in indicators["counts"] if end <= now - seconds][-BASELINE_BARS:]
-    if len(samples) != BASELINE_BARS or any(type(count) is not int or count < 0 for count in samples):
-        return None
-    return median(samples)
+__all__ = [
+    "BASELINE_BARS", "BTC_BAR_SECONDS", "BTC_RETURN_SAMPLES", "BURST_RATIO",
+    "CANDLE_SOURCE", "FINDING_LEVELS", "MIN_BURST_TRADES", "MIN_LARGE_MOVE_PCT",
+    "MIN_STRONG_MOVE_PCT", "SPREAD_MULTIPLE", "WIDE_SPREAD_ATR_FRACTION",
+    "active_anomalies", "btc_context", "candle_indicators", "finding_strength",
+    "refresh_candles", "tape_baseline", "wide_spread",
+]
 
 
 def active_anomalies(snapshot, *, tape_ratio=BURST_RATIO):
