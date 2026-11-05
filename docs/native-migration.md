@@ -74,7 +74,8 @@ per-venue копии для `1m`, `5m`, `15m`; screener читает Hyperliquid
 чтобы не утраивать буфер сделок за 24 часа.
 
 Свечи в `/v1/snapshot` кешируются на 30 секунд на пару `(symbol, window)`.
-Screener запрашивает `include_candles=0` и берёт NATR из отдельного
+Первый запрос с `include_candles=1` прогревает кэш и может занять несколько
+секунд; screener запрашивает `include_candles=0` и берёт NATR из отдельного
 `/v1/candles`, как форк.
 
 ### `GET /v1/candles`
