@@ -69,8 +69,13 @@ uv run hyperdata-screener --api-url http://127.0.0.1:8420 --notify
 - `candles`: natr, range_ratio, tape_baseline, closed_at, quality.
 
 `flow` относится к Hyperliquid. Нативный full-hub хранит combined-окна и
-per-venue копии; screener читает Hyperliquid, чтобы молчащий Binance не менял
-сигнал.
+per-venue копии для `1m`, `5m`, `15m`; screener читает Hyperliquid, чтобы
+молчащий Binance не менял сигнал. Более длинные окна остаются только combined,
+чтобы не утраивать буфер сделок за 24 часа.
+
+Свечи в `/v1/snapshot` кешируются на 30 секунд на пару `(symbol, window)`.
+Screener запрашивает `include_candles=0` и берёт NATR из отдельного
+`/v1/candles`, как форк.
 
 ### `GET /v1/candles`
 
@@ -110,7 +115,8 @@ uv run python -m extensions.scalper.parity baseline.jsonl candidate.jsonl --repo
 
 1. Прогнать shadow 24 часа на live и добиться `parity-report.json` без расхождений
    два дня подряд.
-2. Проверить latency: p95 `/v1/snapshot` ≤ 200 мс, интервал скана ≤ 6 с.
+2. Проверить latency: p95 `/v1/snapshot?include_candles=0` ≤ 200 мс,
+   интервал скана ≤ 6 с.
 3. Проверить 24-часовой soak: нет `429`, нет необработанных исключений,
    рост RSS ≤ 50 МБ.
 4. Отдельным этапом добавить контекст: ликвидации, whales, HLP, funding,
