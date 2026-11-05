@@ -81,12 +81,34 @@ def test_remote_hub_apply_builds_capture_compatible_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_remote_hub_fetches_full_orderbook(monkeypatch) -> None:
+    hub = RemoteHub("http://127.0.0.1:8420")
+    hub.market.assets = {"BTC": object()}
+
+    async def fake_get(path: str, **params):
+        assert path == "/v1/orderbook/BTC"
+        return {
+            "symbol": "BTC", "timestamp": 123.0, "imbalance": 0.2,
+            "best_bid": 99.0, "best_ask": 101.0, "spread": 2.0,
+            "bids": [{"price": 99.0, "size": 1.0}, {"price": 98.0, "size": 2.0}],
+            "asks": [{"price": 101.0, "size": 1.0}, {"price": 102.0, "size": 2.0}],
+        }
+
+    monkeypatch.setattr(hub, "_get", fake_get)
+    book = await hub.fetch_orderbook("btc")
+    assert book is not None
+    assert book.best_bid == 99.0
+    assert len(book.bids) == 2
+    assert len(book.asks) == 2
+
+
+@pytest.mark.asyncio
 async def test_remote_hub_get_candles_uses_native_series(monkeypatch) -> None:
     hub = RemoteHub("http://127.0.0.1:8420")
 
     async def fake_get(path: str, **params):
         assert path == "/v1/candles"
-        assert params["symbols"] == "BTC"
+        assert params["symbols"] == "btc"
         return {"series": [{"symbol": "BTC", "interval": "5m", "candles": [{"timestamp": 1}]}]}
 
     monkeypatch.setattr(hub, "_get", fake_get)

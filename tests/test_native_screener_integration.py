@@ -67,6 +67,16 @@ class FakeHub:
         return self.books.get(symbol)
 
 
+def test_journal_path_separates_demo_and_live(monkeypatch, tmp_path) -> None:
+    from apps.screener_web.__main__ import journal_path
+
+    monkeypatch.setenv("HYPERDATA_SCREENER_DATA_DIR", str(tmp_path))
+    assert journal_path(None, demo=True).name == "scalper-demo.sqlite"
+    assert journal_path(None, demo=False).name == "scalper.sqlite"
+    explicit = tmp_path / "custom.sqlite"
+    assert journal_path(explicit, demo=True) == explicit
+
+
 @pytest.mark.asyncio
 async def test_healthz_rejects_stale_or_failed_native_feed() -> None:
     from apps.screener_web.__main__ import healthz
@@ -101,6 +111,7 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
     app.router.add_get("/v1/market", api.handle_market)
     app.router.add_get("/v1/snapshot", api.handle_snapshot)
     app.router.add_get("/v1/candles", api.handle_candles)
+    app.router.add_get("/v1/orderbook/{symbol}", api.handle_orderbook)
     client = TestClient(TestServer(app))
     await client.start_server()
     remote = RemoteHub(str(client.server.make_url("")).rstrip("/"))
@@ -110,6 +121,8 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
         assert remote.ready is True
         assert [asset.symbol for asset in remote.get_all_assets()] == ["BTC", "ETH"]
         assert remote.orderflow.get_snapshot("BTC", "1m").trade_count == 1
+        book = await remote.fetch_orderbook("BTC")
+        assert book is not None and book.best_bid == 69999.0
 
         service = Screener(
             remote, journal,

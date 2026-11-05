@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import logging
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 import aiohttp
@@ -25,6 +26,11 @@ from extensions.scalper.parity import Recorder
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.service import Screener
 from extensions.scalper.telegram import listen_reports
+from hyperdata_terminal.api_server import (
+    _make_host_guard_middleware,
+    _make_rate_limit_middleware,
+    _RateLimiter,
+)
 from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
 
 LOG = logging.getLogger(__name__)
@@ -39,6 +45,12 @@ def data_dir() -> Path:
         base = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
         return base / "hyperdata-screener"
     return Path.home() / ".local" / "share" / "hyperdata-screener"
+
+
+def journal_path(configured: Path | None, demo: bool) -> Path:
+    if configured is not None:
+        return configured
+    return data_dir() / ("scalper-demo.sqlite" if demo else "scalper.sqlite")
 
 
 def window_of(request: web.Request) -> str:
@@ -90,9 +102,10 @@ async def detail(request: web.Request) -> web.Response:
     window = window_of(request)
     if (symbol, window) not in service.rows:
         raise web.HTTPNotFound()
+    book = await hub.fetch_orderbook(symbol)
     return web.json_response({
         **service.rows[symbol, window],
-        "book": orderbook_details(hub, symbol),
+        "book": asdict(book) if book else orderbook_details(hub, symbol),
         "history": service.journal.latest(symbol, window, limit=20),
     })
 
@@ -112,7 +125,12 @@ async def healthz(request: web.Request) -> web.Response:
 
 
 def build_app(hub: RemoteHub, service: Screener) -> web.Application:
-    app = web.Application()
+    middlewares = []
+    guard = _make_host_guard_middleware("127.0.0.1")
+    if guard is not None:
+        middlewares.append(guard)
+    middlewares.append(_make_rate_limit_middleware(_RateLimiter()))
+    app = web.Application(middlewares=middlewares)
     app["hub"] = hub
     app["service"] = service
     app.router.add_get("/scalper", dashboard)
@@ -123,16 +141,24 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
 
 
 async def run(args: argparse.Namespace) -> None:
-    journal = Journal(args.journal)
+    journal = None
     recorder = Recorder(args.record) if args.record else None
     hub = RemoteHub(args.api_url, timeout=args.timeout)
     runner: web.AppRunner | None = None
     tasks: list[asyncio.Task] = []
     try:
         await hub.start()
+        path = journal_path(args.journal, hub.demo)
+        journal = Journal(path)
+        if hub.demo:
+            hub.alerts.telegram_token = ""
+            hub.alerts.telegram_chat_id = ""
+            hub.alerts.discord_webhook = ""
+            hub.alerts.enabled = False
         async with aiohttp.ClientSession() as session:
             gemini = analyst(session, hub.demo)
-            notify = bool(args.notify and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
+            notify = bool(args.notify and not hub.demo
+                          and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
             service = Screener(hub, journal, gemini, notify, recorder=recorder)
             app = build_app(hub, service)
             runner = web.AppRunner(app)
@@ -142,10 +168,10 @@ async def run(args: argparse.Namespace) -> None:
             journal.recover()
             tasks.extend(asyncio.create_task(worker()) for worker in
                          (service.run, service.analyze, service.deliver))
-            tasks.append(asyncio.create_task(service.refresh_quality(args.journal), name="screener-quality"))
+            tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
             if not hub.demo:
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
-                tasks.append(asyncio.create_task(service.refresh_profiles(args.journal), name="screener-profiles"))
+                tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
             if notify:
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
             LOG.info("Dashboard: http://127.0.0.1:%d/scalper (native %s)", args.port, args.api_url)
@@ -166,7 +192,8 @@ async def run(args: argparse.Namespace) -> None:
         await hub.stop()
         if recorder is not None:
             recorder.close()
-        journal.close()
+        if journal is not None:
+            journal.close()
 
 
 def main() -> None:
@@ -176,14 +203,13 @@ def main() -> None:
                         help="native HyperData API base URL (default: http://127.0.0.1:8420)")
     parser.add_argument("--port", type=int, default=8421, help="screener web port (default: 8421)")
     parser.add_argument("--journal", type=Path, default=None,
-                        help="SQLite journal path (default: <screener data dir>/scalper.sqlite)")
+                        help="SQLite journal path (default: <screener data dir>/scalper.sqlite; "
+                             "scalper-demo.sqlite in demo mode)")
     parser.add_argument("--timeout", type=float, default=10.0, help="native API timeout in seconds")
     parser.add_argument("--tui", action="store_true", help="also show the Rich Market Overview")
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()
-    if args.journal is None:
-        args.journal = data_dir() / "scalper.sqlite"
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
     logging.basicConfig(level=logging.WARNING if args.tui else logging.INFO)

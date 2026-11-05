@@ -140,10 +140,42 @@ class RemoteHub:
 
     async def get_candles(self, symbol: str, timeframe: str = "15m", bars: int = 100) -> list[dict]:
         payload = await self._get(
-            "/v1/candles", symbols=symbol.upper(), interval=timeframe, bars=bars,
+            "/v1/candles", symbols=symbol, interval=timeframe, bars=bars,
         )
         series = payload.get("series") or []
         return series[0].get("candles", []) if series else []
+
+    def _resolve_symbol(self, symbol: str) -> str:
+        if symbol in self.market.assets:
+            return symbol
+        upper = symbol.upper()
+        for known in self.market.assets:
+            if known.upper() == upper:
+                return known
+        return symbol
+
+    async def fetch_orderbook(self, symbol: str) -> OrderBookSnapshot | None:
+        """Full book for the detail endpoint; snapshots only carry top-of-book."""
+        resolved = self._resolve_symbol(symbol)
+        try:
+            payload = await self._get(f"/v1/orderbook/{resolved}")
+        except Exception as exc:
+            LOG.debug("Orderbook detail failed for %s: %s", resolved, type(exc).__name__)
+            return None
+        bids = [OrderBookLevel(price=float(level["price"]), size=float(level["size"]))
+                for level in payload.get("bids", [])]
+        asks = [OrderBookLevel(price=float(level["price"]), size=float(level["size"]))
+                for level in payload.get("asks", [])]
+        if not bids or not asks:
+            return None
+        best_bid, best_ask = bids[0].price, asks[0].price
+        return OrderBookSnapshot(
+            timestamp=float(payload.get("timestamp") or self._as_of or time.time()),
+            symbol=payload.get("symbol", resolved), bids=bids, asks=asks,
+            imbalance=float(payload.get("imbalance") or 0.0),
+            best_bid=best_bid, best_ask=best_ask,
+            spread=float(payload.get("spread") or (best_ask - best_bid)),
+        )
 
     def _apply(self, payload: dict, assets: list[dict]) -> None:
         now = float(payload.get("as_of") or time.time())

@@ -1117,6 +1117,8 @@ class HyperDataAPI:
             "best_bid": snap.best_bid, "best_ask": snap.best_ask,
             "spread": snap.spread, "timestamp": snap.timestamp,
             "bid_levels": len(snap.bids), "ask_levels": len(snap.asks),
+            "bids": [{"price": b.price, "size": b.size} for b in snap.bids],
+            "asks": [{"price": a.price, "size": a.size} for a in snap.asks],
             "bids_top5": [{"price": b.price, "size": b.size} for b in snap.bids[:5]],
             "asks_top5": [{"price": a.price, "size": a.size} for a in snap.asks[:5]],
         })
