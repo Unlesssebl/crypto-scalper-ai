@@ -174,6 +174,46 @@ async def test_update_data_reads_async_extra_reader_and_renders_panels():
     assert dashboard.build_dashboard() is not None
 
 
+def test_pinned_pages_and_all_threshold():
+    assert MarketOverviewDashboard(page="risk")._current_page(40) == "risk"
+    assert MarketOverviewDashboard(page="vault")._current_page(40) == "vault"
+    auto = MarketOverviewDashboard(page="auto")
+    assert auto._current_page(80) == "all"
+    assert auto._current_page(40) in {"market", "risk", "vault"}
+
+
+def test_compact_header_shows_page_label():
+    dashboard = MarketOverviewDashboard()
+    dashboard.assets = [_asset()]
+    dashboard.health = {"overall": "warn", "orderflow_venues": {
+        "hyperliquid": {"status": "ok"}, "binance": {"status": "silent"}}}
+    header = dashboard.build_compact_header("risk").plain
+    assert "[RISK]" in header
+    assert "⚠ PARTIAL" in header
+
+
+@pytest.mark.asyncio
+async def test_pages_render_with_native_data():
+    async def extra():
+        return {
+            "orderflow": [{"symbol": "BTC", "signal": "BULLISH", "venue": "combined",
+                           "cvd": 100.0, "ofi": 0.2, "trades": 5, "quality": "ok"}],
+            "liquidations": {"confirmed_count": 1, "confirmed_volume_usd": 1000.0},
+            "danger_zone": {"positions": []},
+            "whales": {"positions": [{"symbol": "BTC", "side": "long", "size_usd": 2e6,
+                                      "leverage": 10, "distance_pct": 8.0}]},
+            "hlp": {"warmup": True},
+            "heatmap": {"symbol": "BTC", "price": 70000.0, "range_pct": 10.0, "buckets": []},
+            "smart_money": {"stats": {}, "smart": [], "signals": []},
+        }
+
+    for page in ("market", "risk", "vault"):
+        dashboard = MarketOverviewDashboard(
+            page=page, asset_reader=lambda: [_asset()], extra_reader=extra)
+        await dashboard.update_data()
+        assert dashboard.build_dashboard() is not None
+
+
 @pytest.mark.asyncio
 async def test_extra_reader_failure_does_not_break_dashboard():
     async def boom():

@@ -235,6 +235,8 @@ async def run(args: argparse.Namespace) -> None:
                     context_reader=lambda: hub.context,
                     health_reader=lambda: hub.health_summary,
                     extra_reader=native_panels,
+                    page=args.tui_page,
+                    rotate_seconds=args.tui_rotate,
                 )
                 await dashboard_view.run()
             else:
@@ -263,6 +265,12 @@ def main() -> None:
                              "scalper-demo.sqlite in demo mode)")
     parser.add_argument("--timeout", type=float, default=10.0, help="native API timeout in seconds")
     parser.add_argument("--tui", action="store_true", help="also show the Rich Market Overview")
+    parser.add_argument("--tui-page", choices=["auto", "all", "market", "risk", "vault"],
+                        default=os.getenv("HYPERDATA_TUI_PAGE", "auto"),
+                        help="TUI layout: auto (rotate fitted pages on short terminals), "
+                             "all, market, risk or vault")
+    parser.add_argument("--tui-rotate", type=float, default=10.0,
+                        help="seconds between rotated TUI pages (default: 10)")
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()

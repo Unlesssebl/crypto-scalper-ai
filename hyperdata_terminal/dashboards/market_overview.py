@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 import pyfiglet
 from rich import box
 from rich.align import Align
-from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -120,6 +119,10 @@ def generate_mock_assets(n: int = 25) -> list[AssetInfo]:
 
 # -- Dashboard class --------------------------------------------------------
 
+def _compact_panels(panels: list) -> list:
+    return [panel for panel in panels if panel is not None]
+
+
 class MarketOverviewDashboard:
     """Rich-powered terminal dashboard for Hyperliquid market overview."""
 
@@ -133,6 +136,8 @@ class MarketOverviewDashboard:
         context_reader=None,
         health_reader=None,
         extra_reader=None,
+        page: str = "auto",
+        rotate_seconds: float = 10.0,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -153,6 +158,11 @@ class MarketOverviewDashboard:
         # {"orderflow": [...], "liquidations": {...}, "danger_zone": {...},
         #  "whales": {...}}.
         self.extra_reader = extra_reader
+        # Screen mode cannot scroll, so on short terminals the native panels
+        # are split into two fitted pages that rotate. "all" pins the tall
+        # single-page layout; "market"/"risk" pin one page.
+        self.page = page if page in ("auto", "all", "market", "risk", "vault") else "auto"
+        self.rotate_seconds = max(3.0, rotate_seconds)
         self.assets: list[AssetInfo] = []
         self.context: dict = {}
         self.health: dict = {}
@@ -161,6 +171,49 @@ class MarketOverviewDashboard:
         self.update_error: str | None = None
 
     # -- Header ---------------------------------------------------------------
+
+    def _health_badge(self) -> tuple[str, str] | None:
+        overall = str((self.health or {}).get("overall")
+                      or (self.health or {}).get("status") or "").lower()
+        if not overall:
+            return None
+        return {
+            "ok": ("✓ LIVE", "bold bright_green"),
+            "warn": ("⚠ PARTIAL", "bold yellow"),
+            "stale": ("⚠ STALE", "bold bright_red"),
+            "drift": ("⚠ DRIFT", "bold yellow"),
+            "fail": ("⚠ DEGRADED", "bold bright_red"),
+        }.get(overall, (f"● {overall.upper()}", "bold bright_white"))
+
+    def _flow_label(self) -> str | None:
+        venues = (self.health or {}).get("orderflow_venues") or {}
+        if not venues:
+            return None
+        live = [venue for venue, info in venues.items()
+                if (info or {}).get("status") == "ok"]
+        names = {"hyperliquid": "HL", "binance": "BN"}
+        return " + ".join(names.get(venue, venue.upper()) for venue in live) or "silent"
+
+    def build_compact_header(self, page: str | None = None) -> Text:
+        """One-line header for the density-first layout (no ASCII art)."""
+        line = Text()
+        line.append("\u26a1 HYPERDATA", style="bold bright_magenta")
+        line.append("  MARKET OVERVIEW", style="bright_white")
+        if page:
+            line.append(f"  [{page.upper()}]", style="bold bright_cyan")
+        line.append("  |  ", style="dim white")
+        line.append("DEMO" if self.demo else "LIVE",
+                    style="bold bright_green" if self.demo else "bold bright_red")
+        line.append(f"  |  Assets {len(self.assets)}", style="bold bright_yellow")
+        if badge := self._health_badge():
+            line.append("  |  ", style="dim white")
+            line.append(badge[0], style=badge[1])
+        if flow := self._flow_label():
+            line.append("  |  Flow: ", style="dim bright_white")
+            line.append(flow, style="bright_white")
+        line.append("  |  ", style="dim white")
+        line.append(datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), style="dim bright_white")
+        return line
 
     def build_header(self) -> Text:
         """ASCII art header using pyfiglet."""
@@ -185,24 +238,10 @@ class MarketOverviewDashboard:
         info_line.append("  |  ", style="dim white")
         info_line.append(f"Assets: {asset_count}", style="bold bright_yellow")
 
-        health = self.health or {}
-        overall = str(health.get("overall") or health.get("status") or "").lower()
-        if overall:
-            badge = {
-                "ok": ("✓ LIVE", "bold bright_green"),
-                "warn": ("⚠ PARTIAL", "bold yellow"),
-                "stale": ("⚠ STALE", "bold bright_red"),
-                "drift": ("⚠ DRIFT", "bold yellow"),
-                "fail": ("⚠ DEGRADED", "bold bright_red"),
-            }.get(overall, (f"● {overall.upper()}", "bold bright_white"))
+        if badge := self._health_badge():
             info_line.append("  |  ", style="dim white")
             info_line.append(badge[0], style=badge[1])
-        venues = health.get("orderflow_venues") or {}
-        if venues:
-            live = [venue for venue, info in venues.items()
-                    if (info or {}).get("status") == "ok"]
-            names = {"hyperliquid": "HL", "binance": "BN"}
-            flow = " + ".join(names.get(venue, venue.upper()) for venue in live) or "silent"
+        if flow := self._flow_label():
             info_line.append("  |  Flow: ", style="dim bright_white")
             info_line.append(flow, style="bright_white")
 
@@ -466,9 +505,37 @@ class MarketOverviewDashboard:
 
     # -- Full dashboard -------------------------------------------------------
 
+    @staticmethod
+    def _panel_grid(panels: list, per_row: int = 3) -> list[Table]:
+        """Lay panels out in fixed equal-width rows (no width balancing)."""
+        rows = []
+        for start in range(0, len(panels), per_row):
+            chunk = panels[start:start + per_row]
+            grid = Table.grid(expand=True, padding=(0, 1))
+            for _ in chunk:
+                grid.add_column(ratio=1)
+            grid.add_row(*chunk)
+            rows.append(grid)
+        return rows
+
+    def _current_page(self, height: int) -> str:
+        if self.page in ("all", "market", "risk", "vault"):
+            return self.page
+        if height >= 75:
+            return "all"
+        slot = int(time.time() / self.rotate_seconds) % 3
+        return ("market", "risk", "vault")[slot]
+
     def build_dashboard(self) -> Panel:
-        """Compose the full dashboard layout."""
-        header = self.build_header()
+        """Compose the dashboard, sized to the terminal (no scrolling)."""
+        # Rich's screen mode cannot scroll, so fit the content to the height
+        # we actually have: drop the ASCII art, shrink tables and, on short
+        # terminals, rotate between two fitted pages.
+        height = max(24, self.console.size.height or 50)
+        page = self._current_page(height)
+        compact = bool(self.extra) or page != "all"
+        header = (self.build_compact_header(page if page != "all" else None)
+                  if compact else self.build_header())
 
         if not self.assets:
             scanning = Text()
@@ -488,33 +555,63 @@ class MarketOverviewDashboard:
             content = Group(Align.center(header), Text(""), scanning)
         else:
             extra = self.extra or {}
-            wide = [
-                orderflow_panel(extra.get("orderflow") or []),
-                self.build_context_panel(self.context),
-            ]
-            grid = [
-                liquidations_panel(extra.get("liquidations")),
-                danger_zone_panel(extra.get("danger_zone")),
-                whales_panel(extra.get("whales")),
-                hlp_panel(extra.get("hlp")),
-                heatmap_panel(extra.get("heatmap")),
-                smart_money_panel(extra.get("smart_money")),
-            ]
-            wide = [panel for panel in wide if panel is not None]
-            grid = [panel for panel in grid if panel is not None]
-            # Native panels make the view taller; trim the two long tables so
-            # the whole screen still fits a normal terminal.
-            compact = bool(wide or grid)
-            assets_table = self.build_assets_table(self.assets, limit=8 if compact else 20)
-            extreme_table = self.build_extreme_funding(self.assets, limit=3 if compact else 10)
+            small = 3 if height >= 48 else 2
+            assets_limit = 12 if height >= 50 else 8 if height >= 42 else 6
+            if height < 36:
+                assets_limit = 4
+            funding_limit = 5 if height >= 50 else 3
+            order_limit = 6 if height >= 50 else 4 if height >= 40 else 3
+            heat_limit = 6 if height >= 50 else 4 if height >= 40 else 3
+            if height < 36:
+                heat_limit = 2
+
+            orderflow = orderflow_panel(extra.get("orderflow") or [], limit=order_limit)
+            context_panel = self.build_context_panel(self.context)
+            liquidations = liquidations_panel(extra.get("liquidations"), limit=small)
+            danger = danger_zone_panel(extra.get("danger_zone"), limit=small)
+            whales = whales_panel(extra.get("whales"), limit=small)
+            hlp = hlp_panel(extra.get("hlp"), limit=small)
+            heatmap = heatmap_panel(extra.get("heatmap"), limit=heat_limit)
+            smart = smart_money_panel(extra.get("smart_money"), limit=small)
             stats = self.build_stats_bar()
 
-            sections = [Align.center(header), Text(""), assets_table, Text("")]
-            for panel in wide:
-                sections.extend([panel, Text("")])
-            for start in range(0, len(grid), 3):
-                sections.extend([Columns(grid[start:start + 3], equal=True, expand=True), Text("")])
-            sections.extend([extreme_table, Text(""), stats, Text("")])
+            if page == "market":
+                sections = [header,
+                            self.build_assets_table(self.assets, limit=assets_limit)]
+                if orderflow is not None:
+                    sections.append(orderflow)
+                if context_panel is not None:
+                    sections.append(context_panel)
+                if height >= 46:
+                    sections.append(self.build_extreme_funding(self.assets, limit=funding_limit))
+                sections.append(stats)
+            elif page == "risk":
+                sections = [header]
+                grid = _compact_panels([liquidations, danger, whales])
+                if grid:
+                    sections.append(self._panel_grid(grid, per_row=3)[0])
+                sections.append(stats)
+            elif page == "vault":
+                sections = [header]
+                for panel in (hlp, heatmap, smart):
+                    if panel is not None:
+                        sections.append(panel)
+                if height >= 36:
+                    sections.append(stats)
+            else:
+                sections = [Align.center(header), Text(""),
+                            self.build_assets_table(self.assets, limit=20), Text("")]
+                if orderflow is not None:
+                    sections.extend([orderflow, Text("")])
+                if context_panel is not None:
+                    sections.extend([context_panel, Text("")])
+                sections.extend(self._panel_grid(
+                    _compact_panels([liquidations, danger, whales, hlp, heatmap, smart]),
+                    per_row=3))
+                sections.extend([
+                    self.build_extreme_funding(self.assets, limit=10),
+                    Text(""), stats, Text(""),
+                ])
             content = Group(*sections)
 
         return Panel(
@@ -644,7 +741,7 @@ class MarketOverviewDashboard:
             console=self.console,
             refresh_per_second=2,
             screen=True,
-            vertical_overflow="visible",
+            vertical_overflow="crop",
         ) as live:
             try:
                 while True:
