@@ -91,6 +91,7 @@ async def screener(request: web.Request) -> web.Response:
         "gemini": "configured" if service.gemini.key else "disabled",
         "ai_provider": service.gemini.provider,
         "quality_report": service.quality_report,
+        "context": hub.context,
         "rows": rows,
     })
 

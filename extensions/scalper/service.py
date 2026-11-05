@@ -10,15 +10,15 @@ from urllib.parse import quote
 
 from hyperdata_terminal.utils.helpers import format_price, format_usd
 
-from .audit import CONTROL_INTERVAL, STRONG_RANK
 from .activity import CANDLE_SOURCE, active_anomalies, btc_context, finding_strength, refresh_candles, wide_spread
 from .analysis import DIRECTIONAL, compare, snapshot_key
+from .audit import CONTROL_INTERVAL, STRONG_RANK
 from .journal import dump
 from .market import WINDOWS, capture, metric
-from .shadow import ShadowDetector
-from .quality import calculate_quality
 from .phase import PhaseTracker
 from .profile import DAY, calculate_profiles, fresh, profile_context, sample_window, situation_facts
+from .quality import calculate_quality
+from .shadow import ShadowDetector
 
 LOG = logging.getLogger(__name__)
 AI_INTERVAL = 12
@@ -100,7 +100,8 @@ def alert_text(snapshot, native, ai, event, *, rich=False, updates=()):
         trigger += f' · {html.escape(strength["icon"])} <b>Сила: {html.escape(strength["label"])}</b>'
     phase = event.get("movement_phase")
     if phase and phase["phase"] not in {"unavailable", "untracked"}:
-        trigger += f'<br><b>Фаза:</b> {html.escape(phase["label"])}' if rich else f'\n<b>Фаза:</b> {html.escape(phase["label"])}'
+        trigger += (f'<br><b>Фаза:</b> {html.escape(phase["label"])}'
+                    if rich else f'\n<b>Фаза:</b> {html.escape(phase["label"])}')
         if phase["distance_natr"] is not None:
             trigger += f' · {phase["distance_natr"]:+.1f} NATR от начала'
         trigger += f' · {phase["age_seconds"]} с'
@@ -223,6 +224,17 @@ def with_senior_context(snapshot, candles):
     metrics = {name: metric(candles[name], CANDLE_SOURCE, closed_at, unit)
                for name, unit in units.items() if candles[name] is not None}
     return {**snapshot, "context_15m": {"window": "15m", "captured_at": closed_at, "metrics": metrics}}
+
+
+def with_market_context(snapshot, hub):
+    """Attach the market-wide context (L/S, basis, IV, liquidations, whales) if
+    the hub exposes it. `RemoteHub` carries ``/v1/snapshot``'s ``context`` block
+    directly; the in-process `ScalperHub` does not expose one (kept for parity),
+    so this is a no-op there."""
+    context = getattr(hub, "context", None)
+    if not context:
+        return snapshot
+    return {**snapshot, "market_context": context}
 
 
 class Screener:
@@ -457,6 +469,7 @@ class Screener:
                         and row["btc_context"]["updated_at"] <= snapshot["captured_at"]):
                     baseline = {**baseline, "btc_context": row["btc_context"]}
                 snapshot = with_senior_context(baseline, self.candles.get((candidate[0], "15m")))
+                snapshot = with_market_context(snapshot, self.hub)
                 event = {**event, "analyzed_signal": native["native_signal"],
                          "analysis_gate": row["analysis_gate"], "context_5m": row["context_5m"],
                          "facts": row["facts"], "strength": row["strength"], "movement_phase": row["movement_phase"]}

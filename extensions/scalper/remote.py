@@ -85,6 +85,7 @@ class RemoteHub:
         self.last_error: str | None = None
         self._session: aiohttp.ClientSession | None = None
         self._books: dict[str, OrderBookSnapshot] = {}
+        self._context: dict[str, dict] = {}
         self._as_of = 0.0
         self._warnings: list[str] = []
         key = os.getenv("HYPERDATA_API_KEY", "").strip()
@@ -134,6 +135,7 @@ class RemoteHub:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.status.market_data = "error"
             raise
+        self._context = payload.get("context") or {}
         self._apply(payload, assets)
         self.ready = True
         self.last_error = None
@@ -272,3 +274,8 @@ class RemoteHub:
     @property
     def warnings(self) -> list[str]:
         return list(self._warnings)
+
+    @property
+    def context(self) -> dict[str, dict]:
+        """Market-wide context from `/v1/snapshot` (L/S, basis, IV, ...)."""
+        return dict(self._context)

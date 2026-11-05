@@ -188,3 +188,52 @@ async def test_candles_builder_returns_raw_series() -> None:
     payload = await build_candles(hub, ["BTC"], interval="5m", bars=50)
     assert payload["series"][0]["symbol"] == "BTC"
     assert len(payload["series"][0]["candles"]) == 50
+
+
+class _ContextHub(FakeHub):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.lsr = SimpleNamespace(get_latest=lambda s: SimpleNamespace(
+            long_short_ratio=1.2, long_ratio=0.55, short_ratio=0.45,
+            timestamp=time.time(), source="binance"))
+        self.spot = SimpleNamespace(get_latest=lambda s: SimpleNamespace(
+            spot_price=69900.0, perp_price=70000.0, basis_pct=0.143,
+            timestamp=time.time(), source="binance"))
+        self.deribit = SimpleNamespace(get_latest=lambda s: SimpleNamespace(
+            mark_iv=45.0, index_price=70000.0, oi_usd=1_000_000_000.0, timestamp=time.time()))
+        self.liquidations = SimpleNamespace(get_stats=lambda **k: {
+            "window_minutes": k["window_minutes"], "confirmed_count": 3,
+            "confirmed_volume_usd": 150_000.0, "long_count": 2, "short_count": 1,
+            "by_symbol": {"BTC": {"count": 3, "volume_usd": 150_000.0}},
+            "coverage": {"binance": {"method": "ws"}},
+        })
+
+    def get_whale_positions(self, min_size_usd=100_000.0):
+        position = SimpleNamespace(symbol="BTC", size_usd=1_000_000.0,
+                                   leverage=5.0, distance_pct=12.0)
+        return [position]
+
+    def get_extreme_funding(self, threshold_annualized=0.10):
+        return [SimpleNamespace(symbol="SOL", funding_rate=0.00002)]
+
+
+@ pytest.mark.asyncio
+async def test_snapshot_includes_market_context() -> None:
+    hub = _ContextHub()
+    payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
+                                   now=time.time(), include_candles=False)
+    context = payload["context"]
+    assert context["lsr"]["BTC"]["long_short_ratio"] == 1.2
+    assert context["basis"]["BTC"]["basis_pct"] == 0.143
+    assert context["iv"]["BTC"]["mark_iv"] == 45.0
+    assert context["liquidations"]["confirmed_count"] == 3
+    assert context["whales"][0]["symbol"] == "BTC"
+    assert context["extreme_funding"][0]["annualized_pct"] > 0
+
+
+@ pytest.mark.asyncio
+async def test_snapshot_context_is_empty_for_bare_hub() -> None:
+    hub = FakeHub()
+    payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
+                                   now=time.time(), include_candles=False)
+    assert payload["context"] == {}

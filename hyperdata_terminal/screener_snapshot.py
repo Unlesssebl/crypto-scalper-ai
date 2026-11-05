@@ -162,6 +162,113 @@ def _candle_row(hub, symbol: str, window: str, now: float, indicators, cached: b
     }
 
 
+def _context_block(hub, now: float) -> dict:
+    """Market-wide context the screener surfaces alongside per-symbol rows.
+
+    These come from hub sub-engines that only cover the majors or are global
+    (L/S ratio, basis, IV, liquidations, whales, funding), so they belong in a
+    single top-level block rather than being repeated on every symbol row.
+    Missing sub-engines (older hub / demo) degrade to empty dicts, never raise.
+    """
+    context: dict[str, dict] = {}
+
+    # L/S account ratio (BTC/ETH/SOL; venue crowd via ``source``).
+    lsr = getattr(hub, "lsr", None)
+    if lsr is not None:
+        block = {}
+        for symbol in ("BTC", "ETH", "SOL"):
+            snap = lsr.get_latest(symbol)
+            if snap:
+                block[symbol] = {
+                    "long_short_ratio": snap.long_short_ratio,
+                    "long_ratio": snap.long_ratio, "short_ratio": snap.short_ratio,
+                    "timestamp": snap.timestamp, "source": snap.source,
+                }
+        if block:
+            context["lsr"] = block
+
+    # Spot-perp basis (BTC/ETH/SOL).
+    spot = getattr(hub, "spot", None)
+    if spot is not None:
+        block = {}
+        for symbol in ("BTC", "ETH", "SOL"):
+            snap = spot.get_latest(symbol)
+            if snap:
+                block[symbol] = {
+                    "spot_price": snap.spot_price, "perp_price": snap.perp_price,
+                    "basis_pct": snap.basis_pct, "timestamp": snap.timestamp,
+                    "source": snap.source,
+                }
+        if block:
+            context["basis"] = block
+
+    # Deribit implied volatility (BTC/ETH).
+    deribit = getattr(hub, "deribit", None)
+    if deribit is not None:
+        block = {}
+        for underlying in ("BTC", "ETH"):
+            snap = deribit.get_latest(underlying)
+            if snap:
+                block[underlying] = {
+                    "mark_iv": snap.mark_iv, "index_price": snap.index_price,
+                    "oi_usd": snap.oi_usd, "timestamp": snap.timestamp,
+                }
+        if block:
+            context["iv"] = block
+
+    # Confirmed liquidation census over the last hour (not a complete census;
+    # ``coverage`` reports which exchange feeds are contributing).
+    liquidations = getattr(hub, "liquidations", None)
+    stats = None
+    if liquidations is not None:
+        try:
+            stats = liquidations.get_stats(window_minutes=60, include_estimated=False)
+        except Exception:
+            stats = None
+    if stats:
+        context["liquidations"] = {
+            "window_minutes": stats["window_minutes"],
+            "confirmed_count": stats["confirmed_count"],
+            "confirmed_volume_usd": stats["confirmed_volume_usd"],
+            "long_count": stats["long_count"], "short_count": stats["short_count"],
+            "by_symbol": dict(list(stats["by_symbol"].items())[:10]),
+            "coverage": stats["coverage"],
+        }
+
+    # Whale book (largest tracked positions).
+    whales = []
+    if hasattr(hub, "get_whale_positions"):
+        try:
+            whales = hub.get_whale_positions(min_size_usd=250_000)[:20]
+        except Exception:
+            whales = []
+    if whales:
+        context["whales"] = [
+            {"symbol": whale.symbol, "size_usd": whale.size_usd,
+             "leverage": getattr(whale, "leverage", None),
+             "distance_pct": whale.distance_pct}
+            for whale in whales
+        ]
+
+    # Top extreme funding across venues (annualised %).
+    extreme = []
+    if hasattr(hub, "get_extreme_funding"):
+        try:
+            extreme = hub.get_extreme_funding(threshold_annualized=0.10)[:15]
+        except Exception:
+            extreme = []
+    if extreme:
+        context["extreme_funding"] = [
+            {"symbol": asset.symbol,
+             "annualized_pct": asset.funding_rate * 8760 * 100}
+            for asset in extreme
+        ]
+
+    if context:
+        context["as_of"] = now
+    return context
+
+
 async def _indicators(hub, symbol: str, window: str, now: float) -> tuple[dict | None, bool]:
     key = (symbol, window)
     cached = _CANDLE_CACHE.get(key)
@@ -245,6 +352,7 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
             "quality": market_quality,
         },
         "warnings": warnings,
+        "context": _context_block(hub, now),
         "rows": rows,
     }
 

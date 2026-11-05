@@ -46,6 +46,11 @@ context_15m содержит фон по закрытым свечам: изме
 Если окна заметно расходятся, объясни это; старшее окно не отменяет автоматически краткий импульс.
 Если есть btc_context, сравни последнюю закрытую свечу инструмента с BTC.
 Корреляция доходностей описывает связь в прошедшем окне и сама не задаёт направление или причину движения.
+market_context, если есть, — это рыночный фон: long/short-соотношение счетов (lsr),
+spot-perp базис (basis), подразумеваемая волатильность (iv), ликвидации за час,
+крупнейшие отслеживаемые позиции (whales) и экстремальный финансинг (extreme_funding).
+Это контекст, а не доказательство направления текущего окна: используй его для оценки
+риск-аппетита и уровня рынка, но не как аргумент направления в argument/contradiction.
 В списках аргументов ссылайся только на ключи основного окна из metrics."""
 ARGUMENT = {
     "type": "object", "required": ["metric", "reason"], "additionalProperties": False,
@@ -96,6 +101,8 @@ def blind_payload(snapshot):
             payload[key] = {field: context[field] for field in ("window", "captured_at", "metrics")}
             if "flow_quality" in context:
                 payload[key]["flow_quality"] = context["flow_quality"]
+    if market := snapshot.get("market_context"):
+        payload["market_context"] = market
     return payload
 
 
