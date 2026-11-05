@@ -113,6 +113,21 @@ uv sync                 # или: .\.venv\Scripts\python.exe -m pip install -e .
 - Ключи Gemini/OpenRouter/Telegram храните в `.env`, не в git.
 - Не запускайте два экземпляра на одном каталоге данных.
 
+## Parity-регрессия
+
+Скринер умеет писать по одной JSONL-строке на скан; `hyperdata-parity`
+сравнивает две записи (например, до и после изменения логики сигналов):
+
+```powershell
+uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --record candidate.jsonl
+uv run hyperdata-parity baseline.jsonl candidate.jsonl --report parity-report.json
+```
+
+Код возврата `0` — расхождения в пределах порогов, `1` — нет. Пороги:
+core ≤ 10%, secondary ≤ 30%, согласие по сигналу ≥ 95%. Отчёт содержит
+`by_field` и первые 200 расхождений, поэтому регрессию видно по конкретной
+метрике, а не только по итоговому флагу.
+
 ## Что смотреть при сбоях
 
 1. `/healthz` — 503 и `last_error`.

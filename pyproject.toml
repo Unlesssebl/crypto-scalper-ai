@@ -48,6 +48,10 @@ dependencies = [
 # `hyperdata mcp`: serve the live data to AI agents over the Model Context Protocol.
 mcp = ["mcp>=2.2,<3"]
 
+[dependency-groups]
+# `uv run pytest` / `uv run ruff` work in any checkout without a manual install.
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.9"]
+
 [project.urls]
 Homepage = "https://hyperdata.vercel.app"
 Source = "https://github.com/Co-Messi/HyperData-Terminal"
@@ -57,6 +61,8 @@ Issues = "https://github.com/Co-Messi/HyperData-Terminal/issues"
 hyperdata = "hyperdata_terminal.cli:main"
 crypto-scalper = "apps.scalper_web.__main__:main"
 hyperdata-screener = "apps.screener_web.__main__:main"
+# Regression/diagnostic tool: compare two JSONL screener recordings.
+hyperdata-parity = "extensions.scalper.parity:main"
 # Same command under the distribution name, so `uvx hyperdata-terminal` works.
 hyperdata-terminal = "hyperdata_terminal.cli:main"
 
