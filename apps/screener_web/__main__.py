@@ -141,8 +141,9 @@ async def run(args: argparse.Namespace) -> None:
             tasks.extend(asyncio.create_task(worker()) for worker in
                          (service.run, service.analyze, service.deliver))
             tasks.append(asyncio.create_task(service.refresh_quality(args.journal), name="screener-quality"))
-            tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
-            tasks.append(asyncio.create_task(service.refresh_profiles(args.journal), name="screener-profiles"))
+            if not hub.demo:
+                tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
+                tasks.append(asyncio.create_task(service.refresh_profiles(args.journal), name="screener-profiles"))
             if notify:
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
             LOG.info("Dashboard: http://127.0.0.1:%d/scalper (native %s)", args.port, args.api_url)
