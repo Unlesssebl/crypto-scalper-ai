@@ -893,6 +893,7 @@ class HyperDataAPI:
     async def handle_market(self, request: web.Request) -> web.Response:
         limit = _int_param(request, "limit", 50, minimum=1, maximum=1000)
         assets = self.hub.get_all_assets()[:limit]
+        observed = getattr(self.hub.market, "observed_fields", {})
         data = []
         for a in assets:
             data.append({
@@ -904,8 +905,13 @@ class HyperDataAPI:
                 "mark_price": a.mark_price,
                 "index_price": a.index_price,
                 "premium_pct": getattr(a, "premium_pct", 0.0),
+                "observed_fields": sorted(observed.get(a.symbol, set())),
             })
-        return web.json_response({"count": len(data), "assets": data})
+        return web.json_response({
+            "count": len(data),
+            "as_of": getattr(self.hub.market, "observed_at", 0.0),
+            "assets": data,
+        })
 
     async def handle_market_symbol(self, request: web.Request) -> web.Response:
         sym = request.match_info["symbol"].upper()
@@ -920,17 +926,28 @@ class HyperDataAPI:
             snapshots = self.hub.orderflow.get_all_snapshots(sym)
         except KeyError:
             return web.json_response({"error": f"No orderflow data for {sym}"}, status=404)
+        now = time.time()
+        connected_at = self.hub.orderflow.hyperliquid_connected_at(sym)
         result = {}
         for tf, snap in snapshots.items():
             if snap:
+                bucket = self.hub.orderflow.buckets.get(sym, {}).get(tf)
+                trades = bucket.window_trades(now) if bucket else ()
                 result[tf] = {
                     "buy_volume": snap.buy_volume, "sell_volume": snap.sell_volume,
                     "net_volume": snap.buy_volume - snap.sell_volume,
                     "trade_count": snap.trade_count,
                     "ofi": snap.ofi, "signal": snap.signal,
+                    "trades_per_second": snap.trades_per_sec,
                     # Share of the window covered by data; < 0.95 means the
                     # timeframe is still warming up after start.
                     "coverage": round(snap.coverage, 3),
+                    "warming_up": snap.warming_up,
+                    "connected_at": connected_at or None,
+                    "last_trade_at": trades[-1].timestamp if trades else None,
+                    "first_trade_price": trades[0].price if trades else None,
+                    "last_trade_price": trades[-1].price if trades else None,
+                    "venue": "combined",
                 }
         # Per-venue attribution: `cumulative_cvd` stays the combined figure
         # for back-compat, but it is never returned alone — a consumer can
