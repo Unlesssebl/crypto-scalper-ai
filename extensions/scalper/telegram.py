@@ -13,6 +13,69 @@ LOG = logging.getLogger(__name__)
 REPORT = re.compile(r"/report(?:@([a-zA-Z0-9_]+))?(?:\s+(1m|5m))?", re.IGNORECASE)
 
 
+def digest_text(rows, context, *, rich=False):
+    """Short market snapshot: top rows by direction plus the market context.
+
+    Used for a periodic unsolicited digest; `rows` is the screener's
+    `service.rows` dict and `context` the hub's market-context block. Returns
+    None when there is nothing worth sending (no rows or no context).
+    """
+    def esc(text):
+        return html.escape(str(text))
+
+    if not context:
+        return None
+    lines = ["<b>Обзор рынка</b>"]
+
+    if lsr := context.get("lsr", {}).get("BTC"):
+        ratio = lsr.get("long_short_ratio")
+        if ratio is not None:
+            lines.append(f"L/S BTC {ratio:.2f} · {esc(lsr.get('source', '?'))}")
+    if iv := context.get("iv", {}).get("BTC"):
+        mark = iv.get("mark_iv")
+        if mark is not None:
+            lines.append(f"IV BTC {mark:.0f}%")
+    if basis := context.get("basis", {}).get("BTC"):
+        bp = basis.get("basis_pct")
+        if bp is not None:
+            lines.append(f"Базис BTC {bp:+.2f}%")
+    if liq := context.get("liquidations"):
+        count = liq.get("confirmed_count")
+        if count is not None:
+            lines.append(f"Ликвидации (1 ч): {count} ({int(liq.get('confirmed_volume_usd', 0)):,} USD)")
+
+    top = []
+    for (symbol, window), row in rows.items():
+        if window != "1m":
+            continue
+        direction = row.get("hyperdata", {}).get("direction", "NOT_AVAILABLE")
+        if direction in ("BULLISH", "BEARISH"):
+            top.append((symbol, direction))
+    if top:
+        ticks = " · ".join(f"{esc(sym)} {('🟢' if d == 'BULLISH' else '🔴')}" for sym, d in top)
+        lines.append(f"Направленные 1m: {ticks}")
+
+    text = "\n".join(["<b>" + lines[0] + "</b>", *lines[1:]]) if rich else "\n".join(lines)
+    return text
+
+
+async def run_digest(session, service, interval_seconds):
+    """Send the market-context digest every `interval_seconds` when enabled."""
+    alerts = service.hub.alerts
+    while True:
+        await asyncio.sleep(interval_seconds)
+        if not (alerts.telegram_token and alerts.telegram_chat_id):
+            continue
+        context = getattr(service.hub, "context", None)
+        text = digest_text(service.rows, context)
+        if text is None:
+            continue
+        try:
+            await alerts.send_telegram(text, rich_html=digest_text(service.rows, context, rich=True))
+        except Exception:
+            LOG.exception("Market digest send failed")
+
+
 def report_text(report, window=None, *, rich=False):
     if report is None:
         return "Отчёт ещё рассчитывается. Повторите /report через минуту."

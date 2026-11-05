@@ -28,7 +28,7 @@ from extensions.scalper.service import (
     with_movement_context,
     with_senior_context,
 )
-from extensions.scalper.telegram import listen_reports, report_command, report_text
+from extensions.scalper.telegram import digest_text, listen_reports, report_command, report_text
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, ShardState, Trade
@@ -667,3 +667,31 @@ def test_blind_payload_carries_market_context_when_present(market):
     snapshot["market_context"] = {"lsr": {"BTC": {"long_short_ratio": 1.2}}}
     payload = blind_payload(snapshot)
     assert payload["market_context"]["lsr"]["BTC"]["long_short_ratio"] == 1.2
+
+
+def test_digest_text_renders_context_and_directional_rows():
+    context = {
+        "lsr": {"BTC": {"long_short_ratio": 1.4, "source": "okx"}},
+        "iv": {"BTC": {"mark_iv": 45.0}},
+        "basis": {"BTC": {"basis_pct": 0.12}},
+        "liquidations": {"confirmed_count": 3, "confirmed_volume_usd": 250_000},
+    }
+    rows = {
+        ("BTC", "1m"): {"hyperdata": {"direction": "BULLISH"}},
+        ("ETH", "1m"): {"hyperdata": {"direction": "BEARISH"}},
+        ("ETH", "5m"): {"hyperdata": {"direction": "NEUTRAL"}},
+    }
+    text = digest_text(rows, context)
+    assert text is not None
+    assert "L/S BTC 1.40" in text
+    assert "IV BTC 45%" in text
+    assert "Базис BTC +0.12%" in text
+    assert "Ликвидации (1 ч): 3" in text
+    assert "BTC 🟢" in text
+    assert "ETH 🔴" in text
+    assert "5m" not in text
+
+
+def test_digest_text_requires_context():
+    assert digest_text({}, None) is None
+    assert digest_text({}, {}) is None

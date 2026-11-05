@@ -169,6 +169,25 @@ function node(tag, text, parent) {
   return element;
 }
 
+function renderMarketContext(context) {
+  if (!context) return;
+  const overview = $("overview");
+  const existing = overview.querySelectorAll(".market-context");
+  existing.forEach(el => el.remove());
+  const cards = [
+    ["L/S BTC", context.lsr?.BTC ? (context.lsr.BTC.long_short_ratio ?? null)?.toFixed(2) : "—"],
+    ["IV BTC", context.iv?.BTC?.mark_iv ? context.iv.BTC.mark_iv.toFixed(0) + "%" : "—"],
+    ["Базис BTC", context.basis?.BTC?.basis_pct != null ? (context.basis.BTC.basis_pct > 0 ? "+" : "") + context.basis.BTC.basis_pct.toFixed(2) + "%" : "—"],
+    ["Ликвидации 1ч", context.liquidations?.confirmed_count ?? "—"],
+  ];
+  for (const [label, total] of cards) {
+    const card = node("div", null, overview);
+    card.className = "stat market-context";
+    node("small", label, card);
+    node("strong", String(total), card);
+  }
+}
+
 function render() {
   const query = $("search").value.trim().toUpperCase(), filter = $("filter").value;
   const rows = data.map(display).filter(row => row.symbol.toUpperCase().includes(query) && (!filter || row.category === filter));
@@ -530,6 +549,7 @@ async function refresh() {
     if (sequence !== generation) return;
     data = result.rows;
     renderQuality(result.quality_report);
+    renderMarketContext(result.context);
     $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
       " · " + result.ai_provider + " " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
     render();
