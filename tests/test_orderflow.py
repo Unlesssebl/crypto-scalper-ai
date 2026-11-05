@@ -240,7 +240,7 @@ def test_venue_windows_follow_add_symbol() -> None:
     engine = OrderFlowEngine(symbols=["BTC"])
     engine.add_symbol("ETH")
 
-    assert set(engine.venue_buckets["hyperliquid"]["ETH"]) == {"1m", "5m", "15m", "1h", "4h", "24h"}
+    assert set(engine.venue_buckets["hyperliquid"]["ETH"]) == {"1m", "5m", "15m"}
     assert engine.get_venue_snapshot("ETH", "1m", "hyperliquid") is not None
     assert engine.get_venue_snapshot("ETH", "1m", "binance") is not None
     assert engine.venue_last_trade_at("ETH", "hyperliquid") == 0.0

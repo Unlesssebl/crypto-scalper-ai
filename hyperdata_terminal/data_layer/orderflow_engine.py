@@ -38,6 +38,10 @@ CONNECT_GRACE_SECONDS = STALE_AFTER_SECONDS
 PARSE_ERROR_LOG_INTERVAL = 60.0
 
 VENUES = ("hyperliquid", "binance")
+# The screener only needs the short windows. Keeping a per-venue 24h deque
+# would triple the largest trade buffer for no consumer; longer windows stay
+# combined-only.
+VENUE_TIMEFRAMES = ("1m", "5m", "15m")
 
 # Hyperliquid closes a WebSocket (code 1006, no close frame, no error
 # message) when it receives a `trades` subscription for a coin that is not in
@@ -321,8 +325,8 @@ class OrderFlowEngine:
         self.venue_buckets: dict[str, dict[str, dict[str, TimeframeBucket]]] = {
             venue: {
                 sym: {
-                    tf: TimeframeBucket(sym, tf, secs)
-                    for tf, secs in self.timeframes.items()
+                    tf: TimeframeBucket(sym, tf, self.timeframes[tf])
+                    for tf in VENUE_TIMEFRAMES
                 }
                 for sym in self.symbols
             }
@@ -1224,7 +1228,7 @@ class OrderFlowEngine:
         self.recent_trades[symbol] = deque(maxlen=100)
         for venue in VENUES:
             self.venue_buckets[venue][symbol] = {
-                tf: TimeframeBucket(symbol, tf, secs)
-                for tf, secs in self.timeframes.items()
+                tf: TimeframeBucket(symbol, tf, self.timeframes[tf])
+                for tf in VENUE_TIMEFRAMES
             }
             self.recent_trades_by_venue[venue][symbol] = deque(maxlen=100)
