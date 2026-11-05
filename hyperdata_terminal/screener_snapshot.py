@@ -274,6 +274,39 @@ def build_context(hub, now: float | None = None) -> dict:
     return _context_block(hub, now if now is not None else time.time())
 
 
+def build_health(hub) -> dict:
+    """In-process equivalent of the ``/v1/health`` subset the TUI renders.
+
+    Keeps the same shape as ``RemoteHub.health_summary`` so both dashboard
+    entry points can use one renderer.
+    """
+    monitor = getattr(hub, "health", None)
+    result = monitor.latest() if monitor is not None else None
+    overall = (result or {}).get("overall")
+    status = getattr(hub, "status", None)
+    feeds = {
+        "liquidation_feed": getattr(status, "liquidation_feed", None),
+        "orderflow_engine": getattr(status, "orderflow_engine", None),
+        "orderbook_feed": getattr(status, "orderbook_feed", None),
+        "market_data": getattr(status, "market_data", None),
+        "hlp": getattr(status, "hlp_status", None),
+    }
+    venues = {}
+    orderflow = getattr(hub, "orderflow", None)
+    if orderflow is not None and hasattr(orderflow, "venue_freshness"):
+        try:
+            venues = orderflow.venue_freshness()
+        except Exception:
+            venues = {}
+    return {
+        "status": overall or getattr(status, "mode", None),
+        "overall": overall,
+        "feeds": {key: value for key, value in feeds.items() if value is not None},
+        "orderflow_venues": venues,
+        "failed_components": list(getattr(status, "failed_components", []) or []),
+    }
+
+
 async def _indicators(hub, symbol: str, window: str, now: float) -> tuple[dict | None, bool]:
     key = (symbol, window)
     cached = _CANDLE_CACHE.get(key)

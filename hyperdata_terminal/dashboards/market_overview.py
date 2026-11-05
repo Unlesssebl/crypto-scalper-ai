@@ -119,6 +119,7 @@ class MarketOverviewDashboard:
         asset_reader=None,
         signal_reader=None,
         context_reader=None,
+        health_reader=None,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -131,8 +132,13 @@ class MarketOverviewDashboard:
         # basis, IV, liquidations, whales, extreme funding). Kept as a reader
         # so the same widget serves the in-process hub and the remote screener.
         self.context_reader = context_reader
+        # Optional callable returning the /v1/health subset (status, feeds,
+        # per-venue orderflow). Rendered as a badge so the TUI never claims
+        # LIVE while a feed is partial/stale.
+        self.health_reader = health_reader
         self.assets: list[AssetInfo] = []
         self.context: dict = {}
+        self.health: dict = {}
         self.last_update: float = 0.0
         self.update_error: str | None = None
 
@@ -160,6 +166,28 @@ class MarketOverviewDashboard:
         )
         info_line.append("  |  ", style="dim white")
         info_line.append(f"Assets: {asset_count}", style="bold bright_yellow")
+
+        health = self.health or {}
+        overall = str(health.get("overall") or health.get("status") or "").lower()
+        if overall:
+            badge = {
+                "ok": ("✓ LIVE", "bold bright_green"),
+                "warn": ("⚠ PARTIAL", "bold yellow"),
+                "stale": ("⚠ STALE", "bold bright_red"),
+                "drift": ("⚠ DRIFT", "bold yellow"),
+                "fail": ("⚠ DEGRADED", "bold bright_red"),
+            }.get(overall, (f"● {overall.upper()}", "bold bright_white"))
+            info_line.append("  |  ", style="dim white")
+            info_line.append(badge[0], style=badge[1])
+        venues = health.get("orderflow_venues") or {}
+        if venues:
+            live = [venue for venue, info in venues.items()
+                    if (info or {}).get("status") == "ok"]
+            names = {"hyperliquid": "HL", "binance": "BN"}
+            flow = " + ".join(names.get(venue, venue.upper()) for venue in live) or "silent"
+            info_line.append("  |  Flow: ", style="dim bright_white")
+            info_line.append(flow, style="bright_white")
+
         info_line.append("  |  ", style="dim white")
         info_line.append(now_str, style="dim bright_white")
 
@@ -524,9 +552,18 @@ class MarketOverviewDashboard:
             # Context is supplementary: never let it break the market table.
             self.context = {}
 
+    def _refresh_health(self) -> None:
+        if self.health_reader is None:
+            return
+        try:
+            self.health = self.health_reader() or {}
+        except Exception:
+            self.health = {}
+
     async def update_data(self) -> None:
         """Fetch new data or generate mock data."""
         self._refresh_context()
+        self._refresh_health()
         if self.asset_reader is not None:
             self.assets = self.asset_reader()
             self.last_update = time.time()

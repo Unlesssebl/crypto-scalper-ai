@@ -114,3 +114,48 @@ async def test_remote_hub_get_candles_uses_native_series(monkeypatch) -> None:
     monkeypatch.setattr(hub, "_get", fake_get)
     candles = await hub.get_candles("btc", "5m", bars=36)
     assert candles == [{"timestamp": 1}]
+
+
+def test_remote_hub_tracks_orderflow_venue() -> None:
+    now = time.time()
+    hub = RemoteHub("http://127.0.0.1:8420")
+    hub._apply(_payload(now), _assets())
+    assert hub.orderflow.venue("BTC", "1m") == "hyperliquid"
+    assert hub.orderflow.venue("BTC", "5m") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_remote_hub_caches_health_summary(monkeypatch) -> None:
+    hub = RemoteHub("http://127.0.0.1:8420")
+
+    async def fake_get(path: str, **params):
+        assert path == "/v1/health"
+        return {
+            "status": "warn",
+            "data_health": {"overall": "warn"},
+            "feeds": {"orderflow_engine": "partial", "market_data": "connected"},
+            "orderflow_venues": {
+                "hyperliquid": {"status": "ok"},
+                "binance": {"status": "silent"},
+            },
+            "failed_components": [],
+        }
+
+    monkeypatch.setattr(hub, "_get", fake_get)
+    await hub._refresh_health()
+    health = hub.health_summary
+    assert health["overall"] == "warn"
+    assert health["feeds"]["orderflow_engine"] == "partial"
+    assert health["orderflow_venues"]["binance"]["status"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_remote_hub_health_failure_is_not_fatal(monkeypatch) -> None:
+    hub = RemoteHub("http://127.0.0.1:8420")
+
+    async def boom(path: str, **params):
+        raise RuntimeError("health down")
+
+    monkeypatch.setattr(hub, "_get", boom)
+    await hub._refresh_health()
+    assert hub.health_summary == {}

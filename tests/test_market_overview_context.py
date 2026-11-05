@@ -117,3 +117,39 @@ def test_build_context_is_safe_on_empty_hub():
     assert isinstance(context, dict)
     assert "as_of" in context
     assert "lsr" not in context and "basis" not in context and "iv" not in context
+
+
+def test_header_renders_health_badge_and_flow_label():
+    dashboard = MarketOverviewDashboard()
+    dashboard.assets = [_asset()]
+    dashboard.health = {
+        "overall": "warn",
+        "orderflow_venues": {
+            "hyperliquid": {"status": "ok"},
+            "binance": {"status": "silent"},
+        },
+    }
+    header = dashboard.build_header().plain
+    assert "⚠ PARTIAL" in header
+    assert "Flow: HL" in header
+    assert "BN" not in header
+
+
+def test_header_marks_live_when_health_is_ok():
+    dashboard = MarketOverviewDashboard()
+    dashboard.assets = [_asset()]
+    dashboard.health = {"overall": "ok", "orderflow_venues": {
+        "hyperliquid": {"status": "ok"}, "binance": {"status": "ok"}}}
+    header = dashboard.build_header().plain
+    assert "✓ LIVE" in header
+    assert "Flow: HL + BN" in header
+
+
+@pytest.mark.asyncio
+async def test_update_data_reads_health_reader():
+    dashboard = MarketOverviewDashboard(
+        asset_reader=lambda: [_asset()],
+        health_reader=lambda: {"overall": "ok"},
+    )
+    await dashboard.update_data()
+    assert dashboard.health["overall"] == "ok"

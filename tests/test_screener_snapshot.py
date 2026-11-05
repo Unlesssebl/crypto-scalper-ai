@@ -9,7 +9,7 @@ import pytest
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookLevel, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, ShardState, Trade
-from hyperdata_terminal.screener_snapshot import build_candles, build_snapshot
+from hyperdata_terminal.screener_snapshot import build_candles, build_health, build_snapshot
 
 
 def _trade(side: str, price: float, size: float, ts: float, symbol: str = "BTC") -> Trade:
@@ -229,6 +229,20 @@ async def test_snapshot_includes_market_context() -> None:
     assert context["liquidations"]["confirmed_count"] == 3
     assert context["whales"][0]["symbol"] == "BTC"
     assert context["extreme_funding"][0]["annualized_pct"] > 0
+
+
+def test_build_health_reports_feeds_and_venues() -> None:
+    hub = FakeHub()
+    hub.status = SimpleNamespace(
+        liquidation_feed="connected", orderflow_engine="partial",
+        orderbook_feed="connected", market_data="connected", hlp_status="connected",
+        failed_components=[], mode="live",
+    )
+    hub.health = SimpleNamespace(latest=lambda: {"overall": "warn"})
+    health = build_health(hub)
+    assert health["overall"] == "warn"
+    assert health["feeds"]["orderflow_engine"] == "partial"
+    assert set(health["orderflow_venues"]) == {"hyperliquid", "binance"}
 
 
 @ pytest.mark.asyncio

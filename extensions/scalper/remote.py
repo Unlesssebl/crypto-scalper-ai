@@ -44,9 +44,15 @@ class RemoteOrderFlow:
         self.buckets: dict[str, dict[str, RemoteBucket]] = {}
         self.recent_trades: dict[str, list[Trade]] = {}
         self._connected_at: dict[str, float] = {}
+        # Venue label per (symbol, window): "hyperliquid" when the snapshot is
+        # HL-only (the parity default), "combined" when it fell back to both.
+        self.venues: dict[str, dict[str, str]] = {}
 
     def hyperliquid_connected_at(self, symbol: str) -> float:
         return self._connected_at.get(symbol, 0.0)
+
+    def venue(self, symbol: str, timeframe: str) -> str:
+        return self.venues.get(symbol, {}).get(timeframe, "unknown")
 
     def get_snapshot(self, symbol: str, timeframe: str) -> CVDSnapshot:
         return self.buckets[symbol][timeframe].get_snapshot()
@@ -86,6 +92,8 @@ class RemoteHub:
         self._session: aiohttp.ClientSession | None = None
         self._books: dict[str, OrderBookSnapshot] = {}
         self._context: dict[str, dict] = {}
+        self._health: dict = {}
+        self._health_at = 0.0
         self._as_of = 0.0
         self._warnings: list[str] = []
         key = os.getenv("HYPERDATA_API_KEY", "").strip()
@@ -139,6 +147,27 @@ class RemoteHub:
         self._apply(payload, assets)
         self.ready = True
         self.last_error = None
+        await self._refresh_health()
+
+    async def _refresh_health(self, interval: float = 10.0) -> None:
+        """Cache `/v1/health` for the TUI badge (auxiliary, never fatal)."""
+        now = time.monotonic()
+        if self._health and now - self._health_at < interval:
+            return
+        try:
+            payload = await self._get("/v1/health")
+        except Exception as exc:
+            LOG.debug("Health fetch failed: %s", type(exc).__name__)
+            return
+        self._health_at = now
+        data_health = payload.get("data_health") or {}
+        self._health = {
+            "status": payload.get("status"),
+            "overall": data_health.get("overall") or payload.get("status"),
+            "feeds": payload.get("feeds") or {},
+            "orderflow_venues": payload.get("orderflow_venues") or {},
+            "failed_components": payload.get("failed_components") or [],
+        }
 
     async def get_candles(self, symbol: str, timeframe: str = "15m", bars: int = 100) -> list[dict]:
         payload = await self._get(
@@ -214,6 +243,7 @@ class RemoteHub:
         orderflow.buckets.clear()
         orderflow.recent_trades.clear()
         orderflow._connected_at.clear()
+        orderflow.venues.clear()
         books: dict[str, OrderBookSnapshot] = {}
         for row in payload.get("rows", []):
             symbol, window = row["symbol"], row["window"]
@@ -242,6 +272,7 @@ class RemoteHub:
                     ))
             orderflow.buckets.setdefault(symbol, {})[window] = RemoteBucket(snapshot, trades)
             orderflow.recent_trades[symbol] = trades
+            orderflow.venues.setdefault(symbol, {})[window] = flow.get("venue") or "combined"
             orderflow._connected_at[symbol] = float(flow.get("connected_at") or 0.0)
             book = row.get("book") or {}
             if (book.get("quality") not in (None, "unavailable")
@@ -279,3 +310,8 @@ class RemoteHub:
     def context(self) -> dict[str, dict]:
         """Market-wide context from `/v1/snapshot` (L/S, basis, IV, ...)."""
         return dict(self._context)
+
+    @property
+    def health_summary(self) -> dict:
+        """Cached `/v1/health` subset for the TUI badge."""
+        return dict(self._health)
