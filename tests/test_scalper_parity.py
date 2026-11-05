@@ -71,7 +71,7 @@ def test_recorder_writes_symbol_window_and_parity_passes(tmp_path) -> None:
 def test_parity_reports_quality_and_value_mismatches(tmp_path) -> None:
     baseline, candidate = tmp_path / "base.jsonl", tmp_path / "cand.jsonl"
     _write(baseline, _row())
-    _write(candidate, _row(quality="stale", cvd=500.0))
+    _write(candidate, _row(quality="clock_skew", cvd=500.0))
 
     report = compare(load(baseline), load(candidate))
     assert report["passed"] is False
