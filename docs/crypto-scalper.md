@@ -10,38 +10,46 @@
 .\start.ps1
 ```
 
-Скрипт сам подготовит окружение, установит пакет, скопирует `.env.example` в `.env` и запустит приложение. Откройте [панель Crypto Scalper](http://127.0.0.1:8420/scalper).
+Скрипт сам подготовит окружение, установит пакет, скопирует `.env.example` в `.env`, запустит нативный HyperData API на `8420` и внешний screener на `8421`. Откройте [панель Crypto Scalper](http://127.0.0.1:8421/scalper).
 
 На Linux и macOS используйте `./start.sh`.
 
-Если установлен [uv](https://docs.astral.sh/uv/), скрипт использует его: окружение и зависимости готовит uv, а не `pip`. Без uv всё работает через `.venv`.
+Если установлен [uv](https://docs.astral.sh/uv/), скрипт использует его: окружение и зависимости готовит uv, а не `pip`. Без uv всё работает через `.venv`. Логи нативного API пишутся в `.runtime/native.log`.
 
 ### Режимы
 
 | Команда | Что получится |
 |---|---|
-| `.\start.ps1` | Веб-панель на `http://127.0.0.1:8420/scalper` |
-| `.\start.ps1 --tui` | Веб-панель плюс Rich Market Overview в терминале |
-| `.\start.ps1 --demo` | Синтетические данные, отдельный журнал, без Gemini и Telegram |
-| `.\start.ps1 --port 8500` | Другой порт |
+| `.\start.ps1` | Native API `8420` + screener `8421` |
+| `.\start.ps1 --tui` | Плюс Rich Market Overview в терминале |
+| `.\start.ps1 --demo` | Синтетические данные, без Gemini и Telegram |
+| `.\start.ps1 --port 8500` | Другой порт screener |
+| `.\start.ps1 --api-port 8500` | Другой порт native API |
 | `.\start.ps1 --notify` | Telegram-уведомления, если заданы токен и chat id |
-| `.\start.ps1 --help` | Все флаги приложения |
+| `.\start.ps1 --legacy` | Старый `crypto-scalper` форк вместо новой связки |
+| `.\start.ps1 --help` | Все флаги лаунчера |
 
 Колонки 1M AI и 5M AI показывают итог сравнения и возраст принятого снимка.
 
 ### Вариант с uv
 
-Если uv установлен, можно запускать без скрипта:
+Если uv установлен, можно запускать supervisor напрямую:
+
+```powershell
+uv run python scripts/serve.py
+```
+
+Старый форк остаётся доступен отдельно:
 
 ```powershell
 uv run crypto-scalper
 ```
 
-Первый запуск создаст окружение; версии зависимостей зафиксированы в `uv.lock`. Флаги передаются так же: `uv run crypto-scalper --demo`, `uv run crypto-scalper --tui`.
+Первый запуск создаст окружение; версии зависимостей зафиксированы в `uv.lock`.
 
 ### Внешний screener на нативном API
 
-Вместо форка можно запускать нативный hub и отдельный screener:
+Архитектура по умолчанию — нативный hub и отдельный screener:
 
 ```powershell
 uv run hyperdata api --port 8420
@@ -87,6 +95,10 @@ OPENROUTER_MODEL=google/gemini-3.5-flash-lite
 `HYPERDATA_DATA_DIR` задаёт каталог состояния HyperData и журнала. По умолчанию на Windows это `%LOCALAPPDATA%\hyperdata`. Используйте один экземпляр приложения на журнал.
 
 ## Архитектура
+
+> Ниже описана архитектура legacy-режима `crypto-scalper`. Production-режим
+> (`hyperdata api` + `hyperdata-screener`) описан в
+> [native-migration.md](native-migration.md).
 
 - Штатные `HyperDataHub`, `MarketData`, `OrderFlowEngine`, `OrderBookEngine`, `DataStore`, REST/WebSocket API и Rich Market Overview работают в одном процессе. Обе панели читают один кэш. HTTP-интерфейс расширен маршрутами `/scalper`, `/v1/scalper?window=1m` и `/v1/scalper/{symbol}?window=5m`. Оригинальные CLI и MCP остались доступны как отдельные режимы upstream.
 - Screener берёт первые 20 Hyperliquid perpetual по штатной сортировке 24h USD volume. Список обновляется примерно каждые пять секунд. Подписки покрывают 30 контрактов с запасом на перестановку рейтинга и пересобираются, если в Top-20 попал неподписанный контракт. Пересборка ограничена одним разом в минуту. После неё окнам снова требуется прогрев. Цена, OI и funding берутся из Hyperliquid asset contexts. CVD, OFI, объём, число сделок и цены первой и последней сделки берутся из штатного окна Order Flow. Стакан берётся из штатного L2. Каждый показатель содержит источник, время последнего наблюдения, единицу и качество. Метки сделок берутся с биржи. Если сделка опережает часы компьютера более чем на пять секунд, окно помечается как `clock_skew`.
