@@ -171,6 +171,7 @@ def _align(baseline: list[dict], candidate: list[dict], tolerance: float = 2.5):
 def compare(baseline: list[dict], candidate: list[dict]) -> dict:
     pairs = _align(baseline, candidate)
     mismatches: list[dict] = []
+    by_field: dict[str, int] = {}
     compared = 0
     for left, right in pairs:
         base_rows, cand_rows = _rows(left), _rows(right)
@@ -182,22 +183,26 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
                 for field in fields:
                     lv, rv = _value(base_row, group, field), _value(cand_row, group, field)
                     if not _matches(field, lv, rv):
+                        name = f"{group}.{field}"
                         mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
-                                           "field": f"{group}.{field}",
-                                           "baseline": lv, "candidate": rv})
+                                           "field": name, "baseline": lv, "candidate": rv})
+                        by_field[name] = by_field.get(name, 0) + 1
                     lq, rq = _quality(base_row, group, field), _quality(cand_row, group, field)
                     if lq != rq:
+                        name = f"{group}.{field}.quality"
                         mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
-                                           "field": f"{group}.{field}.quality",
-                                           "baseline": lq, "candidate": rq})
+                                           "field": name, "baseline": lq, "candidate": rq})
+                        by_field[name] = by_field.get(name, 0) + 1
             ls, rs = _signal(base_row), _signal(cand_row)
             if ls != rs:
                 mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                    "field": "signal", "baseline": ls, "candidate": rs})
+                by_field["signal"] = by_field.get("signal", 0) + 1
             ld, rd = _direction(base_row), _direction(cand_row)
             if ld != rd:
                 mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                    "field": "direction", "baseline": ld, "candidate": rd})
+                by_field["direction"] = by_field.get("direction", 0) + 1
     return {
         "passed": not mismatches and bool(pairs),
         "baseline_records": len(baseline),
@@ -205,6 +210,7 @@ def compare(baseline: list[dict], candidate: list[dict]) -> dict:
         "aligned_scans": len(pairs),
         "rows_compared": compared,
         "mismatches": len(mismatches),
+        "by_field": dict(sorted(by_field.items(), key=lambda item: item[1], reverse=True)),
         "details": mismatches[:200],
     }
 
