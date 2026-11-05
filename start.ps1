@@ -1,6 +1,5 @@
 #!/usr/bin/env pwsh
-# Production launcher: native HyperData API + external screener.
-# Legacy fork mode: .\start.ps1 --legacy [old crypto-scalper flags]
+# Launcher: native HyperData API + external screener.
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -21,14 +20,12 @@ Starts the native HyperData API (8420) and the external screener (8421).
   --notify            enable Telegram delivery
   --journal PATH      screener SQLite journal
   --record PATH       append every scan to JSONL
-  --legacy            run the old crypto-scalper fork instead
   --help              this help
 
 Examples:
   .\start.ps1
   .\start.ps1 --demo
   .\start.ps1 --tui --notify
-  .\start.ps1 --legacy --port 8420
 "@
 }
 
@@ -81,7 +78,7 @@ if ($uv) {
         & $python.Command @($python.Prefix + @("-m", "venv", ".venv"))
         if ($LASTEXITCODE -ne 0) { throw "Could not create .venv" }
     }
-    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.scalper_web, apps.screener_web" 2>$null
+    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.screener_web" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Step "Installing dependencies (the first run can take a minute)"
         & $venvPython -m pip install --upgrade pip
@@ -98,19 +95,7 @@ if (-not (Test-Path $envFile)) {
     Write-Host "    Add GEMINI_API_KEY (or configure OpenRouter) to enable AI analysis."
 }
 
-$legacy = $args -contains "--legacy"
-if ($legacy) {
-    $forward = @($args | Where-Object { $_ -ne "--legacy" })
-    Write-Step "Starting legacy crypto-scalper"
-    if ($uv) {
-        & uv run crypto-scalper @forward
-    } else {
-        & $venvPython -m apps.scalper_web @forward
-    }
-    exit $LASTEXITCODE
-}
-
-# Keep the old --port spelling for the screener web port.
+# Keep the --port spelling for the screener web port.
 $serveArgs = @()
 for ($i = 0; $i -lt $args.Count; $i++) {
     if ($args[$i] -eq "--port") {

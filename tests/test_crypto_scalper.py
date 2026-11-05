@@ -4,9 +4,8 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from aiohttp import web
 
-from apps.scalper_web.__main__ import ScalperAPI
+from apps.screener_web.__main__ import build_app
 from extensions.scalper.activity import (
     active_anomalies,
     btc_context,
@@ -245,10 +244,8 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         assert [entry["status"] for entry in observations] == ["observed", "missed", "pending"]
         assert observations[0]["price"] == 15
 
-        api = ScalperAPI(hub, service, 0)
         from aiohttp.test_utils import TestClient, TestServer
-        app = web.Application()
-        api.add_routes(app)
+        app = build_app(hub, service)
         async with TestClient(TestServer(app)) as client:
             response = await client.get("/v1/scalper/kPEPE?window=5m")
             assert response.status == 200

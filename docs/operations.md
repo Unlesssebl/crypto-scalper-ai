@@ -18,8 +18,6 @@
 
 Linux/macOS: `./start.sh`.
 
-Старый форк: `.\start.ps1 --legacy` или `uv run crypto-scalper`.
-
 ## Порты и проверки
 
 | Что | Адрес |
@@ -100,9 +98,14 @@ uv sync                 # или: .\.venv\Scripts\python.exe -m pip install -e .
 
 ## Откат
 
-1. Остановить supervisor.
-2. Запустить `.\start.ps1 --legacy` — старый `crypto-scalper`.
-3. Тег `scalper-baseline` фиксирует состояние форка до миграции.
+Legacy-режим удалён из кода. Откат — через git:
+
+```powershell
+git switch --detach scalper-baseline   # состояние форка до миграции
+```
+
+Тег `scalper-baseline` фиксирует последнее состояние форка; текущая ветка —
+`crypto-scalper`. Перед переключением остановите supervisor.
 
 ## Безопасность
 

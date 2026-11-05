@@ -251,8 +251,7 @@ def with_senior_context(snapshot, candles):
 def with_market_context(snapshot, hub):
     """Attach the market-wide context (L/S, basis, IV, liquidations, whales) if
     the hub exposes it. `RemoteHub` carries ``/v1/snapshot``'s ``context`` block
-    directly; the in-process `ScalperHub` does not expose one (kept for parity),
-    so this is a no-op there."""
+    directly; a hub without one is a no-op."""
     context = getattr(hub, "context", None)
     if not context:
         return snapshot

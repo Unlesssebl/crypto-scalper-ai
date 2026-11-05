@@ -18,12 +18,12 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
-from apps.scalper_web.__main__ import analyst, terminal_signals
 from extensions.scalper.activity import active_anomalies
 from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, orderbook_details
 from extensions.scalper.parity import Recorder
 from extensions.scalper.remote import RemoteHub
+from extensions.scalper.runtime import analyst, terminal_signals
 from extensions.scalper.service import Screener
 from extensions.scalper.telegram import announce_online, listen_reports, run_digest
 from hyperdata_terminal.api_server import (
@@ -34,7 +34,7 @@ from hyperdata_terminal.api_server import (
 from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
 
 LOG = logging.getLogger(__name__)
-DASHBOARD = Path(__file__).resolve().parent.parent / "scalper_web" / "dashboard.html"
+DASHBOARD = Path(__file__).resolve().parent / "dashboard.html"
 
 
 def data_dir() -> Path:
@@ -91,7 +91,7 @@ async def screener(request: web.Request) -> web.Response:
         "gemini": "configured" if service.gemini.key else "disabled",
         "ai_provider": service.gemini.provider,
         "quality_report": service.quality_report,
-        "context": hub.context,
+        "context": getattr(hub, "context", {}),
         "rows": rows,
     })
 
@@ -103,7 +103,8 @@ async def detail(request: web.Request) -> web.Response:
     window = window_of(request)
     if (symbol, window) not in service.rows:
         raise web.HTTPNotFound()
-    book = await hub.fetch_orderbook(symbol)
+    fetch = getattr(hub, "fetch_orderbook", None)
+    book = await fetch(symbol) if fetch is not None else None
     return web.json_response({
         **service.rows[symbol, window],
         "book": asdict(book) if book else orderbook_details(hub, symbol),

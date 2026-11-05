@@ -59,7 +59,6 @@ Issues = "https://github.com/Co-Messi/HyperData-Terminal/issues"
 
 [project.scripts]
 hyperdata = "hyperdata_terminal.cli:main"
-crypto-scalper = "apps.scalper_web.__main__:main"
 hyperdata-screener = "apps.screener_web.__main__:main"
 # Regression/diagnostic tool: compare two JSONL screener recordings.
 hyperdata-parity = "extensions.scalper.parity:main"
@@ -70,10 +69,10 @@ hyperdata-terminal = "hyperdata_terminal.cli:main"
 version = { attr = "hyperdata_terminal.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["hyperdata_terminal*", "extensions.scalper*", "apps.scalper_web*", "apps.screener_web*"]
+include = ["hyperdata_terminal*", "extensions.scalper*", "apps.screener_web*"]
 
 [tool.setuptools.package-data]
-"apps.scalper_web" = ["dashboard.html"]
+"apps.screener_web" = ["dashboard.html"]
 
 [tool.ruff]
 line-length = 120

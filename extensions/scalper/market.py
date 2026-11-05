@@ -1,13 +1,6 @@
-"""Venue-scoped snapshots from the native HyperData hub."""
-import asyncio
-import logging
+"""Hub-agnostic snapshot helpers used by the screener."""
 import math
-import time
 from dataclasses import asdict
-
-from hyperdata_terminal.data_layer.hub import HyperDataHub
-from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
-from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
 
 from .activity import CANDLE_SOURCE, tape_baseline
 
@@ -20,87 +13,6 @@ MARKET_FIELDS = {
     "price": "USD mark", "volume_24h": "USD", "open_interest": "USD",
     "funding_rate": "fraction/hour",
 }
-LOG = logging.getLogger(__name__)
-
-
-class ScalperHub(HyperDataHub):
-    """Run the Hyperliquid components needed by Market Overview and the screener."""
-
-    # Parity runs need a stable subscription set: the native hub cannot rotate
-    # its orderflow shard plan, so a fork rebuild would reset every window and
-    # make the comparison meaningless. Opt-in via --fixed-universe.
-    fixed_universe = False
-
-    async def start(self):
-        if self._running:
-            return
-        self._running = True
-        self.status.started_at = time.time()
-        if self.demo:
-            self.status.mode = "demo"
-            await self._start_demo()
-            self._tasks.append(asyncio.create_task(self._market_refresh_loop(), name="demo-market"))
-            return
-        self.status.mode = "live"
-        self.status.market_data = "starting"
-        self.store.attach(self)
-        await self.alerts.start()
-        self._tasks.append(asyncio.create_task(self.refresh_market(), name="market-refresh"))
-        self._tasks.append(asyncio.create_task(self.prune_market_history(), name="market-prune"))
-
-    async def refresh_market(self):
-        last_rotation = float("-inf")
-        while self._running:
-            try:
-                await self.market.refresh()
-                assets = self.get_all_assets()
-                self.status.market_data = "connected" if self.market_age() <= 20 else "stale"
-                self.status.last_market_refresh = self.market.observed_at
-                self.status.tracked_assets = len(assets)
-                self.status.uptime_seconds = time.time() - self.status.started_at
-                self.status.orderflow_engine = "connected" if any(
-                    self.orderflow.hyperliquid_connected_at(asset.symbol) for asset in assets[:20]
-                ) else "connecting"
-                self.status.orderbook_feed = "connected" if not self.orderbook.is_stale() else "connecting"
-                top = {asset.symbol for asset in assets[:20]}
-                now = time.monotonic()
-                needs_symbols = not top <= set(self.orderflow.symbols)
-                needs_rotation = needs_symbols and now - last_rotation >= 60
-                if top and self.status.market_data == "connected" and (
-                    not self.orderflow.running or (needs_rotation and not self.fixed_universe)
-                ):
-                    await self.subscribe([asset.symbol for asset in assets[:30]])
-                    last_rotation = now
-            except Exception:
-                self.status.market_data = "error"
-                LOG.exception("Hyperliquid market update failed")
-            await asyncio.sleep(self.market_refresh_interval)
-
-    async def prune_market_history(self):
-        while self._running:
-            await asyncio.sleep(3600)
-            try:
-                await asyncio.to_thread(self.store.prune)
-            except Exception:
-                LOG.exception("HyperData market history pruning failed")
-
-    async def subscribe(self, symbols):
-        await self.orderflow.stop()
-        await self.orderbook.stop()
-        self.symbols = symbols
-        self.orderflow = OrderFlowEngine(symbols, include_binance=False)
-        self.orderflow.on_trade(self._handle_trade)
-        self.orderbook = OrderBookEngine(symbols)
-        await self.orderflow.start()
-        await self.orderbook.start()
-
-    def market_age(self):
-        if self.demo:
-            return time.time() - self.status.last_market_refresh
-        return time.monotonic() - self.market.last_update if self.market.last_update else math.inf
-
-    def market_timestamp(self):
-        return (self.status.last_market_refresh if self.demo else self.market.observed_at) or None
 
 
 def metric(value, source, updated_at, unit, quality="ok"):

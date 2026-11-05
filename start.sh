@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Production launcher: native HyperData API + external screener.
-# Legacy fork mode: ./start.sh --legacy [old crypto-scalper flags]
+# Launcher: native HyperData API + external screener.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -22,14 +21,12 @@ Starts the native HyperData API (8420) and the external screener (8421).
   --notify            enable Telegram delivery
   --journal PATH      screener SQLite journal
   --record PATH       append every scan to JSONL
-  --legacy            run the old crypto-scalper fork instead
   --help              this help
 
 Examples:
   ./start.sh
   ./start.sh --demo
   ./start.sh --tui --notify
-  ./start.sh --legacy --port 8420
 EOF
 }
 
@@ -50,11 +47,6 @@ find_python() {
     return 1
 }
 
-legacy=0
-for arg in "$@"; do
-    [ "$arg" = "--legacy" ] && legacy=1
-done
-
 if command -v uv >/dev/null 2>&1; then
     ok "Using $(uv --version)"
     RUNNER=(uv run python)
@@ -70,7 +62,7 @@ else
         step "Creating the virtual environment in .venv"
         "$PYTHON" -m venv .venv
     fi
-    if ! .venv/bin/python -c 'import hyperdata_terminal, extensions.scalper, apps.scalper_web, apps.screener_web' 2>/dev/null; then
+    if ! .venv/bin/python -c 'import hyperdata_terminal, extensions.scalper, apps.screener_web' 2>/dev/null; then
         step "Installing dependencies (the first run can take a minute)"
         .venv/bin/python -m pip install --upgrade pip
         .venv/bin/python -m pip install -e .
@@ -82,19 +74,6 @@ if [ ! -f .env ]; then
     cp .env.example .env
     warn "Created .env from .env.example."
     echo "    Add GEMINI_API_KEY (or configure OpenRouter) to enable AI analysis."
-fi
-
-if [ "$legacy" = 1 ]; then
-    forward=()
-    for arg in "$@"; do
-        [ "$arg" = "--legacy" ] || forward+=("$arg")
-    done
-    step "Starting legacy crypto-scalper"
-    if command -v uv >/dev/null 2>&1; then
-        exec uv run crypto-scalper "${forward[@]}"
-    else
-        exec .venv/bin/python -m apps.scalper_web "${forward[@]}"
-    fi
 fi
 
 serve_args=()

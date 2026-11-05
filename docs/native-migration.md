@@ -98,17 +98,19 @@ per-venue копии для `1m`, `5m`, `15m`; screener читает Hyperliquid
 
 ## Parity-прогон
 
-Оба приложения умеют писать по одной JSONL-строке на скан:
+Screener пишет по одной JSONL-строке на скан. Исторический shadow-прогон
+сравнивал запись форка с записью screener; после удаления legacy эталоном
+служит предыдущая запись screener (регрессия логики сигналов):
 
 ```powershell
-# эталон: фиксированный universe, иначе ротация Top-20 сбрасывает прогрев
-uv run crypto-scalper --port 8422 --fixed-universe --record baseline.jsonl
+# эталон: запись до изменения (или сохранённый артефакт shadow-прогона)
+uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --record baseline.jsonl
 
-# кандидат
-uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --record candidate.jsonl
+# кандидат: запись после изменения
+uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8422 --record candidate.jsonl
 
 # отчёт
-uv run python -m extensions.scalper.parity baseline.jsonl candidate.jsonl --report parity-report.json
+uv run hyperdata-parity baseline.jsonl candidate.jsonl --report parity-report.json
 ```
 
 `parity` выравнивает сканы по ближайшему времени (±2.5 с), пропускает
@@ -165,9 +167,11 @@ API. Это осознанный компромисс: горячее перер
    интервал скана ≤ 6 с.
 3. Проверить 24-часовой soak: нет `429`, нет необработанных исключений,
    рост RSS ≤ 50 МБ.
-4. После parity-недели удалить `ScalperHub` и `ScalperAPI`-наследник.
+
+Legacy-режим (`ScalperHub`, `ScalperAPI`, `apps/scalper_web`, `--legacy`)
+удалён — отдельного шага для этого больше не нужно.
 
 ## Откат
 
-До cutover: остановить `hyperdata-screener`, продолжить `crypto-scalper`.
-Тег `scalper-baseline` фиксирует состояние форка до миграции.
+Код откатывается через git: `git switch --detach scalper-baseline`.
+Тег `scalper-baseline` фиксирует последнее состояние форка до миграции.
