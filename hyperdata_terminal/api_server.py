@@ -445,6 +445,9 @@ class HyperDataAPI:
             ("GET", "/v1/orderbook/{symbol}", self.handle_orderbook),
             ("GET", "/v1/whales", self.handle_whales),
             ("GET", "/v1/positions/danger-zone", self.handle_danger_zone),
+            ("GET", "/v1/positions/heatmap", self.handle_heatmap),
+            ("GET", "/v1/hlp", self.handle_hlp),
+            ("GET", "/v1/smart-money", self.handle_smart_money),
             # Copy-trading endpoints removed from OSS build (derived trader intelligence)
             ("GET", "/v1/public/metrics", self.handle_public_metrics),
         ]
@@ -1145,6 +1148,77 @@ class HyperDataAPI:
             "as_of": self.hub.positions.as_of(positions),
             "scan_age_seconds": _serialize(self.hub.positions.scan_age_seconds()),
             "positions": [_serialize(p) for p in positions],
+        })
+
+    async def handle_heatmap(self, request: web.Request) -> web.Response:
+        """GET /v1/positions/heatmap — liquidation USD per price bucket."""
+        from hyperdata_terminal.dashboards.liquidation_heatmap import compute_heatmap_buckets
+
+        symbol = _resolve_symbol(self.hub, request.query.get("symbol", "BTC"))
+        buckets_n = _int_param(request, "buckets", 40, minimum=5, maximum=200)
+        range_pct = _float_param(request, "range_pct", 15.0, minimum=1.0, maximum=100.0)
+        price = self.hub.positions.market_prices.get(symbol) or 0.0
+        if not price:
+            asset = self.hub.market.assets.get(symbol)
+            price = getattr(asset, "mark_price", 0.0) or getattr(asset, "price", 0.0)
+        buckets = compute_heatmap_buckets(
+            list(self.hub.positions.positions), price,
+            symbol=symbol, n_buckets=buckets_n, range_pct=range_pct,
+        )
+        return web.json_response({
+            "symbol": symbol,
+            "price": price,
+            "range_pct": range_pct,
+            "scan_age_seconds": _serialize(self.hub.positions.scan_age_seconds()),
+            "buckets": [{
+                "price_low": b.price_low, "price_high": b.price_high, "mid": b.mid,
+                "long_usd": b.long_usd, "short_usd": b.short_usd,
+                "long_count": b.long_count, "short_count": b.short_count,
+            } for b in buckets],
+        })
+
+    async def handle_hlp(self, request: web.Request) -> web.Response:
+        """GET /v1/hlp — Hyperliquidity Provider vault state and positions."""
+        hlp = self.hub.hlp
+        stats = hlp.get_stats()
+        return web.json_response({
+            **stats,
+            "warmup": hlp.get_latest_snapshot() is None,
+            "positions": _serialize(hlp.get_top_positions(10)),
+            "absorptions": _serialize(hlp.get_liquidation_absorptions(60)[-10:]),
+            "absorbed_24h": len(hlp.get_liquidation_absorptions(1440)),
+        })
+
+    async def handle_smart_money(self, request: web.Request) -> web.Response:
+        """GET /v1/smart-money — aggregate wallet tiers and recent signals.
+
+        Wallet addresses are deliberately omitted: the payload exposes the
+        derived ranking only (rank, win rate, confidence, PnL), matching what
+        the dashboard shows.
+        """
+        def wallet(profile) -> dict:
+            return {
+                "rank": profile.rank, "tier": profile.tier,
+                "win_rate": profile.win_rate, "confidence": profile.confidence,
+                "realized_pnl": profile.total_realized_pnl,
+                "account_value": profile.account_value,
+                "active_symbols": list(profile.active_symbols)[:3],
+            }
+
+        def signal(item) -> dict:
+            return {
+                "timestamp": item.timestamp, "tier": item.tier, "action": item.action,
+                "symbol": item.symbol, "size_usd": item.size_usd,
+                "wallet_rank": item.wallet_rank, "wallet_win_rate": item.wallet_win_rate,
+                "signal_type": item.signal_type,
+                "wallet_confidence": getattr(item, "wallet_confidence", 0.0),
+            }
+
+        return web.json_response({
+            "stats": self.hub.smart_money.get_stats(),
+            "smart": [wallet(p) for p in self.hub.get_smart_money(5)],
+            "dumb": [wallet(p) for p in self.hub.get_dumb_money(3)],
+            "signals": [signal(s) for s in self.hub.get_smart_money_signals(8)],
         })
 
     # ── Public metrics ────────────────────────────────────────────
