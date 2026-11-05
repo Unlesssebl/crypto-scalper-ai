@@ -28,11 +28,12 @@ def _finite(value):
 
 
 def _market_age(hub, now: float) -> float:
+    # Demo data has no wall-clock observed_at; `last_update` is monotonic and
+    # must never be mixed with `time.time()`.
+    if getattr(hub, "demo", False):
+        return 0.0
     observed_at = getattr(hub.market, "observed_at", 0.0) or 0.0
-    if observed_at:
-        return max(0.0, now - observed_at)
-    last_update = getattr(hub.market, "last_update", 0.0) or 0.0
-    return float("inf") if not last_update else max(0.0, now - last_update)
+    return max(0.0, now - observed_at) if observed_at else float("inf")
 
 
 def _market_quality(hub, now: float, age: float) -> str:
@@ -220,11 +221,14 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
             cached = False
             if include_candles and not getattr(hub, "demo", False):
                 indicators, cached = await _indicators(hub, symbol, window, now)
+            flow_row = _flow_row(hub, symbol, window, now)
+            if flow_row["quality"] == "unavailable" and not getattr(hub, "demo", False):
+                warnings.append(f"{symbol}: no Hyperliquid orderflow subscription")
             rows.append({
                 "symbol": symbol,
                 "window": window,
                 "market": _market_row(asset, observed, age, market_quality),
-                "flow": _flow_row(hub, symbol, window, now),
+                "flow": flow_row,
                 "book": _book_row(hub, symbol, now),
                 "candles": _candle_row(hub, symbol, window, now, indicators, cached),
             })

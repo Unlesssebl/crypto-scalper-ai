@@ -89,6 +89,16 @@ def test_parity_accepts_flat_api_rows(tmp_path) -> None:
     assert report["passed"] is True
 
 
+def test_parity_aligns_scans_within_tolerance(tmp_path) -> None:
+    baseline, candidate = tmp_path / "base.jsonl", tmp_path / "cand.jsonl"
+    _write(baseline, _row(), as_of=1001.0)
+    _write(candidate, _row(), as_of=1003.0)
+
+    report = compare(load(baseline), load(candidate))
+    assert report["aligned_scans"] == 1
+    assert report["passed"] is True
+
+
 def test_parity_requires_aligned_scans(tmp_path) -> None:
     baseline, candidate = tmp_path / "base.jsonl", tmp_path / "cand.jsonl"
     _write(baseline, _row(), as_of=1000.0)

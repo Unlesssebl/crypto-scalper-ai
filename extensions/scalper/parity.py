@@ -80,10 +80,6 @@ def load(path: Path | str) -> list[dict]:
     return records
 
 
-def _bucket(as_of: float) -> int:
-    return int(round(as_of / 5.0) * 5)
-
-
 def _rows(record: dict) -> dict[tuple[str, str], dict]:
     rows = record.get("rows") or []
     if isinstance(rows, dict):
@@ -145,42 +141,68 @@ def _matches(name: str, left, right) -> bool:
     return left == right
 
 
+def _align(baseline: list[dict], candidate: list[dict], tolerance: float = 2.5):
+    """Greedy nearest-neighbour alignment of two scan series.
+
+    The fork and the external screener start independently, so their 5-second
+    scans land on different grids; rounding to a shared grid would misalign
+    half the scans. Match each baseline record to the closest unused candidate
+    within `tolerance` seconds instead.
+    """
+    base = sorted(baseline, key=lambda record: record["as_of"])
+    cand = sorted(candidate, key=lambda record: record["as_of"])
+    used: set[int] = set()
+    pairs: list[tuple[dict, dict]] = []
+    for left in base:
+        best: int | None = None
+        best_dt: float | None = None
+        for index, right in enumerate(cand):
+            if index in used:
+                continue
+            dt = abs(left["as_of"] - right["as_of"])
+            if dt <= tolerance and (best_dt is None or dt < best_dt):
+                best, best_dt = index, dt
+        if best is not None:
+            used.add(best)
+            pairs.append((left, cand[best]))
+    return pairs
+
+
 def compare(baseline: list[dict], candidate: list[dict]) -> dict:
-    base = {_bucket(record["as_of"]): record for record in baseline}
-    cand = {_bucket(record["as_of"]): record for record in candidate}
-    shared = sorted(base.keys() & cand.keys())
+    pairs = _align(baseline, candidate)
     mismatches: list[dict] = []
     compared = 0
-    for stamp in shared:
-        base_rows, cand_rows = _rows(base[stamp]), _rows(cand[stamp])
+    for left, right in pairs:
+        base_rows, cand_rows = _rows(left), _rows(right)
         for key in sorted(base_rows.keys() & cand_rows.keys()):
             compared += 1
-            left, right = base_rows[key], cand_rows[key]
+            base_row, cand_row = base_rows[key], cand_rows[key]
+            stamp = left["as_of"]
             for group, fields in GROUPS.items():
                 for field in fields:
-                    lv, rv = _value(left, group, field), _value(right, group, field)
+                    lv, rv = _value(base_row, group, field), _value(cand_row, group, field)
                     if not _matches(field, lv, rv):
                         mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                            "field": f"{group}.{field}",
                                            "baseline": lv, "candidate": rv})
-                    lq, rq = _quality(left, group, field), _quality(right, group, field)
+                    lq, rq = _quality(base_row, group, field), _quality(cand_row, group, field)
                     if lq != rq:
                         mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                            "field": f"{group}.{field}.quality",
                                            "baseline": lq, "candidate": rq})
-            ls, rs = _signal(left), _signal(right)
+            ls, rs = _signal(base_row), _signal(cand_row)
             if ls != rs:
                 mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                    "field": "signal", "baseline": ls, "candidate": rs})
-            ld, rd = _direction(left), _direction(right)
+            ld, rd = _direction(base_row), _direction(cand_row)
             if ld != rd:
                 mismatches.append({"as_of": stamp, "symbol": key[0], "window": key[1],
                                    "field": "direction", "baseline": ld, "candidate": rd})
     return {
-        "passed": not mismatches and bool(shared),
+        "passed": not mismatches and bool(pairs),
         "baseline_records": len(baseline),
         "candidate_records": len(candidate),
-        "aligned_scans": len(shared),
+        "aligned_scans": len(pairs),
         "rows_compared": compared,
         "mismatches": len(mismatches),
         "details": mismatches[:200],
