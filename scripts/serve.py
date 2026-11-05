@@ -44,9 +44,17 @@ def wait_for_health(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
+def _rotate(path: Path, max_bytes: int = 50 * 1024 * 1024) -> None:
+    if path.exists() and path.stat().st_size >= max_bytes:
+        backup = path.with_suffix(path.suffix + ".1")
+        backup.unlink(missing_ok=True)
+        path.rename(backup)
+
+
 def start_native(port: int, demo: bool) -> subprocess.Popen:
     RUNTIME.mkdir(parents=True, exist_ok=True)
     log_path = RUNTIME / "native.log"
+    _rotate(log_path)
     command = [sys.executable, "-m", "hyperdata_terminal.cli", "api", "--port", str(port)]
     if demo:
         command.append("--demo")
