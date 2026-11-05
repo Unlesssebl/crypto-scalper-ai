@@ -214,6 +214,44 @@ def test_ofi_bounds() -> None:
     assert bucket3.get_snapshot(now).ofi == 0.0
 
 
+def test_engine_venue_windows_are_separate() -> None:
+    engine = OrderFlowEngine(symbols=["BTC"])
+    now = time.time()
+
+    engine._process_trade(_make_trade("buy", 70000, 1.0, ts=now), venue="hyperliquid")
+    engine._process_trade(_make_trade("sell", 70000, 2.0, ts=now), venue="binance")
+
+    combined = engine.get_snapshot("BTC", "1m")
+    hl = engine.get_venue_snapshot("BTC", "1m", "hyperliquid", now)
+    bn = engine.get_venue_snapshot("BTC", "1m", "binance", now)
+
+    assert combined.trade_count == 2
+    assert hl is not None and hl.trade_count == 1
+    assert hl.buy_volume == 70000.0
+    assert hl.sell_volume == 0.0
+    assert bn is not None and bn.trade_count == 1
+    assert bn.buy_volume == 0.0
+    assert bn.sell_volume == 140000.0
+    assert engine.venue_last_trade_at("BTC", "hyperliquid") == now
+    assert len(engine.venue_recent_trades("BTC", "hyperliquid")) == 1
+
+
+def test_venue_windows_follow_add_symbol() -> None:
+    engine = OrderFlowEngine(symbols=["BTC"])
+    engine.add_symbol("ETH")
+
+    assert set(engine.venue_buckets["hyperliquid"]["ETH"]) == {"1m", "5m", "15m", "1h", "4h", "24h"}
+    assert engine.get_venue_snapshot("ETH", "1m", "hyperliquid") is not None
+    assert engine.get_venue_snapshot("ETH", "1m", "binance") is not None
+    assert engine.venue_last_trade_at("ETH", "hyperliquid") == 0.0
+
+
+def test_venue_snapshot_unknown_symbol_is_none() -> None:
+    engine = OrderFlowEngine(symbols=["BTC"])
+    assert engine.get_venue_snapshot("NOPE", "1m") is None
+    assert engine.get_all_venue_snapshots("NOPE") == {}
+
+
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_live_feed() -> None:

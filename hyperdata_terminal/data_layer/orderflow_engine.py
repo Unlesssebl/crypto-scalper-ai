@@ -309,6 +309,25 @@ class OrderFlowEngine:
             s: deque(maxlen=100) for s in self.symbols
         }
 
+        # Per-venue copies of the same windows. The combined buckets above stay
+        # the default (back-compat), while the screener reads only the
+        # Hyperliquid leg so a geoblocked/silent Binance feed cannot change the
+        # signal. venue -> symbol -> timeframe -> bucket.
+        self.venue_buckets: dict[str, dict[str, dict[str, TimeframeBucket]]] = {
+            venue: {
+                sym: {
+                    tf: TimeframeBucket(sym, tf, secs)
+                    for tf, secs in self.timeframes.items()
+                }
+                for sym in self.symbols
+            }
+            for venue in VENUES
+        }
+        self.recent_trades_by_venue: dict[str, dict[str, deque[Trade]]] = {
+            venue: {sym: deque(maxlen=100) for sym in self.symbols}
+            for venue in VENUES
+        }
+
         # Wall-clock time of the last PARSED TRADE from each venue (not the
         # last frame — an ack or an unparseable frame must not read as
         # liveness). 0.0 means "no trade received yet".
@@ -802,6 +821,30 @@ class OrderFlowEngine:
             "binance": self.cumulative_cvd_binance.get(symbol, 0.0),
         }
 
+    def get_venue_snapshot(
+        self, symbol: str, timeframe: str, venue: str = "hyperliquid",
+        now: float | None = None,
+    ) -> CVDSnapshot | None:
+        """One venue's window for *symbol*/*timeframe*, or None if unknown."""
+        bucket = self.venue_buckets.get(venue, {}).get(symbol, {}).get(timeframe)
+        return bucket.get_snapshot(now) if bucket else None
+
+    def get_all_venue_snapshots(
+        self, symbol: str, venue: str = "hyperliquid",
+    ) -> dict[str, CVDSnapshot]:
+        """All timeframe snapshots for one venue; empty when unknown."""
+        buckets = self.venue_buckets.get(venue, {}).get(symbol, {})
+        return {tf: bucket.get_snapshot() for tf, bucket in buckets.items()}
+
+    def venue_recent_trades(self, symbol: str, venue: str = "hyperliquid") -> tuple[Trade, ...]:
+        """Most recent trades for one venue (oldest first)."""
+        return tuple(self.recent_trades_by_venue.get(venue, {}).get(symbol, ()))
+
+    def venue_last_trade_at(self, symbol: str, venue: str = "hyperliquid") -> float:
+        """Exchange timestamp of the last trade from one venue, or 0.0."""
+        trades = self.recent_trades_by_venue.get(venue, {}).get(symbol)
+        return max((trade.timestamp for trade in trades), default=0.0) if trades else 0.0
+
     # -- internal: process a single trade -----------------------------------
 
     def _process_trade(self, trade: Trade, venue: str | None = None) -> None:
@@ -814,9 +857,16 @@ class OrderFlowEngine:
         if sym not in self.buckets:
             return
 
-        # Update every timeframe bucket for this symbol.
+        # Update every combined timeframe bucket for this symbol.
         for bucket in self.buckets[sym].values():
             bucket.add_trade(trade)
+
+        # Update the venue-scoped copies. venue=None (demo/synthetic trades)
+        # only updates the combined series, exactly as before.
+        if venue in self.venue_buckets:
+            for bucket in self.venue_buckets[venue][sym].values():
+                bucket.add_trade(trade)
+            self.recent_trades_by_venue[venue][sym].append(trade)
 
         # Update running cumulative CVD (combined + per-venue).
         delta = trade.size_usd if trade.side == "buy" else -trade.size_usd
@@ -1159,3 +1209,9 @@ class OrderFlowEngine:
         self.cumulative_cvd_hl[symbol] = 0.0
         self.cumulative_cvd_binance[symbol] = 0.0
         self.recent_trades[symbol] = deque(maxlen=100)
+        for venue in VENUES:
+            self.venue_buckets[venue][symbol] = {
+                tf: TimeframeBucket(symbol, tf, secs)
+                for tf, secs in self.timeframes.items()
+            }
+            self.recent_trades_by_venue[venue][symbol] = deque(maxlen=100)
