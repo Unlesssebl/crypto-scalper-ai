@@ -111,6 +111,7 @@ async def run(args):
     recorder = Recorder(args.record) if args.record else None
     try:
         hub = ScalperHub(demo=args.demo)
+        hub.fixed_universe = args.fixed_universe
     except BaseException:
         journal.close()
         if recorder is not None:
@@ -174,6 +175,8 @@ def main():
     parser.add_argument("--notify", action="store_true",
                         help="Enable Telegram delivery when token and chat id are set")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
+    parser.add_argument("--fixed-universe", action="store_true",
+                        help="keep the initial Top-30 subscriptions (stable parity runs)")
     args = parser.parse_args()
     if args.journal is None:
         args.journal = DATA_DIR / ("scalper-demo.sqlite" if args.demo else "scalper.sqlite")

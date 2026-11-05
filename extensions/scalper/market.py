@@ -26,6 +26,11 @@ LOG = logging.getLogger(__name__)
 class ScalperHub(HyperDataHub):
     """Run the Hyperliquid components needed by Market Overview and the screener."""
 
+    # Parity runs need a stable subscription set: the native hub cannot rotate
+    # its orderflow shard plan, so a fork rebuild would reset every window and
+    # make the comparison meaningless. Opt-in via --fixed-universe.
+    fixed_universe = False
+
     async def start(self):
         if self._running:
             return
@@ -62,7 +67,7 @@ class ScalperHub(HyperDataHub):
                 needs_symbols = not top <= set(self.orderflow.symbols)
                 needs_rotation = needs_symbols and now - last_rotation >= 60
                 if top and self.status.market_data == "connected" and (
-                    not self.orderflow.running or needs_rotation
+                    not self.orderflow.running or (needs_rotation and not self.fixed_universe)
                 ):
                     await self.subscribe([asset.symbol for asset in assets[:30]])
                     last_rotation = now
