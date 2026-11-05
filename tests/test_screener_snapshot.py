@@ -122,6 +122,42 @@ async def test_snapshot_warns_for_unlisted_symbol() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_and_candles_routes() -> None:
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hyperdata_terminal.api_server import HyperDataAPI
+
+    now = time.time()
+    hub = FakeHub(candles=_candles(now))
+    hub.orderflow._hl_shard_plan = [["BTC"]]
+    hub.orderflow._hl_shard_state[0] = ShardState(connected_at=now - 120)
+    hub.orderflow._process_trade(_trade("buy", 70000.0, 1.0, now), venue="hyperliquid")
+    hub.orderflow.venue_buckets["hyperliquid"]["BTC"]["1m"].first_trade_at = now - 60
+    api = HyperDataAPI(hub=hub)
+    app = web.Application()
+    app.router.add_get("/v1/snapshot", api.handle_snapshot)
+    app.router.add_get("/v1/candles", api.handle_candles)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/v1/snapshot?symbols=BTC&windows=1m&include_candles=0")
+        assert response.status == 200
+        body = await response.json()
+        assert body["rows"][0]["symbol"] == "BTC"
+        assert body["rows"][0]["flow"]["trade_count"] == 1
+
+        bad = await client.get("/v1/snapshot?windows=3m")
+        assert bad.status == 400
+
+        candles = await client.get("/v1/candles?symbols=BTC&interval=5m&bars=50")
+        assert candles.status == 200
+        assert len((await candles.json())["series"][0]["candles"]) == 50
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_candles_builder_returns_raw_series() -> None:
     now = time.time()
     hub = FakeHub(candles=_candles(now))
