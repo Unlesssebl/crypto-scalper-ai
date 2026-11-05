@@ -116,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--port", type=int, default=None, help="port to bind (default: --api-port, HYPERDATA_API_PORT or 8420)",
     )
+    api.add_argument("--demo", action="store_true", help="serve synthetic data (offline)")
 
     paper = sub.add_parser(
         "paper", help="paper trade strategies on live data",
@@ -139,10 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_api(port: int) -> int:
+async def _run_api(port: int, demo: bool = False) -> int:
     from hyperdata_terminal.data_layer.hub import HyperDataHub
 
-    hub = HyperDataHub(demo=False, api_port=port)
+    hub = HyperDataHub(demo=demo, api_port=port)
     await hub.start()
     if "api_server" in hub.status.failed_components:
         await hub.stop()
@@ -241,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
                     sys.exit(2)
             asyncio.run(run_single(args.dashboard, symbol=symbol, api_port=_api_port(args), boot=boot))
         elif command == "api":
-            sys.exit(asyncio.run(_run_api(args.port or _api_port(args) or 8420)))
+            sys.exit(asyncio.run(_run_api(args.port or _api_port(args) or 8420, demo=args.demo)))
         elif command == "paper":
             sys.exit(asyncio.run(_run_paper(args)))
         elif command == "verify":
