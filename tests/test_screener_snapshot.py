@@ -237,3 +237,26 @@ async def test_snapshot_context_is_empty_for_bare_hub() -> None:
     payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
                                    now=time.time(), include_candles=False)
     assert payload["context"] == {}
+
+
+@ pytest.mark.asyncio
+async def test_snapshot_warns_when_universe_drifts() -> None:
+    hub = FakeHub()  # orderflow subscribes only `BTC`
+    # Add a top-volume asset the orderflow engine does not know about.
+    hub.market = SimpleNamespace(
+        assets={"BTC": _asset("BTC"), "NEWCOIN": _asset("NEWCOIN", price=5.0)},
+        observed_fields={"BTC": {"price"}, "NEWCOIN": {"price"}},
+        observed_at=time.time(),
+        get_candles=hub._get_candles,
+    )
+    payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
+                                   now=time.time(), include_candles=False)
+    assert any("universe drifted" in warning for warning in payload["warnings"])
+
+
+@ pytest.mark.asyncio
+async def test_snapshot_no_drift_warning_when_subscribed() -> None:
+    hub = FakeHub()  # orderflow subscribes `BTC`; market only has `BTC`
+    payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
+                                   now=time.time(), include_candles=False)
+    assert not any("universe drifted" in warning for warning in payload["warnings"])

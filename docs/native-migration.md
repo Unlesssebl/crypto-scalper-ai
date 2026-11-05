@@ -138,6 +138,24 @@ flow/market/book-значения и сигналы. Код возврата `0`
 - внешний сервис `hyperdata-screener`;
 - запись сканов и parity-отчёт;
 - тесты на контракт, per-venue окна, адаптер, parity и сквозной путь.
+- рыночный контекст в `/v1/snapshot`: L/S, basis, IV, ликвидации, whales,
+  extreme funding (`context`-блок), доступен screener, AI и дашборду;
+- риск-аппетит-заметки (`market_risk_context`) в находках и уведомлениях;
+- периодический Telegram-дайджест рынка (`run_digest`, env
+  `HYPERDATA_DIGEST_SECONDS`, по умолчанию 900 с);
+- карточки риск-аппетита (L/S BTC, IV BTC, базис BTC, ликвидации) в
+  `dashboard.html`.
+- детект дрейфа universe: `/v1/snapshot` сообщает в `warnings`, если
+  top-volume-активы не имеют orderflow-подписки (`universe drifted`).
+
+## Universe: ротация и рестарт
+
+Orderflow shard plan фиксируется на `start()` (см. `OrderFlowEngine.add_symbol`),
+поэтому **новый листинг внутри сессии подхватится только рестартом** native
+API. Это осознанный компромисс: горячее переразбиение шардов сбрасывает все
+окна и ломает parity. Сейчас `/v1/snapshot` явно предупреждает о дрейфе
+(`universe drifted: ... (restart to pick them up)`), чтобы оператор видел
+проблему сразу, а не через молчащий CVD.
 
 ## Что осталось до cutover
 
@@ -147,9 +165,7 @@ flow/market/book-значения и сигналы. Код возврата `0`
    интервал скана ≤ 6 с.
 3. Проверить 24-часовой soak: нет `429`, нет необработанных исключений,
    рост RSS ≤ 50 МБ.
-4. Отдельным этапом добавить контекст: ликвидации, whales, HLP, funding,
-   L/S, basis, IV.
-5. После parity-недели удалить `ScalperHub` и `ScalperAPI`-наследник.
+4. После parity-недели удалить `ScalperHub` и `ScalperAPI`-наследник.
 
 ## Откат
 
