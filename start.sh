@@ -19,7 +19,7 @@ Starts the native HyperData API (8420) and the external screener (8421).
   --port N            screener web port (default 8421)
   --tui               also show the Rich Market Overview
   --tui-page NAME     auto|all|market|risk|vault (default: auto)
-  --tui-rotate N      seconds between rotated TUI pages (default: 10)
+  --tui-rotate N      seconds between rotated pages (default: 0 = keys only)
   --notify            enable Telegram delivery
   --journal PATH      screener SQLite journal
   --record PATH       append every scan to JSONL

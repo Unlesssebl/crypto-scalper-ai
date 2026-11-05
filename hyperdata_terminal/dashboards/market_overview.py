@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from hyperdata_terminal.dashboards.keys import KeyPager
 from hyperdata_terminal.dashboards.native_panels import (
     danger_zone_panel,
     heatmap_panel,
@@ -137,7 +138,7 @@ class MarketOverviewDashboard:
         health_reader=None,
         extra_reader=None,
         page: str = "auto",
-        rotate_seconds: float = 10.0,
+        rotate_seconds: float = 0.0,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -162,7 +163,11 @@ class MarketOverviewDashboard:
         # are split into two fitted pages that rotate. "all" pins the tall
         # single-page layout; "market"/"risk" pin one page.
         self.page = page if page in ("auto", "all", "market", "risk", "vault") else "auto"
-        self.rotate_seconds = max(3.0, rotate_seconds)
+        # 0 disables rotation: the operator switches pages with keys instead
+        # of waiting for a timer.
+        self.rotate_seconds = max(0.0, rotate_seconds)
+        self._pager: KeyPager | None = None
+        self._stop_requested = False
         self.assets: list[AssetInfo] = []
         self.context: dict = {}
         self.health: dict = {}
@@ -518,13 +523,38 @@ class MarketOverviewDashboard:
             rows.append(grid)
         return rows
 
+    PAGE_ORDER = ("market", "risk", "vault", "all")
+    PAGE_KEYS = {
+        "1": "market", "m": "market",
+        "2": "risk", "r": "risk",
+        "3": "vault", "v": "vault",
+        "4": "all", "a": "all",
+        "0": "auto",
+    }
+
     def _current_page(self, height: int) -> str:
-        if self.page in ("all", "market", "risk", "vault"):
+        if self.page in self.PAGE_ORDER:
             return self.page
         if height >= 75:
             return "all"
+        if self.rotate_seconds <= 0:
+            return "market"
         slot = int(time.time() / self.rotate_seconds) % 3
         return ("market", "risk", "vault")[slot]
+
+    def handle_key(self, char: str) -> None:
+        """Switch pages from the keyboard (called by KeyPager)."""
+        char = (char or "").lower()
+        if char == "\x03":
+            self._stop_requested = True
+            return
+        if char in self.PAGE_KEYS:
+            self.page = self.PAGE_KEYS[char]
+            return
+        if char in ("\t", "n", " "):
+            current = self._current_page(self.console.size.height or 50)
+            index = self.PAGE_ORDER.index(current) if current in self.PAGE_ORDER else 0
+            self.page = self.PAGE_ORDER[(index + 1) % len(self.PAGE_ORDER)]
 
     def build_dashboard(self) -> Panel:
         """Compose the dashboard, sized to the terminal (no scrolling)."""
@@ -617,7 +647,7 @@ class MarketOverviewDashboard:
         return Panel(
             content,
             title="[bold bright_magenta]\U0001f4ca HYPERDATA \u2014 MARKET OVERVIEW \U0001f4ca[/]",
-            subtitle="[dim bright_white]Ctrl+C to exit[/]",
+            subtitle="[dim bright_white]1 market · 2 risk · 3 vault · 4 all · Tab next · Ctrl+C exit[/]",
             border_style="bright_magenta",
             box=box.DOUBLE_EDGE,
             padding=(1, 2),
@@ -734,23 +764,30 @@ class MarketOverviewDashboard:
     # -- Main loop ------------------------------------------------------------
 
     async def run(self) -> None:
-        """Main loop: refresh market data and update display."""
+        """Main loop: refresh market data, react to page keys, update display."""
         self.console.clear()
-        with Live(
-            self.build_dashboard(),
-            console=self.console,
-            refresh_per_second=2,
-            screen=True,
-            vertical_overflow="crop",
-        ) as live:
-            try:
-                while True:
-                    self.cycle += 1
-                    await self.update_data()
-                    live.update(self.build_dashboard())
-                    await asyncio.sleep(self.refresh_rate)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
+        self._pager = KeyPager(self.handle_key)
+        self._pager.start()
+        try:
+            with Live(
+                self.build_dashboard(),
+                console=self.console,
+                refresh_per_second=4,
+                screen=True,
+                vertical_overflow="crop",
+            ) as live:
+                try:
+                    while not self._stop_requested:
+                        self.cycle += 1
+                        await self.update_data()
+                        live.update(self.build_dashboard())
+                        await asyncio.sleep(self.refresh_rate)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    pass
+        finally:
+            if self._pager is not None:
+                self._pager.stop()
+                self._pager = None
 
 
 # -- CLI entrypoint ---------------------------------------------------------

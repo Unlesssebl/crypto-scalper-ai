@@ -179,7 +179,42 @@ def test_pinned_pages_and_all_threshold():
     assert MarketOverviewDashboard(page="vault")._current_page(40) == "vault"
     auto = MarketOverviewDashboard(page="auto")
     assert auto._current_page(80) == "all"
-    assert auto._current_page(40) in {"market", "risk", "vault"}
+    # Rotation is off by default, so auto stays on MARKET.
+    assert auto._current_page(40) == "market"
+
+
+def test_handle_key_switches_pages():
+    dashboard = MarketOverviewDashboard()
+    assert dashboard.rotate_seconds == 0.0
+    dashboard.handle_key("2")
+    assert dashboard.page == "risk"
+    dashboard.handle_key("3")
+    assert dashboard.page == "vault"
+    dashboard.handle_key("4")
+    assert dashboard.page == "all"
+    dashboard.handle_key("m")
+    assert dashboard.page == "market"
+    dashboard.handle_key("\t")
+    assert dashboard.page == "risk"
+    dashboard.handle_key("0")
+    assert dashboard.page == "auto"
+
+
+def test_key_pager_is_inert_without_tty(monkeypatch):
+    import sys
+
+    from hyperdata_terminal.dashboards.keys import KeyPager
+
+    class _NotATty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NotATty())
+    seen: list[str] = []
+    pager = KeyPager(seen.append)
+    assert pager.start() is False
+    pager.stop()
+    assert seen == []
 
 
 def test_compact_header_shows_page_label():

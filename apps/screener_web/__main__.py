@@ -269,8 +269,8 @@ def main() -> None:
                         default=os.getenv("HYPERDATA_TUI_PAGE", "auto"),
                         help="TUI layout: auto (rotate fitted pages on short terminals), "
                              "all, market, risk or vault")
-    parser.add_argument("--tui-rotate", type=float, default=10.0,
-                        help="seconds between rotated TUI pages (default: 10)")
+    parser.add_argument("--tui-rotate", type=float, default=0.0,
+                        help="seconds between rotated TUI pages (default: 0 = manual keys)")
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()
