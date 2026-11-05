@@ -88,8 +88,8 @@ per-venue копии для `1m`, `5m`, `15m`; screener читает Hyperliquid
 Оба приложения умеют писать по одной JSONL-строке на скан:
 
 ```powershell
-# эталон
-uv run crypto-scalper --port 8422 --record baseline.jsonl
+# эталон: фиксированный universe, иначе ротация Top-20 сбрасывает прогрев
+uv run crypto-scalper --port 8422 --fixed-universe --record baseline.jsonl
 
 # кандидат
 uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --record candidate.jsonl
@@ -98,24 +98,36 @@ uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --record c
 uv run python -m extensions.scalper.parity baseline.jsonl candidate.jsonl --report parity-report.json
 ```
 
-`parity` сравнивает quality-метки, flow/market/book-значения и сигналы,
-выравнивая сканы по 5-секундным окнам. Код возврата `0` — паритет, `1` — есть
+`parity` выравнивает сканы по ближайшему времени (±2.5 с), пропускает
+`warming_up`/`stale` как переходные состояния и сравнивает quality-метки,
+flow/market/book-значения и сигналы. Код возврата `0` — паритет, `1` — есть
 расхождения.
+
+Пороговые значения (эмпирические, после live-shadow):
+
+- core (`flow.*`, `signal`, `direction`) — не более **1%** строк;
+- secondary (`market.*`, `book.*`, `candles.*`) — не более **15%** строк.
+
+Причина: два независимых live-фида не могут совпасть тик-в-тик. Первый
+короткий shadow (16 сканов, 600 строк) дал core 0.67% и secondary 9.3% —
+паритет пройден. Это не заменяет 24-часовой прогон.
 
 ## Что уже реализовано
 
 - per-venue окна в `OrderFlowEngine` (Hyperliquid / Binance / combined);
 - `/v1/snapshot` и `/v1/candles` с quality-метками;
 - `hyperdata api --demo`;
+- prefetch Top-60 по объёму до старта API (orderflow и orderbook);
+- регистронезависимые тикеры (`kPEPE`, `kSHIB`, ...);
 - `RemoteHub` — адаптер нативного API под интерфейс `HyperDataHub`;
 - внешний сервис `hyperdata-screener`;
 - запись сканов и parity-отчёт;
-- тесты на контракт, per-venue окна, адаптер и parity.
+- тесты на контракт, per-venue окна, адаптер, parity и сквозной путь.
 
 ## Что осталось до cutover
 
-1. Прогнать shadow 24 часа на live и добиться `parity-report.json` без расхождений
-   два дня подряд.
+1. Прогнать shadow 24 часа на live и добиться core ≤ 1% / secondary ≤ 15%
+   в `parity-report.json` два дня подряд.
 2. Проверить latency: p95 `/v1/snapshot?include_candles=0` ≤ 200 мс,
    интервал скана ≤ 6 с.
 3. Проверить 24-часовой soak: нет `429`, нет необработанных исключений,

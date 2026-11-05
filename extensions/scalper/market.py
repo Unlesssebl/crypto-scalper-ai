@@ -5,11 +5,11 @@ import math
 import time
 from dataclasses import asdict
 
-from .activity import CANDLE_SOURCE, tape_baseline
-
 from hyperdata_terminal.data_layer.hub import HyperDataHub
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
+
+from .activity import CANDLE_SOURCE, tape_baseline
 
 WINDOWS = {"1m": 60, "5m": 300}
 DIRECTIONS = {
