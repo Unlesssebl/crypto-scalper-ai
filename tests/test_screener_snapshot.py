@@ -12,34 +12,36 @@ from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, Shar
 from hyperdata_terminal.screener_snapshot import build_candles, build_snapshot
 
 
-def _trade(side: str, price: float, size: float, ts: float) -> Trade:
-    return Trade(timestamp=ts, symbol="BTC", side=side, price=price, size=size, size_usd=price * size)
+def _trade(side: str, price: float, size: float, ts: float, symbol: str = "BTC") -> Trade:
+    return Trade(timestamp=ts, symbol=symbol, side=side, price=price, size=size, size_usd=price * size)
 
 
-def _asset() -> AssetInfo:
+def _asset(symbol: str = "BTC", price: float = 70000.0) -> AssetInfo:
     return AssetInfo(
-        symbol="BTC", price=70000.0, funding_rate=0.00001,
+        symbol=symbol, price=price, funding_rate=0.00001,
         open_interest=1_000_000.0, volume_24h=5_000_000.0,
-        price_change_24h_pct=0.01, mark_price=70000.0, index_price=69990.0,
+        price_change_24h_pct=0.01, mark_price=price, index_price=price * 0.999,
     )
 
 
 class FakeHub:
-    def __init__(self, *, demo: bool = False, candles: list[dict] | None = None) -> None:
+    def __init__(self, *, demo: bool = False, candles: list[dict] | None = None,
+                 symbol: str = "BTC", price: float = 70000.0) -> None:
         self.demo = demo
-        self.orderflow = OrderFlowEngine(symbols=["BTC"])
+        self.symbol = symbol
+        self.orderflow = OrderFlowEngine(symbols=[symbol])
         self.market = SimpleNamespace(
-            assets={"BTC": _asset()},
-            observed_fields={"BTC": {"price", "volume_24h", "open_interest", "funding_rate"}},
+            assets={symbol: _asset(symbol, price)},
+            observed_fields={symbol: {"price", "volume_24h", "open_interest", "funding_rate"}},
             observed_at=time.time(),
             get_candles=self._get_candles,
         )
         self._candles = candles or []
         self.book = OrderBookSnapshot(
-            timestamp=time.time(), symbol="BTC",
-            bids=[OrderBookLevel(price=69999.0, size=1.0)],
-            asks=[OrderBookLevel(price=70001.0, size=1.0)],
-            imbalance=0.1, best_bid=69999.0, best_ask=70001.0, spread=2.0,
+            timestamp=time.time(), symbol=symbol,
+            bids=[OrderBookLevel(price=price - 1, size=1.0)],
+            asks=[OrderBookLevel(price=price + 1, size=1.0)],
+            imbalance=0.1, best_bid=price - 1, best_ask=price + 1, spread=2.0,
         )
 
     async def _get_candles(self, symbol: str, interval: str, bars: int = 100) -> list[dict]:
@@ -49,7 +51,7 @@ class FakeHub:
         return list(self.market.assets.values())
 
     def get_orderbook(self, symbol: str):
-        return self.book if symbol == "BTC" else None
+        return self.book if symbol == self.symbol else None
 
 
 def _candles(now: float, count: int = 50) -> list[dict]:
@@ -119,6 +121,28 @@ async def test_snapshot_warns_for_unlisted_symbol() -> None:
     payload = await build_snapshot(hub, symbols=["NOPE"], windows=["1m"], include_candles=False)
     assert payload["rows"] == []
     assert any("NOPE" in warning for warning in payload["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_snapshot_resolves_mixed_case_ticker() -> None:
+    now = time.time()
+    hub = FakeHub(symbol="kPEPE", price=0.0123)
+    hub.orderflow._hl_shard_plan = [["kPEPE"]]
+    hub.orderflow._hl_shard_state[0] = ShardState(connected_at=now - 120)
+    hub.orderflow._process_trade(_trade("buy", 0.0123, 1000.0, now, symbol="kPEPE"), venue="hyperliquid")
+    hub.orderflow.venue_buckets["hyperliquid"]["kPEPE"]["1m"].first_trade_at = now - 60
+
+    payload = await build_snapshot(hub, symbols=["kpepe"], windows=["1m"], now=now, include_candles=False)
+    assert payload["rows"][0]["symbol"] == "kPEPE"
+    assert payload["rows"][0]["market"]["price"] == 0.0123
+
+
+@pytest.mark.asyncio
+async def test_candles_resolve_mixed_case_ticker() -> None:
+    now = time.time()
+    hub = FakeHub(symbol="kPEPE", candles=_candles(now))
+    payload = await build_candles(hub, ["KPEPE"], interval="5m", bars=50)
+    assert payload["series"][0]["symbol"] == "kPEPE"
 
 
 @pytest.mark.asyncio

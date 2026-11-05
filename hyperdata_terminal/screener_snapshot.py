@@ -192,14 +192,16 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
         raise ValueError(f"unsupported windows: {', '.join(invalid)}")
 
     assets = hub.get_all_assets()
-    by_symbol = {asset.symbol: asset for asset in assets}
+    # Hyperliquid has mixed-case tickers (kPEPE, kSHIB, ...). Match requests
+    # case-insensitively but always use the exchange's own spelling downstream.
+    by_symbol = {asset.symbol.upper(): asset for asset in assets}
     if symbols is None:
-        symbols = [asset.symbol for asset in assets[:_MAX_SYMBOLS]]
+        requested = [asset.symbol for asset in assets[:_MAX_SYMBOLS]]
     else:
-        symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
-        if not symbols:
+        requested = [symbol.strip() for symbol in symbols if symbol.strip()]
+        if not requested:
             raise ValueError("symbols must not be empty")
-        if len(symbols) > _MAX_SYMBOLS:
+        if len(requested) > _MAX_SYMBOLS:
             raise ValueError(f"at most {_MAX_SYMBOLS} symbols per request")
 
     age = _market_age(hub, now)
@@ -209,11 +211,12 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
         warnings.append("market data not loaded yet (first ~5s)")
 
     rows = []
-    for symbol in symbols:
-        asset = by_symbol.get(symbol)
+    for requested_symbol in requested:
+        asset = by_symbol.get(requested_symbol.upper())
         if asset is None:
-            warnings.append(f"{symbol}: not listed on Hyperliquid")
+            warnings.append(f"{requested_symbol}: not listed on Hyperliquid")
             continue
+        symbol = asset.symbol
         observed = (MARKET_FIELDS if getattr(hub, "demo", False)
                     else getattr(hub.market, "observed_fields", {}).get(symbol, set()))
         for window in windows:
@@ -255,8 +258,10 @@ async def build_candles(hub, symbols: list[str], interval: str = "5m",
         raise ValueError("bars must be between 2 and 500")
     if not symbols:
         raise ValueError("symbols must not be empty")
+    by_symbol = {asset.symbol.upper(): asset.symbol for asset in hub.get_all_assets()}
     result = []
     for symbol in symbols:
-        candles = await hub.market.get_candles(symbol, interval, bars=bars)
-        result.append({"symbol": symbol, "interval": interval, "candles": candles})
+        resolved = by_symbol.get(symbol.upper(), symbol)
+        candles = await hub.market.get_candles(resolved, interval, bars=bars)
+        result.append({"symbol": resolved, "interval": interval, "candles": candles})
     return {"as_of": time.time(), "series": result}

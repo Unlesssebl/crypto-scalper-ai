@@ -78,6 +78,22 @@ RATE_LIMIT_REQUESTS = 300
 RATE_LIMIT_WINDOW_S = 60.0
 
 
+def _resolve_symbol(hub, raw: str) -> str:
+    """Match a request symbol case-insensitively to the exchange's spelling.
+
+    Hyperliquid lists mixed-case tickers (kPEPE, kSHIB, ...); forcing .upper()
+    made those endpoints return 404.
+    """
+    assets = getattr(getattr(hub, "market", None), "assets", {})
+    if raw in assets:
+        return raw
+    upper = raw.upper()
+    for symbol in assets:
+        if symbol.upper() == upper:
+            return symbol
+    return raw
+
+
 def _is_loopback_host(host: str) -> bool:
     """True if the bind host is loopback-only ('localhost', 127.x, ::1)."""
     if host in ("localhost",):
@@ -914,14 +930,14 @@ class HyperDataAPI:
         })
 
     async def handle_market_symbol(self, request: web.Request) -> web.Response:
-        sym = request.match_info["symbol"].upper()
+        sym = _resolve_symbol(self.hub, request.match_info["symbol"])
         asset = self.hub.market.assets.get(sym)
         if not asset:
             return web.json_response({"error": f"Unknown symbol: {sym}"}, status=404)
         return web.json_response(_serialize(asset))
 
     async def handle_orderflow(self, request: web.Request) -> web.Response:
-        sym = request.match_info["symbol"].upper()
+        sym = _resolve_symbol(self.hub, request.match_info["symbol"])
         try:
             snapshots = self.hub.orderflow.get_all_snapshots(sym)
         except KeyError:
@@ -990,7 +1006,7 @@ class HyperDataAPI:
 
     async def handle_candles(self, request: web.Request) -> web.Response:
         raw_symbols = request.query.get("symbols", "")
-        symbols = [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
+        symbols = [symbol.strip() for symbol in raw_symbols.split(",") if symbol.strip()]
         if not symbols:
             raise web.HTTPBadRequest(text="symbols is required")
         interval = request.query.get("interval", "5m")
@@ -1039,7 +1055,7 @@ class HyperDataAPI:
         return web.json_response(result)
 
     async def handle_funding_symbol(self, request: web.Request) -> web.Response:
-        sym = request.match_info["symbol"].upper()
+        sym = _resolve_symbol(self.hub, request.match_info["symbol"])
         rates = {}
         asset = self.hub.market.assets.get(sym)
         if asset:
@@ -1092,7 +1108,7 @@ class HyperDataAPI:
         return web.json_response(data)
 
     async def handle_orderbook(self, request: web.Request) -> web.Response:
-        sym = request.match_info["symbol"].upper()
+        sym = _resolve_symbol(self.hub, request.match_info["symbol"])
         snap = self.hub.get_orderbook(sym)
         if not snap:
             return web.json_response({"error": f"No orderbook for {sym}"}, status=404)
