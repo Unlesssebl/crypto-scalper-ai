@@ -118,17 +118,22 @@ class RemoteHub:
             return await response.json()
 
     async def refresh_snapshot(self) -> None:
-        market = await self._get("/v1/market", limit=20)
-        assets = market.get("assets", [])[:20]
-        symbols = [asset["symbol"] for asset in assets]
-        if not symbols:
-            raise RuntimeError("native API returned no market assets")
-        payload = await self._get(
-            "/v1/snapshot",
-            symbols=",".join(symbols),
-            windows="1m,5m",
-            include_candles="0",
-        )
+        try:
+            market = await self._get("/v1/market", limit=20)
+            assets = market.get("assets", [])[:20]
+            symbols = [asset["symbol"] for asset in assets]
+            if not symbols:
+                raise RuntimeError("native API returned no market assets")
+            payload = await self._get(
+                "/v1/snapshot",
+                symbols=",".join(symbols),
+                windows="1m,5m",
+                include_candles="0",
+            )
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.status.market_data = "error"
+            raise
         self._apply(payload, assets)
         self.ready = True
         self.last_error = None
