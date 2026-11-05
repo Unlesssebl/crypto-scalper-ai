@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import random
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,13 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from hyperdata_terminal.dashboards.native_panels import (
+    danger_zone_panel,
+    liquidations_panel,
+    orderflow_panel,
+    whales_panel,
+)
 
 # ---------------------------------------------------------------------------
 # Resolve project root so imports work when run as a script
@@ -120,6 +128,7 @@ class MarketOverviewDashboard:
         signal_reader=None,
         context_reader=None,
         health_reader=None,
+        extra_reader=None,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -136,9 +145,14 @@ class MarketOverviewDashboard:
         # per-venue orderflow). Rendered as a badge so the TUI never claims
         # LIVE while a feed is partial/stale.
         self.health_reader = health_reader
+        # Optional (a)sync callable returning the native panels payload:
+        # {"orderflow": [...], "liquidations": {...}, "danger_zone": {...},
+        #  "whales": {...}}.
+        self.extra_reader = extra_reader
         self.assets: list[AssetInfo] = []
         self.context: dict = {}
         self.health: dict = {}
+        self.extra: dict = {}
         self.last_update: float = 0.0
         self.update_error: str | None = None
 
@@ -469,14 +483,24 @@ class MarketOverviewDashboard:
             )
             content = Group(Align.center(header), Text(""), scanning)
         else:
-            assets_table = self.build_assets_table(self.assets, limit=20)
-            context_table = self.build_context_panel(self.context)
-            extreme_table = self.build_extreme_funding(self.assets, limit=10)
+            extra = self.extra or {}
+            panels = [
+                orderflow_panel(extra.get("orderflow") or []),
+                self.build_context_panel(self.context),
+                liquidations_panel(extra.get("liquidations")),
+                danger_zone_panel(extra.get("danger_zone")),
+                whales_panel(extra.get("whales")),
+            ]
+            panels = [panel for panel in panels if panel is not None]
+            # Native panels make the view taller; trim the two long tables so
+            # the whole screen still fits a normal terminal.
+            assets_table = self.build_assets_table(self.assets, limit=10 if panels else 20)
+            extreme_table = self.build_extreme_funding(self.assets, limit=5 if panels else 10)
             stats = self.build_stats_bar()
 
             sections = [Align.center(header), Text(""), assets_table, Text("")]
-            if context_table is not None:
-                sections.extend([context_table, Text("")])
+            for panel in panels:
+                sections.extend([panel, Text("")])
             sections.extend([extreme_table, Text(""), stats, Text("")])
             content = Group(*sections)
 
@@ -560,10 +584,23 @@ class MarketOverviewDashboard:
         except Exception:
             self.health = {}
 
+    async def _refresh_extra(self) -> None:
+        if self.extra_reader is None:
+            return
+        try:
+            value = self.extra_reader()
+            if inspect.isawaitable(value):
+                value = await value
+            self.extra = value or {}
+        except Exception:
+            # Native panels are supplementary; never blank the market table.
+            self.extra = {}
+
     async def update_data(self) -> None:
         """Fetch new data or generate mock data."""
         self._refresh_context()
         self._refresh_health()
+        await self._refresh_extra()
         if self.asset_reader is not None:
             self.assets = self.asset_reader()
             self.last_update = time.time()
@@ -594,6 +631,7 @@ class MarketOverviewDashboard:
             console=self.console,
             refresh_per_second=2,
             screen=True,
+            vertical_overflow="visible",
         ) as live:
             try:
                 while True:

@@ -9,7 +9,7 @@ import pytest
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookLevel, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, ShardState, Trade
-from hyperdata_terminal.screener_snapshot import build_candles, build_health, build_snapshot
+from hyperdata_terminal.screener_snapshot import build_candles, build_extra, build_health, build_snapshot
 
 
 def _trade(side: str, price: float, size: float, ts: float, symbol: str = "BTC") -> Trade:
@@ -229,6 +229,41 @@ async def test_snapshot_includes_market_context() -> None:
     assert context["liquidations"]["confirmed_count"] == 3
     assert context["whales"][0]["symbol"] == "BTC"
     assert context["extreme_funding"][0]["annualized_pct"] > 0
+
+
+class _ExtraHub:
+    class _OF:
+        def get_snapshot(self, symbol, window):
+            return SimpleNamespace(signal="BULLISH", cvd=100.0, ofi=0.2,
+                                   trade_count=5, warming_up=False)
+
+    class _Liq:
+        def get_stats(self, **kwargs):
+            return {"confirmed_count": 1, "confirmed_volume_usd": 10.0,
+                    "by_exchange": {}, "by_symbol": {}}
+
+    class _Pos:
+        def get_danger_zone(self, threshold_pct=5.0):
+            return []
+
+    orderflow = _OF()
+    liquidations = _Liq()
+    positions = _Pos()
+
+    def get_all_assets(self):
+        return [SimpleNamespace(symbol="BTC")]
+
+    def get_whale_positions(self, min_size_usd=250_000.0):
+        return []
+
+
+def test_build_extra_collects_native_panels() -> None:
+    extra = build_extra(_ExtraHub())
+    assert extra["orderflow"][0]["symbol"] == "BTC"
+    assert extra["orderflow"][0]["venue"] == "combined"
+    assert extra["orderflow"][0]["quality"] == "ok"
+    assert extra["liquidations"]["confirmed_count"] == 1
+    assert extra["danger_zone"]["positions"] == []
 
 
 def test_build_health_reports_feeds_and_venues() -> None:

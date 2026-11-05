@@ -274,6 +274,41 @@ def build_context(hub, now: float | None = None) -> dict:
     return _context_block(hub, now if now is not None else time.time())
 
 
+def build_extra(hub, symbols: int = 6) -> dict:
+    """Native panels payload for the in-process TUI (danger zone, whales...).
+
+    Shapes match the REST endpoints so the same Rich builders serve both the
+    in-process hub and `RemoteHub`.
+    """
+    flow = []
+    for asset in hub.get_all_assets()[:symbols]:
+        snapshot = hub.orderflow.get_snapshot(asset.symbol, "1m")
+        if snapshot is None:
+            continue
+        flow.append({
+            "symbol": asset.symbol, "window": "1m", "venue": "combined",
+            "signal": snapshot.signal, "cvd": snapshot.cvd, "ofi": snapshot.ofi,
+            "trades": snapshot.trade_count,
+            "quality": "warming_up" if snapshot.warming_up else "ok",
+        })
+    try:
+        liquidations = hub.liquidations.get_stats(window_minutes=60, include_estimated=False)
+    except Exception:
+        liquidations = None
+    try:
+        danger = {"positions": list(hub.positions.get_danger_zone(threshold_pct=5.0))}
+    except Exception:
+        danger = None
+    try:
+        whales = {"positions": list(hub.get_whale_positions(min_size_usd=250_000)[:10])}
+    except Exception:
+        whales = None
+    return {
+        "orderflow": flow, "liquidations": liquidations,
+        "danger_zone": danger, "whales": whales,
+    }
+
+
 def build_health(hub) -> dict:
     """In-process equivalent of the ``/v1/health`` subset the TUI renders.
 

@@ -150,6 +150,38 @@ async def test_remote_hub_caches_health_summary(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_remote_hub_fetches_native_panels(monkeypatch) -> None:
+    hub = RemoteHub("http://127.0.0.1:8420")
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_get(path: str, **params):
+        calls.append((path, params))
+        return {"ok": True}
+
+    monkeypatch.setattr(hub, "_get", fake_get)
+    await hub.fetch_liquidation_stats(60)
+    await hub.fetch_danger_zone(5.0)
+    await hub.fetch_whales(250_000.0, 10)
+    assert calls[0] == ("/v1/liquidations/stats", {"minutes": 60, "include_estimated": "false"})
+    assert calls[1] == ("/v1/positions/danger-zone", {"threshold": 5.0})
+    assert calls[2] == ("/v1/whales", {"min_size": 250_000.0, "limit": 10})
+
+
+@pytest.mark.asyncio
+async def test_remote_hub_fetches_orderflow_by_symbol(monkeypatch) -> None:
+    hub = RemoteHub("http://127.0.0.1:8420")
+    hub.market.assets = {"kPEPE": object()}
+
+    async def fake_get(path: str, **params):
+        assert path == "/v1/orderflow/kPEPE"
+        return {"timeframes": {"1m": {"net_volume": 1.0}}}
+
+    monkeypatch.setattr(hub, "_get", fake_get)
+    payload = await hub.fetch_orderflow("kpepe")
+    assert payload["timeframes"]["1m"]["net_volume"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_remote_hub_health_failure_is_not_fatal(monkeypatch) -> None:
     hub = RemoteHub("http://127.0.0.1:8420")
 

@@ -208,6 +208,22 @@ class RemoteHub:
             spread=float(payload.get("spread") or (best_ask - best_bid)),
         )
 
+    async def fetch_orderflow(self, symbol: str) -> dict:
+        """Combined + per-venue order flow for one symbol (native endpoint)."""
+        resolved = self._resolve_symbol(symbol)
+        return await self._get(f"/v1/orderflow/{resolved}")
+
+    async def fetch_liquidation_stats(self, minutes: int = 60) -> dict:
+        return await self._get(
+            "/v1/liquidations/stats", minutes=minutes, include_estimated="false",
+        )
+
+    async def fetch_danger_zone(self, threshold: float = 5.0) -> dict:
+        return await self._get("/v1/positions/danger-zone", threshold=threshold)
+
+    async def fetch_whales(self, min_size: float = 250_000.0, limit: int = 10) -> dict:
+        return await self._get("/v1/whales", min_size=min_size, limit=limit)
+
     def _apply(self, payload: dict, assets: list[dict]) -> None:
         now = float(payload.get("as_of") or time.time())
         self._as_of = now

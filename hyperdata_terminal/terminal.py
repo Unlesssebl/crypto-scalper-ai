@@ -65,7 +65,7 @@ async def run_dashboard(hub: HyperDataHub, key: str, symbol: str | None = None) 
     from hyperdata_terminal.dashboards.liquidation_watch import LiquidationWatchDashboard
     from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
     from hyperdata_terminal.dashboards.whale_tracker import WhaleTrackerDashboard
-    from hyperdata_terminal.screener_snapshot import build_context, build_health
+    from hyperdata_terminal.screener_snapshot import build_context, build_extra, build_health
 
     dashboard_map = {
         "liq": lambda: LiquidationWatchDashboard(scanner=hub.positions, refresh_rate=5),
@@ -76,6 +76,7 @@ async def run_dashboard(hub: HyperDataHub, key: str, symbol: str | None = None) 
             market_data=hub.market, refresh_rate=10,
             context_reader=lambda: build_context(hub),
             health_reader=lambda: build_health(hub),
+            extra_reader=lambda: build_extra(hub),
         ),
         "whale": lambda: WhaleTrackerDashboard(scanner=hub.positions, refresh_rate=15),
         "all": lambda: CombinedDashboard(hub, refresh_rate=1),

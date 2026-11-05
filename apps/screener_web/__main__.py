@@ -183,11 +183,45 @@ async def run(args: argparse.Namespace) -> None:
                 ))
             LOG.info("Dashboard: http://127.0.0.1:%d/scalper (native %s)", args.port, args.api_url)
             if args.tui:
+                async def native_panels():
+                    flows = []
+                    for asset in hub.get_all_assets()[:6]:
+                        try:
+                            data = await hub.fetch_orderflow(asset.symbol)
+                        except Exception:
+                            continue
+                        frame = (data.get("timeframes") or {}).get("1m") or {}
+                        if not frame:
+                            continue
+                        flows.append({
+                            "symbol": asset.symbol, "window": "1m",
+                            "signal": frame.get("signal") or "NEUTRAL",
+                            "venue": frame.get("venue") or "combined",
+                            "cvd": frame.get("net_volume"), "ofi": frame.get("ofi"),
+                            "trades": frame.get("trade_count"),
+                            "quality": "warming_up" if frame.get("warming_up") else "ok",
+                        })
+                    try:
+                        liquidations = await hub.fetch_liquidation_stats(60)
+                    except Exception:
+                        liquidations = None
+                    try:
+                        danger = await hub.fetch_danger_zone(5.0)
+                    except Exception:
+                        danger = None
+                    try:
+                        whales = await hub.fetch_whales(250_000.0, 10)
+                    except Exception:
+                        whales = None
+                    return {"orderflow": flows, "liquidations": liquidations,
+                            "danger_zone": danger, "whales": whales}
+
                 dashboard_view = MarketOverviewDashboard(
                     market_data=None, demo=hub.demo, asset_reader=hub.get_all_assets,
                     signal_reader=lambda symbol: terminal_signals(journal, symbol),
                     context_reader=lambda: hub.context,
                     health_reader=lambda: hub.health_summary,
+                    extra_reader=native_panels,
                 )
                 await dashboard_view.run()
             else:
