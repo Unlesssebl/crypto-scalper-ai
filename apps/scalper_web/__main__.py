@@ -20,6 +20,7 @@ from extensions.scalper.telegram import listen_reports
 from hyperdata_terminal.api_server import HyperDataAPI
 from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
 from hyperdata_terminal.paths import DATA_DIR
+from hyperdata_terminal.screener_snapshot import build_context
 
 
 class ScalperAPI(HyperDataAPI):
@@ -146,6 +147,7 @@ async def run(args):
                     dashboard = MarketOverviewDashboard(
                         market_data=hub.market, demo=args.demo, asset_reader=hub.get_all_assets,
                         signal_reader=lambda symbol: terminal_signals(journal, symbol),
+                        context_reader=lambda: build_context(hub),
                     )
                     await dashboard.run()
                 else:

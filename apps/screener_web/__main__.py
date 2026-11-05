@@ -185,6 +185,7 @@ async def run(args: argparse.Namespace) -> None:
                 dashboard_view = MarketOverviewDashboard(
                     market_data=None, demo=hub.demo, asset_reader=hub.get_all_assets,
                     signal_reader=lambda symbol: terminal_signals(journal, symbol),
+                    context_reader=lambda: hub.context,
                 )
                 await dashboard_view.run()
             else:

@@ -118,6 +118,7 @@ class MarketOverviewDashboard:
         refresh_rate: int = 10,
         asset_reader=None,
         signal_reader=None,
+        context_reader=None,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
@@ -126,7 +127,12 @@ class MarketOverviewDashboard:
         self.refresh_rate = refresh_rate
         self.asset_reader = asset_reader
         self.signal_reader = signal_reader
+        # Optional callable returning the native market-context block (L/S,
+        # basis, IV, liquidations, whales, extreme funding). Kept as a reader
+        # so the same widget serves the in-process hub and the remote screener.
+        self.context_reader = context_reader
         self.assets: list[AssetInfo] = []
+        self.context: dict = {}
         self.last_update: float = 0.0
         self.update_error: str | None = None
 
@@ -314,6 +320,104 @@ class MarketOverviewDashboard:
 
         return bar
 
+    # -- Native market context ------------------------------------------------
+
+    def build_context_panel(self, context: dict) -> Table | None:
+        """Risk-appetite block from the native hub/API.
+
+        Renders only what is present: the in-process hub and the remote
+        screener populate different subsets (e.g. demo has no liquidations),
+        so a missing key is omitted rather than shown as a zero.
+        """
+        if not context:
+            return None
+        table = Table(
+            title="\U0001f9ed NATIVE CONTEXT \u00b7 RISK APPETITE",
+            title_style="bold bright_cyan",
+            box=box.SIMPLE_HEAVY,
+            border_style="bright_cyan",
+            header_style="bold bright_white",
+            expand=True,
+            padding=(0, 1),
+        )
+        table.add_column("Signal", style="bold bright_cyan", min_width=16)
+        table.add_column("BTC", justify="right")
+        table.add_column("ETH", justify="right")
+        table.add_column("SOL", justify="right")
+        table.add_column("Note", style="dim bright_white")
+
+        def cell(value, digits=2, suffix=""):
+            if value is None:
+                return Text("—", style="dim white")
+            return Text(f"{value:.{digits}f}{suffix}")
+
+        lsr = context.get("lsr") or {}
+        if lsr:
+            table.add_row(
+                "Long/Short",
+                cell(lsr.get("BTC", {}).get("long_short_ratio")),
+                cell(lsr.get("ETH", {}).get("long_short_ratio")),
+                cell(lsr.get("SOL", {}).get("long_short_ratio")),
+                Text(", ".join(sorted({v.get("source", "?") for v in lsr.values()})), style="dim"),
+            )
+
+        basis = context.get("basis") or {}
+        if basis:
+            table.add_row(
+                "Spot-perp basis",
+                cell(basis.get("BTC", {}).get("basis_pct"), suffix="%"),
+                cell(basis.get("ETH", {}).get("basis_pct"), suffix="%"),
+                cell(basis.get("SOL", {}).get("basis_pct"), suffix="%"),
+                Text(", ".join(sorted({v.get("source", "?") for v in basis.values()})), style="dim"),
+            )
+
+        iv = context.get("iv") or {}
+        if iv:
+            table.add_row(
+                "Deribit IV",
+                cell(iv.get("BTC", {}).get("mark_iv"), digits=1, suffix="%"),
+                cell(iv.get("ETH", {}).get("mark_iv"), digits=1, suffix="%"),
+                Text("—", style="dim white"),
+                Text("implied vol", style="dim"),
+            )
+
+        liquidations = context.get("liquidations") or {}
+        if liquidations:
+            count = liquidations.get("confirmed_count")
+            volume = liquidations.get("confirmed_volume_usd")
+            note = Text(f"{int(volume):,} USD · 1h".replace(",", " "), style="dim")
+            table.add_row(
+                "Liquidations",
+                Text(str(count) if count is not None else "—"),
+                Text("", style="dim"),
+                Text("", style="dim"),
+                note,
+            )
+
+        whales = context.get("whales") or []
+        if whales:
+            largest = max(whales, key=lambda item: item.get("size_usd") or 0)
+            table.add_row(
+                "Whales",
+                Text(f"{len(whales)} tracked", style="bright_white"),
+                Text("", style="dim"),
+                Text("", style="dim"),
+                Text(f"largest {largest.get('symbol', '?')} {fmt_usd(largest.get('size_usd') or 0)}",
+                     style="dim"),
+            )
+
+        extreme = context.get("extreme_funding") or []
+        if extreme:
+            top = ", ".join(
+                f"{item['symbol']} {item['annualized_pct']:+.0f}%" for item in extreme[:5]
+            )
+            table.add_row(
+                "Extreme funding", Text("", style="dim"), Text("", style="dim"), Text("", style="dim"),
+                Text(top, style="dim"),
+            )
+
+        return table
+
     # -- Full dashboard -------------------------------------------------------
 
     def build_dashboard(self) -> Panel:
@@ -338,19 +442,15 @@ class MarketOverviewDashboard:
             content = Group(Align.center(header), Text(""), scanning)
         else:
             assets_table = self.build_assets_table(self.assets, limit=20)
+            context_table = self.build_context_panel(self.context)
             extreme_table = self.build_extreme_funding(self.assets, limit=10)
             stats = self.build_stats_bar()
 
-            content = Group(
-                Align.center(header),
-                Text(""),
-                assets_table,
-                Text(""),
-                extreme_table,
-                Text(""),
-                stats,
-                Text(""),
-            )
+            sections = [Align.center(header), Text(""), assets_table, Text("")]
+            if context_table is not None:
+                sections.extend([context_table, Text("")])
+            sections.extend([extreme_table, Text(""), stats, Text("")])
+            content = Group(*sections)
 
         return Panel(
             content,
@@ -415,8 +515,18 @@ class MarketOverviewDashboard:
 
     # -- Data update ----------------------------------------------------------
 
+    def _refresh_context(self) -> None:
+        if self.context_reader is None:
+            return
+        try:
+            self.context = self.context_reader() or {}
+        except Exception:
+            # Context is supplementary: never let it break the market table.
+            self.context = {}
+
     async def update_data(self) -> None:
         """Fetch new data or generate mock data."""
+        self._refresh_context()
         if self.asset_reader is not None:
             self.assets = self.asset_reader()
             self.last_update = time.time()

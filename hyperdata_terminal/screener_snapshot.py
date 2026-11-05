@@ -269,6 +269,11 @@ def _context_block(hub, now: float) -> dict:
     return context
 
 
+def build_context(hub, now: float | None = None) -> dict:
+    """Public wrapper for the market-context block (dashboard/TUI consumers)."""
+    return _context_block(hub, now if now is not None else time.time())
+
+
 async def _indicators(hub, symbol: str, window: str, now: float) -> tuple[dict | None, bool]:
     key = (symbol, window)
     cached = _CANDLE_CACHE.get(key)
