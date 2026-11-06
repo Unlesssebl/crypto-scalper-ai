@@ -5,14 +5,16 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..paths import DATA_DIR
-from .acceptance import build_acceptance_report, render_markdown
+from .acceptance import build_acceptance_report, render_markdown, required_channels
 from .api import run_api
+from .collectors.attention import follow_attention
 from .collectors.base import CollectorConfig, StreamCollector
 from .collectors.hyperliquid import HyperliquidCollector, normalize_hyperliquid_trades
 from .collectors.okx import OkxCollector, OkxInstrumentCatalog, normalize_okx_trades
@@ -21,6 +23,7 @@ from .contracts import WINDOW_MS, QualityState, known_channel
 from .gaps import GapTracker
 from .ingest import GapControlService, IngestionService
 from .ingest_http import run_ingest
+from .maintenance import prune_raw
 from .postgres import PostgresStore
 from .raw_archive import RawArchive
 from .recovery import AutoRawRecovery, RawRecoveryService
@@ -29,6 +32,17 @@ from .windows import WindowService
 
 LOG = logging.getLogger(__name__)
 DEFAULT_DATABASE_URL = "postgresql://marketpulse:marketpulse@127.0.0.1:5432/marketpulse"
+
+
+def stop_event(provided=None):
+    if provided is not None:
+        return provided
+    stop = asyncio.Event()
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+    except (NotImplementedError, RuntimeError):
+        pass
+    return stop
 
 
 def database_url() -> str:
@@ -87,7 +101,7 @@ async def init_db() -> dict[str, Any]:
 
 
 async def run_ingest_service(stop: asyncio.Event | None = None) -> None:
-    stop = stop or asyncio.Event()
+    stop = stop_event(stop)
     store = await PostgresStore.connect(database_url())
     try:
         await store.register_instruments(default_instruments(markets()))
@@ -114,11 +128,13 @@ async def run_ingest_service(stop: asyncio.Event | None = None) -> None:
             _housekeeping(ingest, auto_recovery, stop),
             name="pulse-housekeeping",
         )
+        recovery_task = asyncio.create_task(_recover_periodically(auto_recovery, stop), name="pulse-recovery")
         try:
             await stop.wait()
         finally:
             housekeeping.cancel()
-            await asyncio.gather(housekeeping, return_exceptions=True)
+            recovery_task.cancel()
+            await asyncio.gather(housekeeping, recovery_task, return_exceptions=True)
             await runner.cleanup()
     finally:
         await store.close()
@@ -129,15 +145,22 @@ async def _housekeeping(
     auto_recovery: AutoRawRecovery,
     stop: asyncio.Event,
 ) -> None:
-    last_recovery_ms = 0
+    last_maintenance_ms = 0
     while not stop.is_set():
         try:
             now = _now_ms()
             await ingest.drain_recalc(now_ms=now)
             await ingest.close_due(now_ms=now)
-            if now - last_recovery_ms >= 30_000:
-                last_recovery_ms = now
-                await auto_recovery.run_once(now_ms=now)
+            if now - last_maintenance_ms >= 60_000:
+                last_maintenance_ms = now
+                storage_gaps = await ingest.store.list_gaps(limit=100_000)
+                maintenance = await asyncio.to_thread(prune_raw, raw_root(), storage_gaps, now,
+                                                     max_bytes=int(os.getenv("PULSE_RAW_BUDGET_BYTES", 5 * 1024**3)))
+                maintenance.update(await ingest.store.resources())
+                maintenance["database_budget_bytes"] = int(os.getenv("PULSE_DB_BUDGET_BYTES", 10 * 1024**3))
+                if maintenance["database_bytes"] >= maintenance["database_budget_bytes"]:
+                    maintenance.update(status="blocked", reason="database_budget_exhausted")
+                await ingest.store.set_control("maintenance", maintenance, now)
         except Exception:
             LOG.exception("Market Pulse housekeeping failed")
         try:
@@ -146,8 +169,20 @@ async def _housekeeping(
             pass
 
 
+async def _recover_periodically(recovery, stop):
+    while not stop.is_set():
+        try:
+            await recovery.run_once(now_ms=_now_ms())
+        except Exception:
+            LOG.exception("Background recovery failed; live housekeeping continues")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_api_service(stop: asyncio.Event | None = None) -> None:
-    stop = stop or asyncio.Event()
+    stop = stop_event(stop)
     store = await PostgresStore.connect(database_url())
     try:
         runner = await run_api(store, host=host(), port=api_port())
@@ -167,7 +202,7 @@ async def run_collector(
     stop: asyncio.Event | None = None,
     refresh_okx: bool = True,
 ) -> None:
-    stop = stop or asyncio.Event()
+    stop = stop_event(stop)
     selected = markets_override or markets()
     config = CollectorConfig(
         venue=venue,
@@ -203,7 +238,32 @@ async def run_collector(
     else:
         raise ValueError(f"unsupported venue {venue!r}")
     try:
-        await collector.run(stop)
+        controller = None
+        if os.getenv("PULSE_DYNAMIC_ATTENTION", "0") == "1":
+            collector.dynamic = True
+            controller = asyncio.create_task(follow_attention(collector, client, stop))
+        worker = asyncio.create_task(collector.run(stop))
+
+        async def stop_socket():
+            await stop.wait()
+            if collector._ws is not None:
+                await collector._ws.close()
+
+        stopper = asyncio.create_task(stop_socket())
+        try:
+            if controller:
+                await asyncio.wait((worker, controller), return_when=asyncio.FIRST_COMPLETED)
+                if not stop.is_set() and controller.done():
+                    await controller
+                    raise RuntimeError("attention controller stopped unexpectedly")
+            await worker
+        finally:
+            worker.cancel()
+            stopper.cancel()
+            await asyncio.gather(worker, stopper, return_exceptions=True)
+            if controller:
+                controller.cancel()
+                await asyncio.gather(controller, return_exceptions=True)
     finally:
         archive.close()
         try:
@@ -328,6 +388,7 @@ async def acceptance(
             start_ms=start_ms,
             end_ms=end_ms,
             required_pct=required_pct,
+            expected_channels=required_channels(markets()),
         )
         return render_markdown(report) if report_format == "markdown" else dumps(report)
     finally:

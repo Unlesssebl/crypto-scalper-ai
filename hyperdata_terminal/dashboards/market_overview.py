@@ -766,8 +766,25 @@ class MarketOverviewDashboard:
     async def run(self) -> None:
         """Main loop: refresh market data, react to page keys, update display."""
         self.console.clear()
-        self._pager = KeyPager(self.handle_key)
+        loop = asyncio.get_running_loop()
+        redraw = asyncio.Event()
+
+        def on_key(char: str) -> None:
+            self.handle_key(char)
+            redraw.set()
+
+        # KeyPager reads on a thread; page state and rendering belong to the
+        # event loop. Wake it immediately, independently of the data interval.
+        self._pager = KeyPager(lambda char: loop.call_soon_threadsafe(on_key, char))
         self._pager.start()
+
+        async def refresh_data() -> None:
+            while not self._stop_requested:
+                self.cycle += 1
+                await self.update_data()
+                redraw.set()
+                await asyncio.sleep(self.refresh_rate)
+
         try:
             with Live(
                 self.build_dashboard(),
@@ -777,11 +794,18 @@ class MarketOverviewDashboard:
                 vertical_overflow="crop",
             ) as live:
                 try:
-                    while not self._stop_requested:
-                        self.cycle += 1
-                        await self.update_data()
-                        live.update(self.build_dashboard())
-                        await asyncio.sleep(self.refresh_rate)
+                    async with asyncio.TaskGroup() as tasks:
+                        refresh_task = tasks.create_task(refresh_data())
+                        try:
+                            while not self._stop_requested:
+                                try:
+                                    await asyncio.wait_for(redraw.wait(), timeout=1.0)
+                                except TimeoutError:
+                                    pass  # Keep the clock, rotation and terminal size current.
+                                redraw.clear()
+                                live.update(self.build_dashboard(), refresh=True)
+                        finally:
+                            refresh_task.cancel()
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     pass
         finally:

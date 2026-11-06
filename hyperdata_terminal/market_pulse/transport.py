@@ -27,6 +27,7 @@ class HttpIngestClient:
         self.token = token
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
+        self.maintenance = {}
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self._session is None or self._session.closed:
@@ -50,6 +51,21 @@ class HttpIngestClient:
             "events": [event.to_payload() for event in events],
         }
         return await self._post("/ingest/v1/batches", payload)
+
+    async def attention(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        async with self._session.get(self.base_url + "/ingest/v1/attention") as response:
+            response.raise_for_status()
+            body = await response.json()
+            self.maintenance = body.get("maintenance") or {}
+            return body.get("plan")
+
+    async def overview(self, candles):
+        return await self._post("/ingest/v1/overview", {"candles": candles})
+
+    async def collector_status(self, venue, markets, **details):
+        return await self._post("/ingest/v1/collector-status/" + venue, {"markets": markets, **details})
 
     async def report(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post("/ingest/v1/gaps", payload)
@@ -126,6 +142,10 @@ class HttpIngestClient:
                 "reason": reason,
             }
         )
+
+    async def released(self, venue, market, channel, source_epoch, now_ms):
+        return await self.report({"action": "released", "venue": venue, "native_market_id": market,
+                                  "channel": channel, "source_epoch": source_epoch, "now_ms": now_ms})
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:

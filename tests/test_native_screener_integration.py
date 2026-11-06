@@ -124,9 +124,13 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
         book = await remote.fetch_orderbook("BTC")
         assert book is not None and book.best_bid == 69999.0
 
+        from extensions.scalper.pulse import PulseContext
+        from extensions.scalper.service import alert_market_facts
+
+        pulse = PulseContext("")
         service = Screener(
             remote, journal,
-            SimpleNamespace(key=None, provider="test", analyze=None), False,
+            SimpleNamespace(key=None, provider="test", analyze=None), False, pulse=pulse,
         )
         service.scan(now)
         assert set(service.rows) == {
@@ -136,6 +140,11 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
         assert row["snapshot"]["metrics"]["cvd"]["value"] == 70000.0
         assert row["snapshot"]["metrics"]["price"]["value"] == 70000.0
         assert row["hyperdata"]["direction"] == "BULLISH"
+        assert row["snapshot"]["market_pulse"]["status"] == "disabled"
+        assert any(label == "Межбиржевые данные" for label, _ in alert_market_facts(row["snapshot"]))
+        journal.record("pulse-evidence", {}, row["snapshot"], row["hyperdata"])
+        recorded = journal.db.execute("SELECT snapshot FROM analyses WHERE id='pulse-evidence'").fetchone()[0]
+        assert "market_pulse" in recorded
     finally:
         await remote.stop()
         journal.close()

@@ -30,15 +30,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AlertConfig:
     """Thresholds for triggering alerts."""
-    min_liquidation_usd: float = 500_000      # Alert on liqs > $500K
+
+    min_liquidation_usd: float = 500_000  # Alert on liqs > $500K
     min_whale_position_usd: float = 5_000_000  # Alert on whale positions > $5M
-    extreme_funding_annual: float = 1.0        # Alert on >100% annualized funding
-    liquidation_cascade_count: int = 50        # Alert if >50 liqs in 5 minutes
+    extreme_funding_annual: float = 1.0  # Alert on >100% annualized funding
+    liquidation_cascade_count: int = 50  # Alert if >50 liqs in 5 minutes
     liquidation_cascade_volume_usd: float = 500_000  # Alert if >$500K volume in 5 minutes
-    liquidation_cascade_window: int = 300      # 5 minutes
-    smart_money_max_rank: int = 5              # Alert on top N smart money wallets
-    hlp_zscore_threshold: float = 2.0          # Alert on HLP Z-score extremes
-    cooldown_seconds: float = 300.0            # 5 min cooldown between similar alerts (was 60s — too noisy)
+    liquidation_cascade_window: int = 300  # 5 minutes
+    smart_money_max_rank: int = 5  # Alert on top N smart money wallets
+    hlp_zscore_threshold: float = 2.0  # Alert on HLP Z-score extremes
+    cooldown_seconds: float = 300.0  # 5 min cooldown between similar alerts (was 60s — too noisy)
 
 
 class AlertManager:
@@ -97,7 +98,7 @@ class AlertManager:
 
     # Per-key cooldown overrides (seconds)
     _COOLDOWN_OVERRIDES = {
-        "cascade_alert": 600,   # 10 minutes between cascade alerts
+        "cascade_alert": 600,  # 10 minutes between cascade alerts
     }
 
     def _should_alert(self, key: str) -> bool:
@@ -263,10 +264,7 @@ class AlertManager:
             short_v = liq_stats["short_volume_usd"]
 
             lines.append(f"Total: {total_count:,} events | {self._fmt_usd(total_vol)} volume")
-            lines.append(
-                f"Long: {long_c:,} ({self._fmt_usd(long_v)}) | "
-                f"Short: {short_c:,} ({self._fmt_usd(short_v)})"
-            )
+            lines.append(f"Long: {long_c:,} ({self._fmt_usd(long_v)}) | Short: {short_c:,} ({self._fmt_usd(short_v)})")
 
             # Find the top single liquidation in the window
             cutoff = time.time() - 240 * 60
@@ -378,9 +376,13 @@ class AlertManager:
         # Discord
         if self.discord_webhook:
             try:
-                async with self._session.post(self.discord_webhook, json={
-                    "content": message,
-                }, timeout=self._SEND_TIMEOUT) as resp:
+                async with self._session.post(
+                    self.discord_webhook,
+                    json={
+                        "content": message,
+                    },
+                    timeout=self._SEND_TIMEOUT,
+                ) as resp:
                     if resp.status in (200, 204):
                         logger.info("Discord alert sent")
                     else:
@@ -397,19 +399,55 @@ class AlertManager:
         redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
         logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
 
-    async def send_telegram(self, message: str, *, rich_html: str | None = None,
-                            copy_text: str | None = None, return_message: bool = False):
+    async def _telegram_serialized(self, method, *args, **kwargs):
+        if not hasattr(self, "_telegram_lock"):
+            self._telegram_lock = asyncio.Lock()
+        async with self._telegram_lock:
+            while time.time() < getattr(self, "_telegram_not_before", 0):
+                await asyncio.sleep(min(1, self._telegram_not_before - time.time()))
+            result = await method(*args, **kwargs)
+            detail = getattr(self, "last_telegram_result", {})
+            if detail.get("http_status") == 429:
+                self._telegram_not_before = time.time() + max(1, int(detail.get("retry_after") or 60))
+            return result
+
+    async def send_telegram(self, message, *, rich_html=None, copy_text=None, return_message=False):
+        return await self._telegram_serialized(
+            self._send_telegram_unlocked,
+            message,
+            rich_html=rich_html,
+            copy_text=copy_text,
+            return_message=return_message,
+        )
+
+    async def edit_telegram(self, message_id, message, *, rich_html=None, copy_text=None):
+        return await self._telegram_serialized(
+            self._edit_telegram_unlocked, message_id, message, rich_html=rich_html, copy_text=copy_text
+        )
+
+    async def _send_telegram_unlocked(
+        self, message: str, *, rich_html: str | None = None, copy_text: str | None = None, return_message: bool = False
+    ):
         """Send a Telegram alert, with HTML fallback on explicit Rich Message rejection."""
         if not self.telegram_token or not self.telegram_chat_id:
+            self.last_telegram_result = {"state": "unconfigured"}
             return False
+        self.last_telegram_result = {"state": "send_pending"}
         if not self._session:
             self._session = aiohttp.ClientSession()
         plain = {"text": message, "parse_mode": "HTML"}
         if copy_text:
             plain["link_preview_options"] = {"is_disabled": True}
-            plain["reply_markup"] = {"inline_keyboard": [[{
-                "text": "Копировать фьючерс", "copy_text": {"text": copy_text},
-            }]]}
+            plain["reply_markup"] = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Копировать фьючерс",
+                            "copy_text": {"text": copy_text},
+                        }
+                    ]
+                ]
+            }
         attempts = [("sendMessage", plain)]
         if rich_html is not None:
             attempts.insert(0, ("sendRichMessage", {"rich_message": {"html": rich_html}}))
@@ -417,46 +455,94 @@ class AlertManager:
             for method, payload in attempts:
                 url = f"https://api.telegram.org/bot{self.telegram_token}/{method}"
                 async with self._session.post(
-                    url, json={"chat_id": self.telegram_chat_id, **payload},
-                    timeout=self._SEND_TIMEOUT, allow_redirects=False,
+                    url,
+                    json={"chat_id": self.telegram_chat_id, **payload},
+                    timeout=self._SEND_TIMEOUT,
+                    allow_redirects=False,
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
                         if result.get("ok") is True:
+                            message_id = (result.get("result") or {}).get("message_id")
+                            if return_message and (type(message_id) is not int or message_id <= 0):
+                                self.last_telegram_result = {
+                                    "state": "outcome_unknown",
+                                    "http_status": 200,
+                                    "reason": "missing_message_id",
+                                }
+                                return False
+                            self.last_telegram_result = {"state": "sent", "http_status": 200}
                             logger.info("Telegram alert sent")
                             if return_message:
                                 return ((result.get("result") or {}).get("message_id"), method == "sendRichMessage")
                             return True
-                    if (method == "sendRichMessage" and response.status in (400, 404)
-                            and (await response.json()).get("ok") is False):
+                    if (
+                        method == "sendRichMessage"
+                        and response.status in (400, 404)
+                        and (await response.json()).get("ok") is False
+                    ):
                         logger.info("Telegram rejected rich alert (%d), using HTML", response.status)
                         continue
                     logger.warning("Telegram send returned %d", response.status)
+                    body = await response.json()
+                    self.last_telegram_result = self._telegram_failure(response.status, body)
                     return False
         except Exception as exc:
+            self.last_telegram_result = {"state": "outcome_unknown", "reason": type(exc).__name__}
             logger.warning("Telegram send failed: %s", type(exc).__name__)
         return False
 
-    async def edit_telegram(self, message_id, message, *, rich_html=None, copy_text=None):
-        if not self._session or not self.telegram_token or not self.telegram_chat_id:
+    async def _edit_telegram_unlocked(self, message_id, message, *, rich_html=None, copy_text=None):
+        if not self.telegram_token or not self.telegram_chat_id:
+            self.last_telegram_result = {"state": "unconfigured"}
             return False
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+        self.last_telegram_result = {"state": "edit_pending"}
         payload = {"chat_id": self.telegram_chat_id, "message_id": message_id}
         if rich_html is not None:
             payload["rich_message"] = {"html": rich_html}
         else:
             payload.update(text=message, parse_mode="HTML", link_preview_options={"is_disabled": True})
             if copy_text:
-                payload["reply_markup"] = {"inline_keyboard": [[{
-                    "text": "Копировать фьючерс", "copy_text": {"text": copy_text},
-                }]]}
+                payload["reply_markup"] = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Копировать фьючерс",
+                                "copy_text": {"text": copy_text},
+                            }
+                        ]
+                    ]
+                }
         try:
             url = f"https://api.telegram.org/bot{self.telegram_token}/editMessageText"
-            async with self._session.post(url, json=payload, timeout=self._SEND_TIMEOUT,
-                                          allow_redirects=False) as response:
-                return response.status == 200 and (await response.json()).get("ok") is True
+            async with self._session.post(
+                url, json=payload, timeout=self._SEND_TIMEOUT, allow_redirects=False
+            ) as response:
+                body = await response.json()
+                if response.status == 200 and body.get("ok") is True:
+                    self.last_telegram_result = {"state": "edited", "http_status": 200}
+                    return True
+                if response.status == 400 and "message is not modified" in str(body.get("description", "")).lower():
+                    self.last_telegram_result = {"state": "unchanged", "http_status": 400}
+                    return True
+                self.last_telegram_result = self._telegram_failure(response.status, body)
+                return False
         except Exception as exc:
+            self.last_telegram_result = {"state": "outcome_unknown", "reason": type(exc).__name__}
             logger.warning("Telegram edit failed: %s", type(exc).__name__)
             return False
+
+    def _telegram_failure(self, status, body):
+        description = str(body.get("description", ""))[:500].replace(self.telegram_token, "[redacted]")
+        return {
+            "state": "failed" if status < 500 else "outcome_unknown",
+            "http_status": status,
+            "error_code": body.get("error_code"),
+            "description": description,
+            "retry_after": (body.get("parameters") or {}).get("retry_after"),
+        }
 
     async def send_test(self) -> bool:
         """Send a test alert to verify configuration."""

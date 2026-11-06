@@ -435,6 +435,7 @@ class HyperDataAPI:
             ("GET", "/v1/live", self.handle_live),
             ("GET", "/v1/health", self.handle_health),
             ("GET", "/v1/market", self.handle_market),
+            ("GET", "/v1/attention", self.handle_attention),
             ("GET", "/v1/market/{symbol}", self.handle_market_symbol),
             ("GET", "/v1/orderflow/{symbol}", self.handle_orderflow),
             ("GET", "/v1/snapshot", self.handle_snapshot),
@@ -936,6 +937,10 @@ class HyperDataAPI:
             "as_of": getattr(self.hub.market, "observed_at", 0.0),
             "assets": data,
         })
+
+    async def handle_attention(self, request: web.Request) -> web.Response:
+        observation = getattr(self.hub, "observation", None)
+        return web.json_response(observation.report() if observation else {"enabled": False})
 
     async def handle_market_symbol(self, request: web.Request) -> web.Response:
         sym = _resolve_symbol(self.hub, request.match_info["symbol"])

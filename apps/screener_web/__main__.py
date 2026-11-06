@@ -5,12 +5,14 @@ or duplicate exchange sockets. It polls the native `/v1/market`,
 `/v1/snapshot` and `/v1/candles` endpoints and serves the existing scalper
 dashboard from the same cache.
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from extensions.scalper.journal import Journal
 from extensions.scalper.market import WINDOWS, orderbook_details
 from extensions.scalper.opportunity import REASON_LABELS, OpportunityPolicy
 from extensions.scalper.parity import Recorder
+from extensions.scalper.pulse import PulseContext
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.runtime import analyst, terminal_signals
 from extensions.scalper.service import Screener
@@ -62,11 +65,14 @@ def window_of(request: web.Request) -> str:
 
 
 async def dashboard(_request: web.Request) -> web.FileResponse:
-    return web.FileResponse(DASHBOARD, headers={
-        "Cache-Control": "no-cache",
-        "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
-    })
+    return web.FileResponse(
+        DASHBOARD,
+        headers={
+            "Cache-Control": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 async def screener(request: web.Request) -> web.Response:
@@ -79,24 +85,39 @@ async def screener(request: web.Request) -> web.Response:
             continue
         latest = service.journal.latest(symbol, frame)
         accepted = service.journal.latest(symbol, frame, accepted=True)
-        rows.append({
-            **row,
-            "latest": latest[0] if latest else None,
-            "accepted": accepted[0] if accepted else None,
-            "queued": (symbol, frame) in service.pending,
-            "anomalies": sorted(active_anomalies(row["snapshot"])),
-        })
-    return web.json_response({
-        "mode": hub.status.mode,
-        "market": hub.status.market_data,
-        "gemini": "configured" if service.gemini.key else "disabled",
-        "ai_provider": service.gemini.provider,
-        "quality_report": service.quality_report,
-        "ai_policy": asdict(service.policy),
-        "ai_reasons": REASON_LABELS,
-        "context": getattr(hub, "context", {}),
-        "rows": rows,
-    })
+        rows.append(
+            {
+                **row,
+                "latest": latest[0] if latest else None,
+                "accepted": accepted[0] if accepted else None,
+                "queued": (symbol, frame) in service.pending,
+                "anomalies": sorted(active_anomalies(row["snapshot"])),
+            }
+        )
+    return web.json_response(
+        {
+            "mode": hub.status.mode,
+            "market": hub.status.market_data,
+            "gemini": "configured" if service.gemini.key else "disabled",
+            "ai_provider": service.gemini.provider,
+            "quality_report": service.quality_report,
+            "ai_policy": asdict(service.policy),
+            "ai_reasons": REASON_LABELS,
+            "context": getattr(hub, "context", {}),
+            "market_pulse": (
+                {
+                    **service.pulse.summary(),
+                    "symbols": {symbol: service.pulse.facts(symbol, time.time()) for symbol in service.pulse.markets},
+                }
+                if getattr(service, "pulse", None)
+                else {"status": "disabled"}
+            ),
+            "attention_plan": service.attention.plan,
+            "attention": getattr(hub, "attention", {"enabled": False}),
+            "consistency": service.context_state(time.time()),
+            "rows": rows,
+        }
+    )
 
 
 async def detail(request: web.Request) -> web.Response:
@@ -108,11 +129,16 @@ async def detail(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     fetch = getattr(hub, "fetch_orderbook", None)
     book = await fetch(symbol) if fetch is not None else None
-    return web.json_response({
-        **service.rows[symbol, window],
-        "book": asdict(book) if book else orderbook_details(hub, symbol),
-        "history": service.journal.latest(symbol, window, limit=20),
-    })
+    return web.json_response(
+        {
+            **service.rows[symbol, window],
+            "book": asdict(book) if book else orderbook_details(hub, symbol),
+            "observation": next(
+                (r for r in getattr(hub, "attention", {}).get("active", []) if r["symbol"] == symbol), None
+            ),
+            "history": service.journal.latest(symbol, window, limit=20),
+        }
+    )
 
 
 async def update_policy(request: web.Request) -> web.Response:
@@ -124,8 +150,12 @@ async def update_policy(request: web.Request) -> web.Response:
         body = await request.json()
         if not isinstance(body, dict) or set(body) != set(OpportunityPolicy.__dataclass_fields__):
             raise ValueError("Expected all AI policy fields")
-        if (type(body["hourly_limit"]) is not int or type(body["cooldown_seconds"]) is not int
-                or type(body["early"]) is not bool or type(body["experiments"]) is not bool):
+        if (
+            type(body["hourly_limit"]) is not int
+            or type(body["cooldown_seconds"]) is not int
+            or type(body["early"]) is not bool
+            or type(body["experiments"]) is not bool
+        ):
             raise ValueError("Invalid policy field types")
         policy = OpportunityPolicy(**body)
     except (ValueError, TypeError) as exc:
@@ -136,18 +166,70 @@ async def update_policy(request: web.Request) -> web.Response:
     return web.json_response(asdict(policy))
 
 
+async def context_packet(request: web.Request) -> web.Response:
+    service = request.app["service"]
+    service.refresh_context_packets(time.time())
+    symbol = request.match_info["symbol"]
+    packet = next((p for s, p in service.context_packets.items() if s.casefold() == symbol.casefold()), None)
+    if packet is None:
+        raise web.HTTPNotFound(text="Instrument is outside current attention")
+    return web.json_response(packet)
+
+
+async def review_context(request: web.Request) -> web.Response:
+    if request.content_type != "application/json":
+        raise web.HTTPUnsupportedMediaType()
+    if request.headers.get("Origin") and request.headers["Origin"] != f"{request.scheme}://{request.host}":
+        raise web.HTTPForbidden()
+    try:
+        body = await request.json()
+        if (
+            not isinstance(body, dict)
+            or set(body) not in ({"packet_id"}, {"packet_id", "route"})
+            or body.get("route", "strong") not in {"free", "strong"}
+            or not isinstance(body["packet_id"], str)
+            or len(body["packet_id"]) != 64
+            or any(c not in "0123456789abcdef" for c in body["packet_id"])
+        ):
+            raise ValueError("Expected fact packet hash")
+    except (ValueError, TypeError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    result = await request.app["service"].review_context(
+        request.match_info["symbol"], body["packet_id"], route=body.get("route", "strong")
+    )
+    return web.json_response(result)
+
+
 async def healthz(request: web.Request) -> web.Response:
     hub: RemoteHub = request.app["hub"]
     ready = bool(hub.ready)
     healthy = ready and hub.last_error is None and hub.status.market_data in ("connected", "synthetic")
-    return web.json_response({
-        "ready": ready,
-        "healthy": healthy,
-        "last_error": hub.last_error,
-        "mode": hub.status.mode,
-        "market": hub.status.market_data,
-        "warnings": hub.warnings,
-    }, status=200 if healthy else 503)
+    attention = getattr(hub, "attention", {})
+    observation_error = attention.get("subscription_error") or attention.get("archive", {}).get("error")
+    healthy = healthy and not observation_error
+    return web.json_response(
+        {
+            "ready": ready,
+            "healthy": healthy,
+            "last_error": hub.last_error,
+            "mode": hub.status.mode,
+            "market": hub.status.market_data,
+            "warnings": hub.warnings,
+            "observation_error": observation_error,
+        },
+        status=200 if healthy else 503,
+    )
+
+
+async def system_status(request):
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get("http://127.0.0.1:8422/status") as response:
+                response.raise_for_status()
+                data = await response.json()
+                return web.json_response({"phase": data["phase"], "services": data["services"]})
+    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError):
+        return web.json_response({"phase": "unmanaged", "services": {}}, status=503)
 
 
 def build_app(hub: RemoteHub, service: Screener) -> web.Application:
@@ -162,8 +244,11 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
     app.router.add_get("/scalper", dashboard)
     app.router.add_get("/v1/scalper", screener)
     app.router.add_post("/v1/scalper/policy", update_policy)
+    app.router.add_get("/v1/scalper/context/{symbol}", context_packet)
+    app.router.add_post("/v1/scalper/context/{symbol}", review_context)
     app.router.add_get("/v1/scalper/{symbol}", detail)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/v1/system", system_status)
     return app
 
 
@@ -184,9 +269,30 @@ async def run(args: argparse.Namespace) -> None:
             hub.alerts.enabled = False
         async with aiohttp.ClientSession() as session:
             gemini = analyst(session, hub.demo)
-            notify = bool(args.notify and not hub.demo
-                          and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
-            service = Screener(hub, journal, gemini, notify, recorder=recorder)
+            notify = bool(args.notify and not hub.demo and hub.alerts.telegram_token and hub.alerts.telegram_chat_id)
+            pulse = (
+                None
+                if hub.demo
+                else PulseContext(
+                    os.getenv("PULSE_API_URL", "http://127.0.0.1:8431"),
+                    tuple(m.strip().upper() for m in os.getenv("PULSE_MARKETS", "BTC,XRP").split(",") if m.strip()),
+                    journal=journal if os.getenv("PULSE_SHADOW", "1") == "1" else None,
+                )
+            )
+            service = Screener(hub, journal, gemini, notify, recorder=recorder, pulse=pulse)
+            if pulse is not None:
+                tasks.append(asyncio.create_task(pulse.run(), name="market-pulse-context"))
+            if service.ai_routes:
+                from dataclasses import asdict
+
+                from extensions.scalper.history.archive import Archive
+                from extensions.scalper.history.runtime import history_dir
+
+                service.attention.archive = Archive(history_dir().parent / "attention-decisions")
+                service.attention.archive.record("policy", asdict(service.attention.engine.policy), time.time())
+                service.attention.archive.record("attention_state", service.attention.state(), time.time())
+                if notify:
+                    tasks.append(asyncio.create_task(service.outbox.run(), name="telegram-card-outbox"))
             app = build_app(hub, service)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -194,10 +300,10 @@ async def run(args: argparse.Namespace) -> None:
             await site.start()
             for interrupted in journal.recover():
                 service.queue_hypothesis(interrupted)
-            tasks.extend(asyncio.create_task(worker()) for worker in
-                         (service.run, service.analyze, service.deliver))
+            tasks.extend(asyncio.create_task(worker()) for worker in (service.run, service.analyze, service.deliver))
             tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
             if not hub.demo:
+                tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
             if notify:
@@ -205,11 +311,15 @@ async def run(args: argparse.Namespace) -> None:
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
                 digest_seconds = int(os.getenv("HYPERDATA_DIGEST_SECONDS", "0"))
                 if digest_seconds > 0:
-                    tasks.append(asyncio.create_task(
-                        run_digest(session, service, digest_seconds), name="telegram-digest",
-                    ))
+                    tasks.append(
+                        asyncio.create_task(
+                            run_digest(session, service, digest_seconds),
+                            name="telegram-digest",
+                        )
+                    )
             LOG.info("Dashboard: http://127.0.0.1:%d/scalper (native %s)", args.port, args.api_url)
             if args.tui:
+
                 async def native_panels():
                     flows = []
                     for asset in hub.get_all_assets()[:6]:
@@ -220,14 +330,18 @@ async def run(args: argparse.Namespace) -> None:
                         frame = (data.get("timeframes") or {}).get("1m") or {}
                         if not frame:
                             continue
-                        flows.append({
-                            "symbol": asset.symbol, "window": "1m",
-                            "signal": frame.get("signal") or "NEUTRAL",
-                            "venue": frame.get("venue") or "combined",
-                            "cvd": frame.get("net_volume"), "ofi": frame.get("ofi"),
-                            "trades": frame.get("trade_count"),
-                            "quality": "warming_up" if frame.get("warming_up") else "ok",
-                        })
+                        flows.append(
+                            {
+                                "symbol": asset.symbol,
+                                "window": "1m",
+                                "signal": frame.get("signal") or "NEUTRAL",
+                                "venue": frame.get("venue") or "combined",
+                                "cvd": frame.get("net_volume"),
+                                "ofi": frame.get("ofi"),
+                                "trades": frame.get("trade_count"),
+                                "quality": "warming_up" if frame.get("warming_up") else "ok",
+                            }
+                        )
                     try:
                         liquidations = await hub.fetch_liquidation_stats(60)
                     except Exception:
@@ -252,12 +366,20 @@ async def run(args: argparse.Namespace) -> None:
                         smart = await hub.fetch_smart_money()
                     except Exception:
                         smart = None
-                    return {"orderflow": flows, "liquidations": liquidations,
-                            "danger_zone": danger, "whales": whales,
-                            "hlp": hlp, "heatmap": heatmap, "smart_money": smart}
+                    return {
+                        "orderflow": flows,
+                        "liquidations": liquidations,
+                        "danger_zone": danger,
+                        "whales": whales,
+                        "hlp": hlp,
+                        "heatmap": heatmap,
+                        "smart_money": smart,
+                    }
 
                 dashboard_view = MarketOverviewDashboard(
-                    market_data=None, demo=hub.demo, asset_reader=hub.get_all_assets,
+                    market_data=None,
+                    demo=hub.demo,
+                    asset_reader=hub.get_all_assets,
                     signal_reader=lambda symbol: terminal_signals(journal, symbol),
                     context_reader=lambda: hub.context,
                     health_reader=lambda: hub.health_summary,
@@ -272,6 +394,8 @@ async def run(args: argparse.Namespace) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if "service" in locals():
+            await asyncio.to_thread(service.attention.close)
         if runner is not None:
             await runner.cleanup()
         await hub.stop()
@@ -284,20 +408,29 @@ async def run(args: argparse.Namespace) -> None:
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--api-url", default=os.getenv("HYPERDATA_API_URL", "http://127.0.0.1:8420"),
-                        help="native HyperData API base URL (default: http://127.0.0.1:8420)")
+    parser.add_argument(
+        "--api-url",
+        default=os.getenv("HYPERDATA_API_URL", "http://127.0.0.1:8420"),
+        help="native HyperData API base URL (default: http://127.0.0.1:8420)",
+    )
     parser.add_argument("--port", type=int, default=8421, help="screener web port (default: 8421)")
-    parser.add_argument("--journal", type=Path, default=None,
-                        help="SQLite journal path (default: <screener data dir>/scalper.sqlite; "
-                             "scalper-demo.sqlite in demo mode)")
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        default=None,
+        help="SQLite journal path (default: <screener data dir>/scalper.sqlite; scalper-demo.sqlite in demo mode)",
+    )
     parser.add_argument("--timeout", type=float, default=10.0, help="native API timeout in seconds")
     parser.add_argument("--tui", action="store_true", help="also show the Rich Market Overview")
-    parser.add_argument("--tui-page", choices=["auto", "all", "market", "risk", "vault"],
-                        default=os.getenv("HYPERDATA_TUI_PAGE", "auto"),
-                        help="TUI layout: auto (rotate fitted pages on short terminals), "
-                             "all, market, risk or vault")
-    parser.add_argument("--tui-rotate", type=float, default=0.0,
-                        help="seconds between rotated TUI pages (default: 0 = manual keys)")
+    parser.add_argument(
+        "--tui-page",
+        choices=["auto", "all", "market", "risk", "vault"],
+        default=os.getenv("HYPERDATA_TUI_PAGE", "auto"),
+        help="TUI layout: auto (rotate fitted pages on short terminals), all, market, risk or vault",
+    )
+    parser.add_argument(
+        "--tui-rotate", type=float, default=0.0, help="seconds between rotated TUI pages (default: 0 = manual keys)"
+    )
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
     args = parser.parse_args()
@@ -305,7 +438,9 @@ def main() -> None:
         parser.error("Port must be between 1 and 65535")
     logging.basicConfig(level=logging.WARNING if args.tui else logging.INFO)
     try:
-        asyncio.run(run(args))
+        from hyperdata_terminal.lifecycle import run_managed
+
+        asyncio.run(run_managed(run(args)))
     except KeyboardInterrupt:
         pass
 

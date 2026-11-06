@@ -1,8 +1,8 @@
 """Instrument profiles from regularly sampled, quality-checked market windows."""
-from collections import defaultdict
-from contextlib import closing
 import math
 import sqlite3
+from collections import defaultdict
+from contextlib import closing
 from statistics import median
 
 DAY = 86400

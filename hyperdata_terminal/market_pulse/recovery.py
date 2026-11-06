@@ -7,7 +7,9 @@ baselines.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+from itertools import islice
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .contracts import DeliveryKind, ExecutionEvent, QualityState, known_channel
@@ -17,6 +19,21 @@ from .raw_archive import RawArchive
 from .storage import MarketPulseStore
 
 Normalizer = Callable[..., Sequence[ExecutionEvent]]
+
+
+async def archive_records(archive, start_ms):
+    # Checksums and JSON scanning may traverse a large archive. Keep them off
+    # the ingest event loop, with a bounded batch crossing the thread boundary.
+    iterator = iter(archive.iter_records(start_ms=start_ms))
+    try:
+        while batch := await asyncio.to_thread(lambda: list(islice(iterator, 250))):
+            for item in batch:
+                yield item
+    finally:
+        try:
+            iterator.close()
+        except (ValueError, RuntimeError):
+            pass  # A cancelled read owns its final file handle until it returns.
 
 
 class RawRecoveryService:
@@ -51,10 +68,14 @@ class RawRecoveryService:
         conflicts = 0
         min_receive: int | None = None
         max_receive: int | None = None
-        for envelope, reference in archive.iter_records(start_ms=start_ms, end_ms=end_ms):
+        # Read one matching boundary frame beyond the half-open replay range.
+        # It is evidence only, never an extra execution in the requested replay.
+        epochs: set[str] = set()
+        async for envelope, reference in archive_records(archive, start_ms):
             scanned += 1
             receive_time_ms = int(envelope.get("receive_time_ms", 0))
             source_epoch = str(envelope.get("source_epoch") or "recovery")
+            epochs.add(source_epoch)
             payload = envelope.get("payload")
             if not isinstance(payload, Mapping):
                 continue
@@ -67,9 +88,12 @@ class RawRecoveryService:
             for event in events:
                 if event.venue != venue or event.native_market_id != market or event.channel != channel:
                     continue
-                batch.append(replace(event, delivery_kind=DeliveryKind.RECOVERY.value))
+                if receive_time_ms < end_ms:
+                    batch.append(replace(event, delivery_kind=DeliveryKind.RECOVERY.value))
                 min_receive = receive_time_ms if min_receive is None else min(min_receive, receive_time_ms)
                 max_receive = receive_time_ms if max_receive is None else max(max_receive, receive_time_ms)
+            if max_receive is not None and max_receive >= end_ms:
+                break
             if len(batch) >= batch_size:
                 result = await self.ingest.append_batch(
                     batch, now_ms=now_ms, touch_coverage=False
@@ -87,48 +111,35 @@ class RawRecoveryService:
 
         reconciled = 0
         remaining = 0
-        if archive.last_error is None and min_receive is not None and max_receive is not None:
-            gaps = await self.store.gaps_overlapping(venue, market, channel, start_ms, end_ms)
-            for gap in gaps:
-                if gap.state != QualityState.GAP_DETECTED.value:
-                    continue
-                if gap.reason and gap.reason.startswith("trade id conflict"):
-                    # A content conflict is not missing data; raw replay must
-                    # not silently turn it into a reconciled window.
-                    remaining += 1
-                    continue
-                # A closed gap needs records at both boundaries.  An open gap
-                # is proven by a boundary frame at its start plus data that
-                # continued after it: a socket outage leaves only the boundary
-                # frame, while an ingest outage leaves records throughout.
-                if gap.end_ms is None:
-                    covered = min_receive <= gap.start_ms and max_receive > gap.start_ms
-                    reconcile_end = max_receive
-                else:
-                    covered = min_receive <= gap.start_ms and max_receive >= gap.end_ms
-                    reconcile_end = gap.end_ms
-                if covered:
-                    await self.gaps.mark_reconciled(
-                        gap.gap_id,
-                        end_ms=reconcile_end,
-                        method="raw",
-                        now_ms=now_ms,
-                        venue=venue,
-                        native_market_id=market,
-                        channel=channel,
-                    )
-                    await self.ingest.rebuild_range(
-                        venue,
-                        market,
-                        channel,
-                        known_channel(venue, channel).value,
-                        gap.start_ms,
-                        reconcile_end,
-                        now_ms=now_ms,
-                    )
-                    reconciled += 1
-                else:
-                    remaining += 1
+        candidate_gaps = await self.store.gaps_overlapping(venue, market, channel, start_ms, end_ms)
+        for gap in candidate_gaps:
+            if gap.state != QualityState.GAP_DETECTED.value:
+                continue
+            target_end = gap.end_ms if gap.end_ms is not None else end_ms
+            # Never shorten a loss interval to whatever prefix happened to be
+            # available. A changed source epoch also cannot prove continuity.
+            covered = (
+                archive.last_error is None
+                and min_receive is not None
+                and max_receive is not None
+                and min_receive <= gap.start_ms
+                and max_receive >= target_end
+                and target_end <= end_ms
+                and len(epochs) == 1
+                and not (gap.reason and gap.reason.startswith("trade id conflict"))
+            )
+            if not covered:
+                remaining += 1
+                continue
+            await self.gaps.mark_reconciled(
+                gap.gap_id, end_ms=target_end, method="raw", now_ms=now_ms,
+                venue=venue, native_market_id=market, channel=channel,
+            )
+            await self.ingest.rebuild_range(
+                venue, market, channel, known_channel(venue, channel).value,
+                gap.start_ms, target_end, now_ms=now_ms,
+            )
+            reconciled += 1
         return {
             "status": "partial" if archive.last_error or remaining else "ok",
             "venue": venue,
@@ -205,13 +216,15 @@ class AutoRawRecovery:
         gaps: GapTracker,
         *,
         raw_root: str,
-        min_attempt_interval_ms: int = 60_000,
+        min_attempt_interval_ms: int = 900_000,
+        max_gaps_per_run: int = 2,
     ) -> None:
         self.store = store
         self.ingest = ingest
         self.gaps = gaps
         self.raw_root = raw_root
         self.min_attempt_interval_ms = min_attempt_interval_ms
+        self.max_gaps_per_run = max_gaps_per_run
         self._attempted: dict[int, int] = {}
 
     async def run_once(self, *, now_ms: int) -> list[dict[str, Any]]:
@@ -222,7 +235,9 @@ class AutoRawRecovery:
         stored_gaps = await self.store.list_gaps(state=QualityState.GAP_DETECTED.value, limit=10_000)
         specs = spec_index(default_instruments())
         results: list[dict[str, Any]] = []
-        for gap in stored_gaps:
+        for gap in sorted(stored_gaps, key=lambda g: g.start_ms, reverse=True):
+            if len(results) >= self.max_gaps_per_run:
+                break
             if gap.reason and gap.reason.startswith("trade id conflict"):
                 continue
             last_attempt = self._attempted.get(gap.gap_id, 0)

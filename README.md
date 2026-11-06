@@ -1,3 +1,7 @@
+> Unified deployment: [Единая система: запуск, данные, AI и ограничения](docs/unified-system.md).
+
+> **Единый запуск:** `.\start.ps1 --notify` · статус `--status` · перезапуск `--restart` · остановка `--stop` · [Инструкция](docs/unified-project.md)
+
 > **Crypto Scalper AI** · Быстрый старт: `.\start.ps1` · [Установка и режимы](docs/crypto-scalper.md) · [Переход на нативный API](docs/native-migration.md) · [Эксплуатация](docs/operations.md)
 
 <div align="center">
@@ -22,6 +26,11 @@ hyperdata
 </div>
 
 ## Why people run it
+
+Crypto Scalper selective observation: [operation, archive and replay](docs/attention-operations.md).
+Factual consistency, manual AI reviews and offline evaluation: [guide](docs/fact-consistency.md).
+The live native Hub now assigns detailed streams by each asset's relative activity,
+with no Top-20 or absolute-volume priority; directional AI requests are disabled in this mode.
 
 - **See where leverage gets wiped before it happens.** A liquidation heatmap and a "closest to liquidation" list built from thousands of live Hyperliquid wallets, for every listed asset. The kind of view paid dashboards charge for.
 - **Watch the biggest books on Hyperliquid.** Size, entry, liquidation price, PnL and leverage of the largest open positions, plus Hyperliquid's own market maker (the HLP vault: AUM, net delta, gross exposure) and the liquidations it absorbs.

@@ -7,6 +7,7 @@ from typing import Any
 from aiohttp import web
 
 from .contracts import SCHEMA_VERSION, InstrumentSpec
+from .control import validate_plan
 from .gaps import GapTracker
 from .ingest import BatchError, GapControlService, IngestionService, decode_batch
 from .storage import MarketPulseStore, RawSegmentRecord
@@ -24,11 +25,15 @@ def create_ingest_app(
     app["ingest"] = ingest
     app["gap_control"] = gap_control
     app["token"] = token
+    app.router.add_post("/ingest/v1/overview", overview)
     app.router.add_post("/ingest/v1/batches", batches)
     app.router.add_post("/ingest/v1/gaps", gaps)
     app.router.add_post("/ingest/v1/instruments", instruments)
     app.router.add_post("/ingest/v1/raw-segments", raw_segments)
     app.router.add_get("/ingest/v1/health", health)
+    app.router.add_post("/ingest/v1/attention", attention)
+    app.router.add_get("/ingest/v1/attention", attention)
+    app.router.add_post("/ingest/v1/collector-status/{venue:hyperliquid|okx}", collector_status)
     app.middlewares.append(_auth)
     return app
 
@@ -54,6 +59,42 @@ async def batches(request: web.Request) -> web.Response:
         return web.json_response({"status": "invalid", "detail": str(exc)}, status=400)
     status = 409 if result["status"] == "conflict" else 200
     return web.json_response({"schema_version": SCHEMA_VERSION, **result}, status=status)
+
+
+async def overview(request):
+    from .overview import validate_candle
+    now = now_ms()
+    try:
+        payload = await request.json()
+        if (not isinstance(payload, dict) or not isinstance(payload.get("candles"), list)
+                or not 1 <= len(payload["candles"]) <= 1000):
+            raise ValueError("expected 1..1000 candles")
+        rows = [validate_candle(r, now) for r in payload["candles"]]
+    except (ValueError, TypeError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    await request.app["store"].put_overview(rows, now)
+    return web.json_response({"status": "ok", "accepted": len(rows)})
+
+
+async def attention(request):
+    store = request.app["store"]
+    if request.method == "POST":
+        try:
+            plan = validate_plan(await request.json(), now_ms())
+        except (ValueError, TypeError) as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        await store.set_control("attention", plan, plan["generated_at_ms"])
+    return web.json_response({"plan": await store.get_control("attention"),
+                              "maintenance": await store.get_control("maintenance")})
+
+
+async def collector_status(request):
+    payload = await request.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("markets"), dict):
+        raise web.HTTPBadRequest(text="invalid collector status")
+    payload["updated_at_ms"] = now_ms()
+    await request.app["store"].set_control("collector:" + request.match_info["venue"], payload, now_ms())
+    return web.json_response({"status": "ok"})
 
 
 async def gaps(request: web.Request) -> web.Response:

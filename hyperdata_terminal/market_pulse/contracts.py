@@ -76,6 +76,7 @@ class QualityState(StrEnum):
     RECONCILED = "reconciled"
     DECLARED_OUTAGE = "declared_outage"
     UNAVAILABLE = "unavailable"
+    OUTSIDE_ATTENTION = "outside_attention"
 
 
 class NotionalStatus(StrEnum):
@@ -461,7 +462,10 @@ class Gap:
             raise ContractError("gap end_ms must not be before start_ms")
 
     def overlaps(self, start_ms: int, end_ms: int) -> bool:
-        return self.start_ms <= end_ms and (self.end_ms is None or self.end_ms >= start_ms)
+        # Windows are half-open. Preserve explicitly recorded point gaps as
+        # one millisecond, without poisoning the adjacent minute.
+        effective_end = None if self.end_ms is None else max(self.start_ms + 1, self.end_ms)
+        return self.start_ms < end_ms and (effective_end is None or effective_end > start_ms)
 
     def to_payload(self) -> dict[str, Any]:
         return {

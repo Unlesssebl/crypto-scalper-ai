@@ -42,6 +42,19 @@ class MarketData:
         self._cache_ttl: float = 1.0  # 1 second (was 5 — too stale for trading)
         self._semaphore = asyncio.Semaphore(MAX_REQUESTS_PER_SECOND)
         self._session: aiohttp.ClientSession | None = None
+        self._premium_warnings: dict[str, tuple[float, float]] = {}
+
+    def _warn_premium(self, symbol, mark_px, oracle_px, premium_pct, volume):
+        if abs(premium_pct) <= .5 or volume <= 100_000:
+            self._premium_warnings.pop(symbol, None)
+            return
+        now = time.monotonic()
+        prior = self._premium_warnings.get(symbol)
+        if (prior is None or now - prior[0] >= 300 or abs(premium_pct - prior[1]) >= .5
+                or premium_pct * prior[1] < 0):
+            self._premium_warnings[symbol] = (now, premium_pct)
+            logger.warning("High premium on %s: mark=%.4f index=%.4f premium=%.3f%%",
+                           symbol, mark_px, oracle_px, premium_pct)
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -81,11 +94,7 @@ class MarketData:
                 premium_pct = 0.0
                 if oracle_px > 0:
                     premium_pct = (mark_px - oracle_px) / oracle_px * 100
-                    if abs(premium_pct) > 0.5 and day_ntl_vlm > 100_000:
-                        logger.warning(
-                            "High premium on %s: mark=%.4f index=%.4f premium=%.3f%%",
-                            symbol, mark_px, oracle_px, premium_pct,
-                        )
+                    self._warn_premium(symbol, mark_px, oracle_px, premium_pct, day_ntl_vlm)
 
                 assets[symbol] = AssetInfo(
                     symbol=symbol,

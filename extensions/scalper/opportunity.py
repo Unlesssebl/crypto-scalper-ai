@@ -7,6 +7,7 @@ from .profile import fresh
 
 MAX_AGE = {"1m": 45, "5m": 120}
 REASON_LABELS = {
+    "context_only": "режим наблюдения: карточка фактов без рекомендации входа",
     "hourly_limit": "превышен часовой лимит", "cooldown": "пауза по инструменту",
     "unconfigured": "нет API-ключа", "queued": "в очереди", "analyzing": "анализ выполняется",
     "ordinary_flow": "обычный поток", "neutral": "нейтральный поток",

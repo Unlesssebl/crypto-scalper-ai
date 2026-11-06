@@ -413,7 +413,7 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
     # newly listed (or volume-rotating) asset can enter the top of the book
     # without a Hyperliquid trades subscription. Surface that explicitly:
     # it needs a restart, not a hot fix.
-    if not getattr(hub, "demo", False):
+    if not getattr(hub, "demo", False) and not getattr(hub.orderflow, "selective", False):
         subscribed = set(getattr(hub.orderflow, "symbols", ()))
         top_n = min(len(assets), 60)
         extra = {asset.symbol for asset in assets[:top_n]} - subscribed

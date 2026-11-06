@@ -208,19 +208,19 @@ async def test_journal_worker_delivery_and_shared_api(market, tmp_path, monkeypa
         assert plain.startswith(headline)
         assert rich.startswith("<p>" + headline)
         assert f'<tg-button type="copy_text" text="{ticker}">' in rich
-        assert "<hr/>\n<p><b>Рынок</b>" in rich
+        assert "<hr/>\n<p><b>Событие</b>" in rich
         assert "<table striped compact>" in rich
-        assert "<th>Стакан</th><td>дисбаланс" in rich
-        assert "<b>Стакан</b> · дисбаланс" in plain
+        assert "<th>Стакан</th><td>перевес" in rich
+        assert "<b>Стакан</b> · перевес" in plain
         assert "<blockquote><b>Гипотеза AI</b>" in rich
         for message in (plain, rich):
-            assert "Сила:" in message and "Mark $" in message and "МСК" in message
-            assert "<b>HyperData</b> 🟢 вверх · <b>AI</b> 🟢 вверх" in message
+            assert "Выраженность:" in message and "Mark $" in message and "МСК" in message
+            assert "<b>Поток HL</b> 🟢 покупки · <b>AI</b> 🟢 вверх" in message
             assert "bid $" not in message and "ask $" not in message
             assert "<b>🧠 Характеристика AI</b>" in message and "Инициатива меняется" in message
             assert "Что наблюдать" not in message and "Когда пересмотреть" not in message
             assert "<details" not in message and "expandable" not in message
-            assert message.index("Всплеск ленты") < message.index("<b>HyperData</b>")
+            assert message.index("Ускорение ленты") < message.index("<b>Поток HL</b>")
             assert message.index("Характеристика AI") < message.index("<blockquote>")
         assert rich.index("Гипотеза AI") < rich.index("Копировать фьючерс")
         assert "CONSENSUS_LONG" not in rich

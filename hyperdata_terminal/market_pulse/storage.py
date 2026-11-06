@@ -118,6 +118,16 @@ class RawSegmentRecord:
 
 @runtime_checkable
 class MarketPulseStore(Protocol):
+    async def put_overview(self, rows, now_ms: int) -> None: ...
+    async def get_overview(self, from_ms: int) -> list[dict]: ...
+
+    async def event_head(self) -> int: ...
+
+    async def get_control(self, name: str) -> dict | None: ...
+
+    async def set_control(self, name: str, payload: dict, now_ms: int) -> bool: ...
+
+    async def due_windows(self, now_ms: int, grace_ms: int) -> list[WindowAggregate]: ...
     async def register_instruments(self, specs: Iterable[InstrumentSpec]) -> None: ...
 
     async def get_instrument_spec(
@@ -250,6 +260,36 @@ class InMemoryMarketPulseStore:
         self._conflict_windows: set[tuple[str, str, str, str, int]] = set()
         self._manual_quality: dict[tuple[str, str, str, str, int], tuple[str, str]] = {}
         self._recalc: set[tuple[str, str, str, str, int]] = set()
+        self._control = {}
+        self._overview = {}
+
+    async def put_overview(self, rows, now_ms):
+        for row in rows:
+            key = (row["symbol"], row["start_ms"])
+            if row["received_at_ms"] >= self._overview.get(key, {}).get("received_at_ms", 0):
+                self._overview[key] = dict(row)
+        self._overview = {k: v for k, v in self._overview.items() if v["start_ms"] >= now_ms - 30*86400_000}
+
+    async def get_overview(self, from_ms):
+        return [dict(r) for r in self._overview.values() if r["start_ms"] >= from_ms]
+
+    async def event_head(self):
+        return self._next_seq - 1
+
+    async def get_control(self, name):
+        return self._control.get(name, (0, None))[1]
+
+    async def due_windows(self, now_ms, grace_ms):
+        rows = [w for w in self._windows.values() if w.window_end_ms + grace_ms <= now_ms
+                and (w.provisional or (w.quality == "partial" and
+                                      w.coverage.get("partial_reason") == "no liveness at window end"))]
+        return sorted(rows, key=lambda w: (w.provisional, w.window_start_ms), reverse=True)[:1000]
+
+    async def set_control(self, name, payload, now_ms):
+        if now_ms < self._control.get(name, (-1, None))[0]:
+            return False
+        self._control[name] = (now_ms, payload)
+        return True
 
     async def register_instruments(self, specs: Iterable[InstrumentSpec]) -> None:
         # First registration wins for a given spec version.  Re-registering the

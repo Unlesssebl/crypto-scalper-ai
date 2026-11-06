@@ -29,6 +29,8 @@ def create_app(store: MarketPulseStore, *, service_version: str = "0.1.0") -> we
     app.router.add_get("/coverage", coverage)
     app.router.add_get("/windows", windows)
     app.router.add_get("/events", events)
+    app.router.add_get("/overview", overview)
+    app.router.add_get("/attention", attention)
     app.router.add_get("/", index)
     app.middlewares.append(_no_store)
     return app
@@ -40,9 +42,22 @@ async def index(request: web.Request) -> web.Response:
             "service": "market-pulse",
             "version": request.app[VERSION_KEY],
             "schema_version": SCHEMA_VERSION,
-            "routes": ["/health", "/coverage", "/windows", "/events"],
+            "routes": ["/health", "/coverage", "/windows", "/events", "/attention", "/overview"],
         }
     )
+
+
+async def overview(request):
+    from .overview import activity
+    now = now_ms()
+    rows = await request.app[STORE_KEY].get_overview(now - 17*60_000)
+    return web.json_response(activity(rows, now))
+
+
+async def attention(request):
+    store = request.app[STORE_KEY]
+    return web.json_response({"plan": await store.get_control("attention"), "collectors": {
+        venue: await store.get_control("collector:" + venue) for venue in ("hyperliquid", "okx")}})
 
 
 async def health(request: web.Request) -> web.Response:
@@ -52,8 +67,22 @@ async def health(request: web.Request) -> web.Response:
     gaps = await store.list_gaps(limit=10_000)
     open_gaps = [gap.to_payload() for gap in gaps if gap.state == "gap_detected"]
     stale = _stale_channels(coverage)
+    plan = await store.get_control("attention")
+    missing = []
+    if plan:
+        from .collectors.specs import market_for_venue
+        from .control import desired_symbols
+        existing = {(c.venue, c.native_market_id, c.channel) for c in coverage
+                    if c.state != "outside_attention"}
+        missing = [{"venue": venue, "market": market_for_venue(venue, symbol)}
+                   for symbol in desired_symbols(plan, now_ms())
+                   for venue, channel in (("hyperliquid", "trades"), ("okx", "trades-all"))
+                   if (venue, market_for_venue(venue, symbol), channel) not in existing]
     status = detail.get("status", "ok")
-    if stale:
+    maintenance = await store.get_control("maintenance")
+    if maintenance and maintenance.get("status") == "blocked":
+        status = "degraded"
+    if stale or missing:
         status = "degraded"
     body = {
         "service": "market-pulse",
@@ -61,8 +90,10 @@ async def health(request: web.Request) -> web.Response:
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "storage": detail,
+        "maintenance": maintenance,
         "channels": [_channel_payload(item) for item in coverage],
         "stale_channels": stale,
+        "missing_channels": missing,
         "open_gaps": open_gaps,
         "limits": {
             "full_exchange_completeness": "not claimed",
@@ -116,6 +147,7 @@ async def events(request: web.Request) -> web.Response:
     store: MarketPulseStore = request.app[STORE_KEY]
     cursor = _int_query(request, "cursor", 0, minimum=0, maximum=9_223_372_036_854_775_807)
     limit = _int_query(request, "limit", 500, minimum=1, maximum=5_000)
+    head = await store.event_head()
     rows = await store.list_events_after(
         cursor,
         venue=request.query.get("venue"),
@@ -124,9 +156,11 @@ async def events(request: web.Request) -> web.Response:
         to_ms=_optional_int_query(request, "to_ms"),
         limit=limit,
     )
+    rows = [row for row in rows if row.event_seq <= head]
     return web.json_response(
         {
             "schema_version": SCHEMA_VERSION,
+            "head_cursor": head,
             "cursor": cursor,
             "next_cursor": rows[-1].event_seq if rows else None,
             "events": [row.to_payload() for row in rows],
@@ -166,6 +200,8 @@ def _stale_channels(channels) -> list[dict]:
     threshold = _stale_after_ms()
     now = now_ms()
     for item in channels:
+        if item.state == "outside_attention":
+            continue
         last = _last_evidence(item)
         silence = None if last is None else max(0, now - last)
         if last is None or silence > threshold:

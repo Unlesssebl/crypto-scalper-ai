@@ -20,6 +20,7 @@ from .contracts import (
     QualityState,
     WindowAggregate,
 )
+from .gaps import reconciled_covers_interval
 from .storage import MarketPulseStore
 
 
@@ -150,6 +151,12 @@ class WindowService:
             now_ms,
         )
         provisional = now_ms < window_end_ms + self.grace_ms
+        # Preserve the actual event specifications, including mixed-spec minutes.
+        coverage["instrument_spec_versions"] = sorted({event.instrument_spec_version for event in events})
+        if not events:
+            spec = await self.store.get_instrument_spec(venue, native_market_id, window_start_ms)
+            if spec and (spec.valid_to_ms is None or spec.valid_to_ms >= window_end_ms):
+                coverage["instrument_spec_versions"] = [spec.spec_version]
         existing = await self.store.get_window(
             venue,
             native_market_id,
@@ -215,11 +222,27 @@ class WindowService:
         return window
 
     async def close_due(self, *, now_ms: int) -> list[WindowAggregate]:
-        rows = await self.store.list_windows(limit=100_000)
+        # Do not scan only the oldest 100k minutes: a growing journal must keep closing new ones.
+        start = (now_ms - self.grace_ms) // WINDOW_MS * WINDOW_MS - WINDOW_MS
+        for channel in await self.store.list_coverage():
+            if channel.state in {QualityState.UNAVAILABLE.value, QualityState.OUTSIDE_ATTENTION.value}:
+                continue
+            existing = await self.store.get_window(channel.venue, channel.native_market_id, channel.channel,
+                                                   "execution", start)
+            if existing is None:
+                await self.rebuild(channel.venue, channel.native_market_id, channel.channel,
+                                   "execution", start, now_ms=now_ms)
+        rows = await self.store.due_windows(now_ms, self.grace_ms)
         due = [
             window
             for window in rows
-            if window.provisional and now_ms >= window.window_end_ms + self.grace_ms
+            if (
+                window.provisional
+                or (
+                    window.quality == QualityState.PARTIAL.value
+                    and window.coverage.get("partial_reason") == "no liveness at window end"
+                )
+            ) and now_ms >= window.window_end_ms + self.grace_ms
         ]
         result = []
         for window in due:
@@ -292,27 +315,29 @@ class WindowService:
             coverage_payload["heartbeat_ms"] = coverage.heartbeat_ms
         if coverage is not None and coverage.state == QualityState.UNAVAILABLE.value:
             return QualityState.UNAVAILABLE.value, coverage_payload
+        if any(gap.state == QualityState.OUTSIDE_ATTENTION.value for gap in gaps):
+            return QualityState.OUTSIDE_ATTENTION.value, coverage_payload
         if coverage is not None and coverage.state == QualityState.WARMING_UP.value:
             return QualityState.WARMING_UP.value, coverage_payload
-        if coverage is not None and coverage.state == QualityState.RECOVERING.value:
-            return QualityState.RECOVERING.value, coverage_payload
         if any(gap.state in {QualityState.GAP_DETECTED.value, QualityState.RECOVERING.value} for gap in gaps):
             return QualityState.GAP_DETECTED.value, coverage_payload
         if any(gap.state == QualityState.DECLARED_OUTAGE.value for gap in gaps):
             return QualityState.DECLARED_OUTAGE.value, coverage_payload
-        if coverage is not None and coverage.state == QualityState.RECONCILED.value:
+        if reconciled_covers_interval(gaps, window_start_ms, window_end_ms):
+            if not window_closed:
+                return QualityState.WARMING_UP.value, coverage_payload
             return QualityState.RECONCILED.value, coverage_payload
-        if gaps and all(gap.state == QualityState.RECONCILED.value for gap in gaps):
-            return QualityState.RECONCILED.value, coverage_payload
+        if coverage is None and not events:
+            return QualityState.UNAVAILABLE.value, coverage_payload
         if (
-            coverage is not None
-            and coverage.connected_since_ms is not None
-            and window_start_ms < coverage.connected_since_ms < window_end_ms
+            coverage is None
+            or coverage.connected_since_ms is None
+            or coverage.connected_since_ms > window_start_ms
         ):
             # The first part of this minute happened before the connection
             # existed.  It is not a full minute and must not be compared with
             # complete minutes.
-            coverage_payload["partial_reason"] = "connected during window"
+            coverage_payload["partial_reason"] = "window starts before proven observation"
             return QualityState.PARTIAL.value, coverage_payload
         if now_ms < window_end_ms + self.grace_ms:
             return QualityState.WARMING_UP.value, coverage_payload
@@ -325,8 +350,6 @@ class WindowService:
             # minute.  A stale socket must not look like a complete minute.
             coverage_payload["partial_reason"] = "no liveness at window end"
             return QualityState.PARTIAL.value, coverage_payload
-        if coverage is None and not events:
-            return QualityState.UNAVAILABLE.value, coverage_payload
         if conflict_marked:
             return QualityState.GAP_DETECTED.value, coverage_payload
         return QualityState.OBSERVED_NO_DETECTED_GAP.value, coverage_payload
@@ -342,6 +365,7 @@ def _zero_if_covered(value: Decimal | None, event_count: int, quality: str) -> D
         QualityState.RECOVERING.value,
         QualityState.DECLARED_OUTAGE.value,
         QualityState.PARTIAL.value,
+        QualityState.OUTSIDE_ATTENTION.value,
     }:
         return Decimal(0)
     return None

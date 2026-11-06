@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 
 import aiohttp
@@ -70,7 +71,8 @@ class OrderBookEngine:
     """Maintains live orderbooks via Hyperliquid l2Book WebSocket."""
 
     def __init__(self, symbols: list[str] | None = None, depth: int = DEFAULT_DEPTH) -> None:
-        self.symbols = symbols or list(DEFAULT_SYMBOLS)
+        self.symbols = list(DEFAULT_SYMBOLS) if symbols is None else list(symbols)
+        self.raw_callback = None
         self.depth = depth
         # books[symbol] = {"bids": [...], "asks": [...], "updated_at": float}
         self.books: dict[str, dict] = {
@@ -117,12 +119,35 @@ class OrderBookEngine:
 
     # ── Public API ───────────────────────────────────────────────
 
+    async def set_symbols(self, symbols: list[str]) -> None:
+        """Replace selective subscriptions without reconnecting surviving symbols."""
+        wanted = list(dict.fromkeys(symbols))
+        old = set(self.symbols)
+        self.symbols = wanted
+        if not wanted:
+            self.last_message_at = 0
+        for symbol in old - set(wanted):
+            self.books.pop(symbol, None)
+            self.snapshots.pop(symbol, None)
+        for symbol in wanted:
+            self.books.setdefault(symbol, {"bids": [], "asks": [], "updated_at": 0.0})
+        if self._ws is not None and not self._ws.closed:
+            try:
+                for method, names in (("unsubscribe", old - set(wanted)), ("subscribe", set(wanted) - old)):
+                    for symbol in sorted(names):
+                        await self._ws.send_json({"method": method, "subscription": {
+                            "type": "l2Book", "coin": symbol, "nSigFigs": 5}})
+            except Exception:
+                # Desired state survives; reconnect resubscribes it in full.
+                await self._ws.close()
+                raise
+
     def get_snapshot(self, symbol: str) -> OrderBookSnapshot | None:
         snap = self.snapshots.get(symbol) or self.snapshots.get(symbol.upper())
         if snap is not None:
             # Recompute staleness at read time so the flag keeps tracking age
             # even when no new books arrive (a frozen feed must read as stale).
-            snap.stale = self.data_age() > STALE_AFTER_SECONDS
+            snap.stale = self.is_stale() or time.time() - snap.timestamp > STALE_AFTER_SECONDS
         return snap
 
     def data_age(self, now: float | None = None) -> float:
@@ -218,6 +243,7 @@ class OrderBookEngine:
 
     async def _connect_and_listen(self) -> None:
         self._session = aiohttp.ClientSession()
+        epoch = uuid.uuid4().hex
         try:
             # heartbeat=20 makes aiohttp ping the server and raise on a missing
             # pong, so a half-open TCP connection triggers reconnect instead of
@@ -234,10 +260,14 @@ class OrderBookEngine:
                 if not self._running:
                     break
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    if self.raw_callback:
+                        self.raw_callback("book", msg.data, epoch, time.time(), time.monotonic_ns())
                     self._handle_message(msg.json())
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
         finally:
+            if self.raw_callback:
+                self.raw_callback("book", None, epoch, time.time(), time.monotonic_ns())
             if self._ws and not self._ws.closed:
                 await self._ws.close()
             if self._session and not self._session.closed:

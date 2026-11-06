@@ -2,6 +2,13 @@
 
 Локальный форк [HyperData Terminal](https://github.com/Co-Messi/HyperData-Terminal) на ветке `crypto-scalper`. Базовый коммит `5fd1f0264391de1b65b18014049ea61161d82d51` закреплён тегом `scalper-upstream-base`. Для просмотра обновлений upstream выполните `git fetch upstream` и `git log --oneline scalper-upstream-base..upstream/main`.
 
+## Единое управление
+
+`start.ps1` теперь управляет native API, скринером и всем Market Pulse вместе.
+Используйте `--status`, `--restart`, `--stop`; обычный запуск работает в фоне,
+а `--tui` — в текущем терминале. Полная актуальная инструкция —
+[unified-project.md](unified-project.md).
+
 ## Быстрый старт
 
 Нужен Python 3.12 или новее. Из каталога форка выполните одну команду:

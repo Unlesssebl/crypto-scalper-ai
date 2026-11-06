@@ -175,7 +175,7 @@ class IngestionService:
 class GapControlService:
     """Translate collector lifecycle messages into durable gap records."""
 
-    ACTIONS = {"connected", "disconnected", "heartbeat", "unavailable", "reconciled"}
+    ACTIONS = {"connected", "disconnected", "heartbeat", "unavailable", "reconciled", "released"}
 
     def __init__(self, store: MarketPulseStore, gaps: GapTracker) -> None:
         self.store = store
@@ -193,6 +193,9 @@ class GapControlService:
         market = payload["native_market_id"]
         channel = payload["channel"]
         source_epoch = payload["source_epoch"]
+        if action == "released":
+            coverage = await self.gaps.on_released(venue, market, channel, source_epoch, now_ms)
+            return {"status": "ok", "coverage": coverage.to_payload()}
         if action == "connected":
             coverage = await self.gaps.on_connected(venue, market, channel, source_epoch, now_ms)
             return {"status": "ok", "coverage": coverage.to_payload()}

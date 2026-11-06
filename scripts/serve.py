@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +23,14 @@ RUNTIME = ROOT / ".runtime"
 LOG = logging.getLogger("serve")
 MAX_RESTARTS = 5
 RESTART_WINDOW = 600.0
+STOP_FILES: dict[int, Path] = {}
+
+
+def managed_start(command, **kwargs):
+    marker = RUNTIME / ("stop-" + uuid.uuid4().hex)
+    process = subprocess.Popen(command, env={**os.environ, "HYPERDATA_STOP_FILE": str(marker)}, **kwargs)
+    STOP_FILES[process.pid] = marker
+    return process
 
 
 def _health_url(port: int) -> str:
@@ -60,7 +70,7 @@ def start_native(port: int, demo: bool) -> subprocess.Popen:
         command.append("--demo")
     LOG.info("Starting native API: %s (log: %s)", " ".join(command), log_path)
     with log_path.open("ab") as log:
-        return subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        return managed_start(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
 
 
 def start_screener(api_port: int, web_port: int, forwarded: list[str]) -> subprocess.Popen:
@@ -71,7 +81,7 @@ def start_screener(api_port: int, web_port: int, forwarded: list[str]) -> subpro
         *forwarded,
     ]
     LOG.info("Starting screener: %s", " ".join(command))
-    return subprocess.Popen(command, cwd=ROOT)
+    return managed_start(command, cwd=ROOT)
 
 
 def stop(process: subprocess.Popen | None, name: str) -> None:
@@ -79,15 +89,26 @@ def stop(process: subprocess.Popen | None, name: str) -> None:
         return
     LOG.info("Stopping %s (pid %s)", name, process.pid)
     try:
+        marker = STOP_FILES.get(process.pid)
+        if marker is not None:
+            marker.touch()
+            process.wait(timeout=30)
+            marker.unlink(missing_ok=True)
+            STOP_FILES.pop(process.pid, None)
+            return
         if sys.platform != "win32":
             # SIGINT lets asyncio.run() unwind and close SQLite/sessions.
             process.send_signal(signal.SIGINT)
         else:
-            process.terminate()
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, check=False)
         process.wait(timeout=10)
     except (subprocess.TimeoutExpired, OSError):
         LOG.warning("%s did not stop cleanly; killing", name)
-        process.kill()
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
+        else:
+            process.kill()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -97,21 +118,25 @@ def stop(process: subprocess.Popen | None, name: str) -> None:
 def run(args: argparse.Namespace) -> int:
     RUNTIME.mkdir(parents=True, exist_ok=True)
     native: subprocess.Popen | None = None
-    if health_ok(args.api_port):
-        LOG.info("Using the already running native API on port %d", args.api_port)
-    else:
-        native = start_native(args.api_port, args.demo)
-        if not wait_for_health(args.api_port):
-            LOG.error("Native API did not become healthy on port %d", args.api_port)
-            stop(native, "native API")
-            return 1
-
-    screener = start_screener(args.api_port, args.web_port, args.forwarded)
-    LOG.info("Dashboard: http://127.0.0.1:%d/scalper", args.web_port)
+    screener: subprocess.Popen | None = None
     native_restarts: list[float] = []
     screener_restarts: list[float] = []
     try:
+        if health_ok(args.api_port):
+            LOG.info("Using the already running native API on port %d", args.api_port)
+        else:
+            native = start_native(args.api_port, args.demo)
+            if not wait_for_health(args.api_port):
+                LOG.error("Native API did not become healthy on port %d", args.api_port)
+                stop(native, "native API")
+                return 1
+
+        screener = start_screener(args.api_port, args.web_port, args.forwarded)
+        LOG.info("Dashboard: http://127.0.0.1:%d/scalper", args.web_port)
         while True:
+            if args.stop_file is not None and args.stop_file.is_file():
+                LOG.info("Cooperative shutdown requested")
+                break
             now = time.monotonic()
             if native is not None and native.poll() is not None:
                 native_restarts = [stamp for stamp in native_restarts if now - stamp < RESTART_WINDOW]
@@ -148,8 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--demo", action="store_true", help="run the native API on synthetic data")
     parser.add_argument("--api-port", type=int, default=8420, help="native API port (default: 8420)")
     parser.add_argument("--web-port", type=int, default=8421, help="screener web port (default: 8421)")
+    parser.add_argument("--stop-file", type=Path, default=RUNTIME / "serve.stop",
+                        help="create this local file to shut down both components cleanly")
     args, forwarded = parser.parse_known_args(argv)
     args.forwarded = forwarded
+    args.stop_file.unlink(missing_ok=True)
     if args.forwarded and args.forwarded[0] == "--":
         args.forwarded = args.forwarded[1:]
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

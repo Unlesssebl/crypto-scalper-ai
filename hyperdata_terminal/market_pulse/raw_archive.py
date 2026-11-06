@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import time
+import uuid
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -56,6 +59,8 @@ class RawArchive:
         self._first_receive_ms: int | None = None
         self._last_receive_ms: int | None = None
         self.last_error: str | None = None
+        self._space_checked_at = 0.0
+        self._space_ok = True
         if not read_only:
             self._open_new(now_ms=_now_ms())
 
@@ -64,9 +69,9 @@ class RawArchive:
         now_ms = max(now_ms, self._created_at_ms + 1)
         stamp = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self._counter += 1
-        name = f"{self.venue}-{stamp}-{self._counter:04d}.jsonl"
+        name = f"{self.venue}-{stamp}-{self._counter:04d}-{uuid.uuid4().hex[:8]}.jsonl"
         self._path = self.root / name
-        self._handle = self._path.open("wb")
+        self._handle = self._path.open("xb")
         self._created_at_ms = now_ms
         self._first_receive_ms = None
         self._last_receive_ms = None
@@ -82,6 +87,14 @@ class RawArchive:
     def append(self, payload: Mapping[str, Any], *, receive_time_ms: int, source_epoch: str) -> RawReference:
         if self.read_only or self._handle is None:
             raise RuntimeError("raw archive is read-only or closed")
+        if time.monotonic() - self._space_checked_at >= 5:
+            self._space_checked_at = time.monotonic()
+            venue_budget = int(os.getenv("PULSE_RAW_VENUE_BUDGET_BYTES", str(5 * 1024**3 // 2)))
+            reserve = int(os.getenv("PULSE_RAW_MIN_FREE_BYTES", str(512 * 1024**2)))
+            self._space_ok = (shutil.disk_usage(self.root).free >= reserve
+                             and sum(p.stat().st_size for p in self.root.glob("*.jsonl")) < venue_budget)
+        if not self._space_ok:
+            raise OSError("raw storage budget exhausted; collection interrupted explicitly")
         envelope = {
             "receive_time_ms": receive_time_ms,
             "source_epoch": source_epoch,
@@ -106,9 +119,10 @@ class RawArchive:
         self._last_receive_ms = receive_time_ms
         if self._first_receive_ms is None:
             self._first_receive_ms = receive_time_ms
-        if receive_time_ms - self._created_at_ms >= self.max_age_ms:
+        reference = RawReference(self._path.name, offset)
+        if receive_time_ms - self._created_at_ms >= min(self.max_age_ms, 300_000):
             self._open_new(now_ms=receive_time_ms)
-        return RawReference(self._path.name, offset)
+        return reference
 
     def seal(self) -> RawSegmentRecord | None:
         if self._handle is None or self._path is None:

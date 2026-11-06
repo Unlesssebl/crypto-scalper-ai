@@ -171,27 +171,27 @@ async def _run_api(port: int, demo: bool = False) -> int:
         limit = 60
     symbols = None if demo else await _api_universe(limit)
     hub = HyperDataHub(symbols=symbols, demo=demo, api_port=port)
-    await hub.start()
-    if "api_server" in hub.status.failed_components:
-        await hub.stop()
-        print(f"hyperdata: could not start the API on port {port} (in use? see the log)", file=sys.stderr)
-        return 1
-    print(f"HyperData API on http://127.0.0.1:{port}/v1/health  (Ctrl+C to stop)", flush=True)
-    logging.getLogger(__name__).info("HyperData API running on port %d (headless)", port)
-
-    # Wait for SIGINT/SIGTERM so `kill <pid>` (what process managers send)
-    # triggers a clean hub.stop(): flushing persistence and closing sockets.
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass  # add_signal_handler is unavailable on Windows
     try:
-        await stop.wait()
-    except asyncio.CancelledError:
-        pass
+        await hub.start()
+        if "api_server" in hub.status.failed_components:
+            print(f"hyperdata: could not start the API on port {port} (in use? see the log)", file=sys.stderr)
+            return 1
+        print(f"HyperData API on http://127.0.0.1:{port}/v1/health  (Ctrl+C to stop)", flush=True)
+        logging.getLogger(__name__).info("HyperData API running on port %d (headless)", port)
+
+        # Wait for SIGINT/SIGTERM so `kill <pid>` (what process managers send)
+        # triggers a clean hub.stop(): flushing persistence and closing sockets.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass  # add_signal_handler is unavailable on Windows
+        try:
+            await stop.wait()
+        except asyncio.CancelledError:
+            pass
     finally:
         await hub.stop()
     return 0
@@ -269,7 +269,8 @@ def main(argv: list[str] | None = None) -> None:
                     sys.exit(2)
             asyncio.run(run_single(args.dashboard, symbol=symbol, api_port=_api_port(args), boot=boot))
         elif command == "api":
-            sys.exit(asyncio.run(_run_api(args.port or _api_port(args) or 8420, demo=args.demo)))
+            from hyperdata_terminal.lifecycle import run_managed
+            sys.exit(asyncio.run(run_managed(_run_api(args.port or _api_port(args) or 8420, demo=args.demo))))
         elif command == "paper":
             sys.exit(asyncio.run(_run_paper(args)))
         elif command == "verify":

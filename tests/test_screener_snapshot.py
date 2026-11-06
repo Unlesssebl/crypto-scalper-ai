@@ -349,3 +349,12 @@ async def test_snapshot_no_drift_warning_when_subscribed() -> None:
     payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"],
                                    now=time.time(), include_candles=False)
     assert not any("universe drifted" in warning for warning in payload["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_selective_snapshot_does_not_demand_top_volume_subscriptions():
+    hub = FakeHub()
+    hub.orderflow.selective = True
+    hub.orderflow.symbols = []
+    payload = await build_snapshot(hub, symbols=["BTC"], windows=["1m"], include_candles=False)
+    assert not any("universe drifted" in warning for warning in payload["warnings"])

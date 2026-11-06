@@ -1,6 +1,7 @@
 """Hyperliquid public trades feed."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import Any
@@ -11,7 +12,7 @@ from ..contracts import (
     known_channel,
     normalize_epoch_ms,
 )
-from .base import CollectorConfig, StreamCollector
+from .base import CollectorConfig, StreamCollector, now_ms
 
 
 def normalize_hyperliquid_trades(
@@ -34,6 +35,10 @@ def normalize_hyperliquid_trades(
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError("Hyperliquid trade is not an object")
+        if not row.get("coin"):
+            raise ValueError("Hyperliquid execution has no instrument identity")
+        if row["coin"] != spec.native_market_id:
+            continue
         side = _side(row.get("side"))
         event_time_ms = normalize_epoch_ms(row.get("time"), "ms")
         price = row.get("px")
@@ -90,11 +95,62 @@ class HyperliquidCollector(StreamCollector):
 
     def __init__(self, config: CollectorConfig, archive, sink, gaps=None, specs=None) -> None:
         super().__init__(config, archive, sink, gaps)
+        self.overview_markets = set()
+        self._overview_subscribed = set()
+        self._overview_pending = {}
+        self._overview_epoch_start = 0
+        self._overview_lock = asyncio.Lock()
         self.specs = {spec.native_market_id: spec for spec in (specs or [])}
         if not self.specs:
             from .specs import hyperliquid_spec
 
             self.specs = {market: hyperliquid_spec(market) for market in config.markets}
+
+    async def auxiliary_connected(self, ws, epoch):
+        self._overview_subscribed.clear()
+        self._overview_epoch_start = now_ms()
+        await self.set_overview_markets(self.overview_markets)
+
+    async def set_overview_markets(self, markets):
+        async with self._overview_lock:
+            self.overview_markets = set(markets)
+            if self._ws is None or self._ws.closed:
+                return
+            for method, symbols in (("unsubscribe", self._overview_subscribed - self.overview_markets),
+                                    ("subscribe", self.overview_markets - self._overview_subscribed)):
+                for symbol in sorted(symbols):
+                    await self._ws.send_json({"method": method, "subscription": {
+                        "type": "candle", "coin": symbol, "interval": "1m"}})
+            self._overview_subscribed = set(self.overview_markets)
+
+    async def auxiliary_payload(self, payload, epoch, received, raw_ref):
+        if not isinstance(payload, dict) or payload.get("channel") != "candle":
+            return
+        from ..overview import VERSION, validate_candle
+        data = payload.get("data") or {}
+        if (not isinstance(data, dict) or data.get("s") not in self.overview_markets
+                or data.get("i") != "1m"):
+            return
+        start = data.get("t")
+        if type(start) is not int or data.get("T") != start + 59_999:
+            raise ValueError("unexpected candle boundaries")
+        row = validate_candle({"schema_version": VERSION, "symbol": data["s"],
+            "start_ms": start, "received_at_ms": received,
+            "epoch_started_ms": self._overview_epoch_start, "trade_count": data.get("n"),
+            "base_volume": data.get("v"), "close": data.get("c"),
+            "source_epoch": epoch, "raw_ref": raw_ref}, received)
+        self._overview_pending[(data["s"], start)] = row
+        # Missing transport history remains missing, never a zero observation.
+        self._overview_pending = {k: v for k, v in self._overview_pending.items()
+                                  if v["start_ms"] >= received // 60_000*60_000 - 120_000}
+
+    async def flush_overview(self):
+        rows = list(self._overview_pending.items())[:1000]
+        if rows:
+            await self.sink.overview([r for _, r in rows])
+            for key, row in rows:
+                if self._overview_pending.get(key) is row:
+                    self._overview_pending.pop(key, None)
 
     @property
     def url(self) -> str:
@@ -108,6 +164,14 @@ class HyperliquidCollector(StreamCollector):
 
     def is_subscription_ack(self, payload: Any) -> bool:
         return isinstance(payload, dict) and payload.get("channel") == "subscriptionResponse"
+
+    def acknowledged_market(self, payload):
+        if self.is_subscription_ack(payload):
+            data = payload.get("data") or {}
+            if (data.get("method") == "subscribe"
+                    and (data.get("subscription") or {}).get("type") == "trades"):
+                return (data.get("subscription") or {}).get("coin")
+        return None
 
     def is_error(self, payload: Any) -> bool:
         return isinstance(payload, dict) and (
@@ -140,7 +204,7 @@ class HyperliquidCollector(StreamCollector):
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("Hyperliquid trade is not an object")
-            coin = str(row.get("coin") or "").upper()
+            coin = str(row.get("coin") or "")
             if coin not in self.specs:
                 # Uncovered markets are not part of V1; they are never reported
                 # as an observed cross-venue comparison.

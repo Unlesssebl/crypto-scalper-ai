@@ -1,4 +1,5 @@
 """Objective post-delivery movement and decision reporting."""
+
 from collections import Counter, defaultdict
 from statistics import median
 
@@ -54,8 +55,11 @@ def match_controls(deliveries, controls):
         for index, control in enumerate(available):
             distance = abs(control["delivered_at"] - timestamp) % 86400
             distance = min(distance, 86400 - distance)
-            if (abs(control["delivered_at"] - timestamp) >= MOVE_SECONDS
-                    and distance <= MATCH_HOUR_LIMIT and 0.5 <= control["target_pct"] / target <= 2):
+            if (
+                abs(control["delivered_at"] - timestamp) >= MOVE_SECONDS
+                and distance <= MATCH_HOUR_LIMIT
+                and 0.5 <= control["target_pct"] / target <= 2
+            ):
                 options.append((distance, abs(control["delivered_at"] - timestamp), index))
         if options:
             pairs.append((delivery, available.pop(min(options)[2])))
@@ -63,14 +67,25 @@ def match_controls(deliveries, controls):
 
 
 def audit_report(db, since, now, windows):
-    results = {window: {"candidates": 0, "decisions": {}, "versions": {},
-                        "delay_buckets": {}, "rank_labels": RANK_LABELS, "control": {"pairs": 0, "signal_hits": 0, "control_hits": 0}}
-               for window in windows}
-    for row in db.execute("""
+    results = {
+        window: {
+            "candidates": 0,
+            "decisions": {},
+            "versions": {},
+            "delay_buckets": {},
+            "rank_labels": RANK_LABELS,
+            "control": {"pairs": 0, "signal_hits": 0, "control_hits": 0},
+        }
+        for window in windows
+    }
+    for row in db.execute(
+        """
         SELECT c.window,c.version,c.decision,COUNT(*) AS count
         FROM finding_candidates c WHERE c.detected_at BETWEEN ? AND ?
         GROUP BY c.window,c.version,c.decision
-    """, (since, now)):
+    """,
+        (since, now),
+    ):
         result = results.get(row["window"])
         if result is None:
             continue
@@ -81,12 +96,15 @@ def audit_report(db, since, now, windows):
         result["versions"].setdefault(row["version"], {})
     delays = defaultdict(list)
     deliveries = defaultdict(list)
-    for row in db.execute("""
+    for row in db.execute(
+        """
         SELECT a.symbol,a.window,m.rank,m.status,m.delivered_at,m.target_pct,c.detected_at,c.version
         FROM delivered_moves m JOIN analyses a ON a.id=m.analysis_id
         JOIN finding_candidates c ON c.analysis_id=a.id
         WHERE m.delivered_at BETWEEN ? AND ? ORDER BY m.delivered_at, a.id
-    """, (since, now)):
+    """,
+        (since, now),
+    ):
         result = results.get(row["window"])
         if result is None:
             continue
@@ -102,12 +120,15 @@ def audit_report(db, since, now, windows):
     for (window, version, rank), samples in delays.items():
         results[window]["versions"][version][rank]["median_delay_seconds"] = round(median(samples), 1)
     for (symbol, window), delivered in deliveries.items():
-        controls = db.execute("""
+        controls = db.execute(
+            """
             SELECT delivered_at,target_pct,status FROM quiet_moves
             WHERE symbol=? AND window=? AND delivered_at BETWEEN ? AND ?
               AND status IN ('hit','quiet')
             ORDER BY delivered_at
-        """, (symbol, window, now - CONTROL_DAYS * 86400, now))
+        """,
+            (symbol, window, now - CONTROL_DAYS * 86400, now),
+        )
         result = results[window]["control"]
         for signal, control in match_controls(delivered, controls):
             result["pairs"] += 1

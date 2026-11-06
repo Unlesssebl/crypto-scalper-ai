@@ -7,10 +7,27 @@ fresh order book or heartbeat is tracked separately from the trades channel.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from .contracts import Gap, QualityState
 from .storage import ChannelCoverage, MarketPulseStore
+
+
+def reconciled_covers_interval(gaps: Iterable[Gap], start_ms: int, end_ms: int) -> bool:
+    """Require a union of reconciled intervals to cover every part of a window."""
+    cursor = start_ms
+    intervals = sorted(
+        (gap.start_ms, gap.end_ms)
+        for gap in gaps
+        if gap.state == QualityState.RECONCILED.value and gap.end_ms is not None
+    )
+    for start, end in intervals:
+        if start > cursor:
+            break
+        cursor = max(cursor, end)
+        if cursor >= end_ms:
+            return True
+    return False
 
 
 class GapTracker:
@@ -34,6 +51,7 @@ class GapTracker:
             current is not None
             and current.last_receive_ms is not None
             and current.source_epoch != source_epoch
+            and current.state != QualityState.OUTSIDE_ATTENTION.value
         ):
             # A new epoch means the collector restarted.  A clean stop does not
             # raise a disconnect, but the downtime is still missing data, so the
@@ -60,6 +78,14 @@ class GapTracker:
             channel=channel,
             state=QualityState.GAP_DETECTED.value,
         )
+        inactive = await self.store.list_gaps(venue=venue, native_market_id=native_market_id,
+                                            channel=channel, state=QualityState.OUTSIDE_ATTENTION.value)
+        for gap in inactive:
+            if gap.end_ms is None:
+                await self.store.update_gap(gap.gap_id, end_ms=now_ms)
+        for gap in open_gaps:
+            if gap.end_ms is None and gap.start_ms < now_ms:
+                await self.store.update_gap(gap.gap_id, end_ms=now_ms, state=gap.state)
         if open_gaps:
             state = QualityState.RECOVERING.value
             reason = reason or "subscription acknowledged; interval is not reconciled"
@@ -101,6 +127,19 @@ class GapTracker:
         await self.store.set_coverage(coverage)
         return coverage
 
+    async def on_released(self, venue, market, channel, epoch, now_ms):
+        current = await self._coverage(venue, market, channel)
+        if current and current.state == QualityState.OUTSIDE_ATTENTION.value:
+            return current
+        await self.store.add_gap(Gap(gap_id=0, venue=venue, native_market_id=market, channel=channel,
+                                    source_epoch=epoch, start_ms=now_ms, detected_at_ms=now_ms,
+                                    state=QualityState.OUTSIDE_ATTENTION.value, reason="attention_released"))
+        coverage = ChannelCoverage(venue=venue, native_market_id=market, channel=channel,
+                                   source_epoch=epoch, state=QualityState.OUTSIDE_ATTENTION.value,
+                                   updated_at_ms=now_ms, reason="attention_released")
+        await self.store.set_coverage(coverage)
+        return coverage
+
     async def on_disconnected(
         self,
         venue: str,
@@ -118,8 +157,9 @@ class GapTracker:
             channel=channel,
             state=QualityState.GAP_DETECTED.value,
         )
-        if existing:
-            gap = existing[-1]
+        unbounded = [gap for gap in existing if gap.end_ms is None]
+        if unbounded:
+            gap = unbounded[-1]
         else:
             gap = await self.store.add_gap(
                 Gap(
@@ -164,6 +204,9 @@ class GapTracker:
     ) -> ChannelCoverage:
         current = await self._coverage(venue, native_market_id, channel)
         state = QualityState.OBSERVED_NO_DETECTED_GAP.value
+        if current is not None and current.state == QualityState.OUTSIDE_ATTENTION.value:
+            # Buffered/recovered executions cannot reactivate a deliberately released feed.
+            return current
         reason = None
         if current is not None:
             if current.state in {QualityState.GAP_DETECTED.value, QualityState.RECOVERING.value}:
@@ -210,6 +253,10 @@ class GapTracker:
         venue = venue or gap.venue
         native_market_id = native_market_id or gap.native_market_id
         channel = channel or gap.channel
+        remaining = await self.store.list_gaps(
+            venue=venue, native_market_id=native_market_id, channel=channel,
+            state=QualityState.GAP_DETECTED.value,
+        )
         current = await self._coverage(venue, native_market_id, channel)
         if current is not None:
             await self.store.set_coverage(
@@ -218,7 +265,7 @@ class GapTracker:
                     native_market_id=native_market_id,
                     channel=channel,
                     source_epoch=current.source_epoch,
-                    state=QualityState.RECONCILED.value,
+                    state=(QualityState.RECOVERING.value if remaining else QualityState.RECONCILED.value),
                     updated_at_ms=now_ms,
                     last_event_ms=current.last_event_ms,
                     last_receive_ms=current.last_receive_ms,

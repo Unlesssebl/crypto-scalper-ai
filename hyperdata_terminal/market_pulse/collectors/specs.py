@@ -51,7 +51,7 @@ def okx_spec(
     contract_multiplier: Decimal = Decimal(1),
     source: str = "okx public instruments",
 ) -> InstrumentSpec:
-    market_id = OKX_MARKET_IDS[base_asset]
+    market_id = market_for_venue("okx", base_asset)
     value = format(contract_size.normalize(), "f")
     multiplier = format(contract_multiplier.normalize(), "f")
     return InstrumentSpec(
@@ -96,5 +96,5 @@ def spec_index(specs: list[InstrumentSpec]) -> dict[tuple[str, str], InstrumentS
 
 def market_for_venue(venue: str, base_asset: str) -> str:
     if venue == "okx":
-        return OKX_MARKET_IDS[base_asset]
+        return OKX_MARKET_IDS.get(base_asset, base_asset.upper() + "-USDT-SWAP")
     return base_asset

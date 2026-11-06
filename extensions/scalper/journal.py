@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS fact_messages (
     event_id TEXT PRIMARY KEY REFERENCES analyses(id), message_id INTEGER,
     rich INTEGER NOT NULL DEFAULT 0, edit_status TEXT
 );
+CREATE TABLE IF NOT EXISTS pulse_card_links (
+    event_id TEXT NOT NULL REFERENCES analyses(id), episode_id TEXT NOT NULL,
+    evaluation_id TEXT NOT NULL, PRIMARY KEY(event_id, episode_id)
+);
+CREATE TABLE IF NOT EXISTS telegram_attempts (
+    id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, action TEXT NOT NULL,
+    at REAL NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pulse_card_edits (
+    event_id TEXT PRIMARY KEY REFERENCES analyses(id), status TEXT NOT NULL, updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS fact_message_updates (
     parent_id TEXT REFERENCES fact_messages(event_id), window TEXT NOT NULL,
     event_id TEXT NOT NULL REFERENCES analyses(id), PRIMARY KEY(parent_id, window)
@@ -171,6 +182,10 @@ class Journal:
 
     def recover(self):
         with self.db:
+            self.db.execute("UPDATE pulse_card_edits SET status='pending' WHERE status='queued'")
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='fact_reviews'").fetchone():
+                self.db.execute("UPDATE fact_reviews SET status='interrupted',reason='process_restarted' "
+                                "WHERE status='pending'")
             self.db.execute("UPDATE analyses SET delivery='interrupted' WHERE delivery='pending' AND ai IS NULL")
             self.db.execute("UPDATE analyses SET delivery='unknown' WHERE delivery IN ('sending', 'pending')")
             candidates = self.db.execute(
@@ -215,8 +230,27 @@ class Journal:
             if not self._record(key, event, snapshot, native):
                 return False
             self.db.execute("INSERT INTO fact_messages(event_id) VALUES(?)", (key,))
+            for venue in snapshot.get("market_pulse", {}).get("venues", []):
+                for assessment in venue.get("shadow", {}).get("metrics", {}).values():
+                    self.db.execute("INSERT OR REPLACE INTO pulse_card_links VALUES(?,?,?)",
+                                    (key, assessment["episode_id"], assessment["evaluation_id"]))
             self.db.execute("UPDATE finding_candidates SET analysis_id=? WHERE id=?", (key, key))
         return True
+
+    def pending_pulse_edits(self):
+        return [row[0] for row in self.db.execute(
+            "SELECT p.event_id FROM pulse_card_edits p JOIN fact_messages f ON f.event_id=p.event_id "
+            "WHERE p.status='pending' AND f.message_id IS NOT NULL")]
+
+    def record_telegram_attempt(self, key, action, detail):
+        with self.db:
+            self.db.execute("INSERT INTO telegram_attempts(event_id,action,at,state,detail) VALUES(?,?,?,?,?)",
+                            (key, action, time.time(), detail.get("state", "unknown"), dump(detail)))
+
+    def pulse_edit_status(self, key, state):
+        with self.db:
+            self.db.execute("UPDATE pulse_card_edits SET status=?,updated_at=? WHERE event_id=?",
+                            (state, time.time(), key))
 
     def fact_message(self, key):
         row = self.db.execute(

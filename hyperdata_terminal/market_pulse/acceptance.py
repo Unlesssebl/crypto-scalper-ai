@@ -8,13 +8,24 @@ observed for a small part of the requested interval.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
+from .collectors.specs import market_for_venue
 from .contracts import WINDOW_MS, QualityState, known_channel
+from .gaps import reconciled_covers_interval
 from .paging import page_windows
-from .storage import MarketPulseStore
+from .storage import ChannelCoverage, MarketPulseStore
 
 REPORT_SCHEMA = "market-pulse.acceptance.v1"
+
+
+def required_channels(markets: Sequence[str] = ("BTC", "XRP")) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (venue, market_for_venue(venue, market), channel)
+        for venue, channel in (("hyperliquid", "trades"), ("okx", "trades-all"))
+        for market in markets
+    )
+
 
 USABLE_STATES = {
     QualityState.OBSERVED_NO_DETECTED_GAP.value,
@@ -60,11 +71,7 @@ class ChannelAcceptance:
 
     @property
     def denominator(self) -> int:
-        return (
-            self.effective_minutes
-            - self.provisional_windows
-            - self.declared_outage_windows
-        )
+        return self.effective_minutes - self.declared_outage_windows
 
     @property
     def usable_pct(self) -> float | None:
@@ -88,6 +95,7 @@ class ChannelAcceptance:
             and self.coverage_span_pct is not None
             and self.usable_pct >= self.required_pct
             and self.coverage_span_pct >= self.required_pct
+            and self.provisional_windows == 0
             and self.conflicts == 0
             and self.missing_windows == 0
         )
@@ -172,19 +180,34 @@ async def build_acceptance_report(
     start_ms: int,
     end_ms: int,
     required_pct: float = 99.0,
+    expected_channels: Sequence[tuple[str, str, str]] | None = None,
 ) -> dict[str, Any]:
     if end_ms <= start_ms:
         raise ValueError("end_ms must be after start_ms")
     start_ms = start_ms // WINDOW_MS * WINDOW_MS
     end_ms = end_ms // WINDOW_MS * WINDOW_MS
     expected = (end_ms - start_ms) // WINDOW_MS
+    if expected <= 0:
+        raise ValueError("acceptance requires at least one complete UTC minute")
+    if not 0 < required_pct <= 100:
+        raise ValueError("required_pct must be in (0, 100]")
+    selected = tuple(dict.fromkeys(required_channels() if expected_channels is None else expected_channels))
+    if not selected:
+        raise ValueError("expected_channels must not be empty")
 
     coverage = await store.list_coverage()
+    by_channel = {(item.venue, item.native_market_id, item.channel): item for item in coverage}
+    missing_channels = [key for key in selected if key not in by_channel]
     conflicts = await store.list_conflicts(limit=100_000)
     gaps = await store.list_gaps(limit=100_000)
 
     channels: list[ChannelAcceptance] = []
-    for item in coverage:
+    for key in selected:
+        item = by_channel.get(key) or ChannelCoverage(
+            venue=key[0], native_market_id=key[1], channel=key[2], source_epoch="",
+            state=QualityState.UNAVAILABLE.value, updated_at_ms=0,
+            reason="required channel never observed",
+        )
         kind = known_channel(item.venue, item.channel).value
         windows = await _channel_windows(
             store,
@@ -285,9 +308,14 @@ async def build_acceptance_report(
                 else:
                     unusable += 1
                 continue
-            if QualityState.RECONCILED.value in states:
+            if reconciled_covers_interval(channel_gaps, window_start, window_start + WINDOW_MS):
                 usable += 1
-            elif item.state in USABLE_STATES:
+            elif (
+                item.state in USABLE_STATES
+                and item.connected_since_ms is not None
+                and item.connected_since_ms <= window_start
+                and max(item.heartbeat_ms or 0, item.last_receive_ms or 0) >= window_start + WINDOW_MS
+            ):
                 # A live, gap-free channel can vouch for a minute without
                 # trades: it is quiet, not missing.
                 quiet += 1
@@ -329,7 +357,9 @@ async def build_acceptance_report(
         "expected_minutes": expected,
         "required_pct": required_pct,
         "channels": payloads,
-        "passed": bool(channels) and all(row["passed"] for row in payloads),
+        "expected_channels": [list(key) for key in selected],
+        "missing_channels": [list(key) for key in missing_channels],
+        "passed": not missing_channels and bool(channels) and all(row["passed"] for row in payloads),
         "limits": {
             "completeness_proof": "not claimed",
             "note": (
@@ -349,6 +379,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"({report['expected_minutes']} minutes)",
         f"- Required usable: {report['required_pct']}%",
         f"- Overall: **{'PASS' if report['passed'] else 'FAIL'}**",
+        f"- Missing required channels: {len(report.get('missing_channels', []))}",
         "",
         "| venue | market | channel | span % | effective | outside | closed | open "
         "| quiet | usable | declared | unusable | missing | usable % "
@@ -374,6 +405,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "Declared outage minutes are excluded from the denominator. "
             "They are known losses, not recovered data.",
+            "",
+            "Provisional minutes block PASS; missing required channels also block PASS.",
             "",
             "A channel must be observed for at least the required share of the "
             "requested window; one healthy minute cannot pass a 24-hour report.",

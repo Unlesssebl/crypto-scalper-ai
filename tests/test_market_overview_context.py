@@ -1,6 +1,8 @@
 """The Market Overview TUI renders the native market-context block."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
@@ -258,3 +260,78 @@ async def test_extra_reader_failure_does_not_break_dashboard():
     await dashboard.update_data()
     assert dashboard.extra == {}
     assert len(dashboard.assets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_fetch", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_page_keys_redraw_without_waiting_for_data(monkeypatch, slow_fetch, cancel):
+    from hyperdata_terminal.dashboards import market_overview
+
+    dashboard = MarketOverviewDashboard(refresh_rate=60)
+    fetching = asyncio.Event()
+    rendered = asyncio.Event()
+    fetch_cancelled = asyncio.Event()
+    calls = 0
+
+    async def update_data():
+        nonlocal calls
+        calls += 1
+        fetching.set()
+        if slow_fetch:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                fetch_cancelled.set()
+
+    class Pager:
+        def __init__(self, callback):
+            self.callback = callback
+            self.stopped = False
+
+        def start(self):
+            return True
+
+        def stop(self):
+            self.stopped = True
+
+    class Display:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def update(self, page, *, refresh=False):
+            if page == "risk" and refresh:
+                rendered.set()
+
+    monkeypatch.setattr(market_overview, "KeyPager", Pager)
+    monkeypatch.setattr(market_overview, "Live", Display)
+    monkeypatch.setattr(dashboard.console, "clear", lambda: None)
+    monkeypatch.setattr(dashboard, "build_dashboard", lambda: dashboard.page)
+    monkeypatch.setattr(dashboard, "update_data", update_data)
+
+    task = asyncio.create_task(dashboard.run())
+    try:
+        await asyncio.wait_for(fetching.wait(), timeout=1)
+        pager = dashboard._pager
+        # Exercise the actual thread-to-event-loop boundary used by KeyPager.
+        await asyncio.to_thread(pager.callback, "2")
+        await asyncio.wait_for(rendered.wait(), timeout=0.5)
+        assert calls == 1  # Navigation must not trigger another fetch.
+        if cancel:
+            task.cancel()
+        else:
+            await asyncio.to_thread(pager.callback, "\x03")
+        await asyncio.wait_for(task, timeout=0.5)
+        assert pager.stopped
+        assert dashboard._pager is None
+        if slow_fetch:
+            assert fetch_cancelled.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

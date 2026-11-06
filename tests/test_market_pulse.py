@@ -206,6 +206,7 @@ async def make_services():
     store = InMemoryMarketPulseStore()
     await store.register_instruments(default_instruments())
     gaps = GapTracker(store)
+    await gaps.on_connected("hyperliquid", "BTC", "trades", "epoch-1", MINUTE)
     windows = WindowService(store, grace_ms=5_000)
     ingest = IngestionService(store, windows, gaps)
     return store, gaps, windows, ingest
@@ -1043,7 +1044,7 @@ async def test_auto_recovery_closes_covered_open_gap(tmp_path):
     archive = RawArchive(tmp_path, "hyperliquid")
     first = MINUTE + 1_000
     last = MINUTE + 181_000
-    for tid, stamp in ((21, first), (22, last)):
+    for tid, stamp in ((21, first), (22, last), (23, last + 1_000)):
         archive.append(
             {
                 "channel": "trades",
@@ -1285,3 +1286,309 @@ async def test_acceptance_rejects_one_minute_for_a_24h_window():
     assert row["coverage_span_pct"] < 1.0
     assert row["passed"] is False
     assert report["passed"] is False
+
+
+@pytest.mark.parametrize("connect_offset", [30_000, 60_000, 120_000])
+async def test_snapshot_before_observation_is_never_a_complete_minute(connect_offset):
+    store, gaps, windows, ingest = await make_services()
+    connected = MINUTE + connect_offset
+    await gaps.on_connected("hyperliquid", "BTC", "trades", "epoch-1", connected)
+    await ingest.append_batch(
+        [event(event_time_ms=MINUTE + 1_000, receive_time_ms=connected + 1_000)],
+        now_ms=connected + 1_000,
+    )
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 180_000)
+    window = await windows.rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE, now_ms=MINUTE + 185_000,
+    )
+    assert window.quality == "partial"
+
+
+@pytest.mark.parametrize(
+    "frames, should_reconcile",
+    [([], False), ([(1_000, "e1")], False),
+     ([(1_000, "e1"), (2_000, "e1")], False),
+     ([(1_000, "e1"), (60_000, "e2")], False),
+     ([(1_000, "e1"), (60_000, "e1")], True),
+     ([(1_000, "e1"), (61_000, "e1")], True)],
+)
+async def test_raw_recovery_requires_target_boundary_and_one_epoch(tmp_path, frames, should_reconcile):
+    from hyperdata_terminal.market_pulse.recovery import AutoRawRecovery
+
+    archive = RawArchive(tmp_path, "hyperliquid")
+    for tid, (offset, epoch) in enumerate(frames):
+        stamp = MINUTE + offset
+        archive.append(
+            {"channel": "trades", "data": [
+                {"coin": "BTC", "side": "B", "px": "100", "sz": "1", "time": stamp, "tid": tid}
+            ]}, receive_time_ms=stamp, source_epoch=epoch,
+        )
+    archive.close()
+    store, gaps, _windows, ingest = await make_services()
+    await store.add_gap(Gap(
+        gap_id=0, venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+        start_ms=MINUTE + 1_000, end_ms=None, detected_at_ms=MINUTE + 2_000,
+        state="gap_detected", reason="ingest interrupted",
+    ))
+    await store.set_coverage(ChannelCoverage(
+        venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e2",
+        state="recovering", updated_at_ms=MINUTE + 60_000, connected_since_ms=MINUTE + 60_000,
+    ))
+    result = (await AutoRawRecovery(
+        store, ingest, gaps, raw_root=str(tmp_path), min_attempt_interval_ms=0,
+    ).run_once(now_ms=MINUTE + 65_000))[0]
+    gap = (await store.list_gaps())[0]
+    assert result["reconciled_gaps"] == int(should_reconcile)
+    assert result["remaining_gaps"] == int(not should_reconcile)
+    assert result["status"] == ("ok" if should_reconcile else "partial")
+    assert gap.end_ms == (MINUTE + 60_000 if should_reconcile else None)
+    assert gap.state == ("reconciled" if should_reconcile else "gap_detected")
+    # The boundary frame proves coverage but belongs outside the replay range.
+    stored = await store.list_events_after(0, limit=100)
+    assert all(row.event.receive_time_ms < MINUTE + 60_000 for row in stored)
+
+
+async def test_reconciled_channel_does_not_bless_unobserved_future_window():
+    store, _gaps, windows, _ingest = await make_services()
+    await store.set_coverage(ChannelCoverage(
+        venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+        state="reconciled", updated_at_ms=MINUTE, connected_since_ms=MINUTE, heartbeat_ms=MINUTE,
+    ))
+    window = await windows.rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE + 3_600_000, now_ms=MINUTE + 3_665_000,
+    )
+    assert window.quality == "partial"
+    assert window.buy_base is None
+
+
+@pytest.mark.parametrize("covered_end, expected", [(30_000, "partial"), (60_000, "reconciled")])
+async def test_reconciled_interval_must_cover_whole_minute(covered_end, expected):
+    store, _gaps, windows, _ingest = await make_services()
+    await store.set_coverage(ChannelCoverage(
+        venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+        state="reconciled", updated_at_ms=MINUTE + 120_000, connected_since_ms=MINUTE + 120_000,
+        heartbeat_ms=MINUTE + 120_000,
+    ))
+    await store.add_gap(Gap(
+        gap_id=0, venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+        start_ms=MINUTE, end_ms=MINUTE + covered_end, detected_at_ms=MINUTE, state="reconciled",
+    ))
+    window = await windows.rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE, now_ms=MINUTE + 125_000,
+    )
+    assert window.quality == expected
+    if expected == "reconciled":
+        provisional = await windows.rebuild(
+            "hyperliquid", "BTC", "trades", "execution", MINUTE, now_ms=MINUTE + 61_000,
+        )
+        assert provisional.provisional
+        assert provisional.quality == "warming_up"
+
+
+async def test_reconciling_one_gap_preserves_other_open_gap():
+    store, gaps, windows, _ingest = await make_services()
+    first, _second = [await store.add_gap(Gap(
+        gap_id=0, venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+        start_ms=MINUTE + offset, end_ms=None, detected_at_ms=MINUTE + offset, state="gap_detected",
+    )) for offset in (0, 120_000)]
+    await gaps.mark_reconciled(first.gap_id, end_ms=MINUTE + 60_000, method="raw", now_ms=MINUTE + 180_000)
+    coverage = await store.get_coverage("hyperliquid", "BTC", "trades")
+    assert coverage.state == "recovering"
+    recovered = await windows.rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE, now_ms=MINUTE + 185_000,
+    )
+    assert recovered.quality == "reconciled"
+    lost = await windows.rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE + 120_000, now_ms=MINUTE + 185_000,
+    )
+    assert lost.quality == "gap_detected"
+
+
+async def test_delayed_heartbeat_revisits_partial_window():
+    store, gaps, _windows, ingest = await make_services()
+    await ingest.append_batch([event()], now_ms=MINUTE + 1_000)
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 59_000)
+    await ingest.close_due(now_ms=MINUTE + 65_001)
+    before = await store.get_window("hyperliquid", "BTC", "trades", "execution", MINUTE)
+    assert before.quality == "partial" and not before.provisional
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 75_000)
+    await ingest.close_due(now_ms=MINUTE + 80_000)
+    after = await store.get_window("hyperliquid", "BTC", "trades", "execution", MINUTE)
+    assert after.quality == "observed_no_detected_gap"
+    assert after.event_count == before.event_count
+    assert after.revised_at_ms == MINUTE + 80_000
+
+
+async def test_heartbeat_deadline_enters_disconnect_path(tmp_path, monkeypatch):
+    import aiohttp
+
+    from hyperdata_terminal.market_pulse.collectors.base import CollectorConfig
+    from hyperdata_terminal.market_pulse.collectors.okx import OkxCollector
+
+    stop = asyncio.Event()
+    store, tracker, _windows, _ingest = await make_services()
+
+    class Reporter:
+        async def connected(self, *args):
+            await tracker.on_connected(*args)
+
+        async def disconnected(self, *args, **kwargs):
+            await tracker.on_disconnected(*args, **kwargs)
+            stop.set()
+
+    class SilentWS(_FakeWS):
+        async def receive(self, timeout=None):
+            if self.messages:
+                return self.messages.pop(0)
+            raise asyncio.TimeoutError
+
+    class Session(_FakeSession):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    ws = SilentWS([_FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps({
+        "event": "subscribe", "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
+    }))], stop)
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda: Session(ws))
+    archive = RawArchive(tmp_path, "okx")
+    try:
+        collector = OkxCollector(CollectorConfig(
+            venue="okx", markets=("BTC",), raw_dir=str(tmp_path), ingest_url="http://unused",
+            base_backoff_ms=0,
+        ), archive, _NullSink(), Reporter())
+        await asyncio.wait_for(collector.run(stop), timeout=2)
+    finally:
+        archive.close()
+    gaps = await store.list_gaps(venue="okx")
+    assert len(gaps) == 1
+    assert "heartbeat response deadline" in gaps[0].reason
+    assert gaps[0].state == "gap_detected"
+    assert ws.sent.count("ping") == 1
+
+
+async def test_pending_minutes_cannot_pass_acceptance():
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report
+
+    store, gaps, _windows, ingest = await make_services()
+    await ingest.append_batch([event()], now_ms=MINUTE + 1_000)
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
+    for minute in (1, 2, 3):
+        await ingest.append_batch([event(
+            trade_id=f"later-{minute}", event_time_ms=MINUTE + minute * WINDOW_MS + 1_000,
+        )], now_ms=MINUTE + minute * WINDOW_MS + 1_000)
+    report = await build_acceptance_report(
+        store, start_ms=MINUTE, end_ms=MINUTE + 4 * WINDOW_MS,
+        expected_channels=(("hyperliquid", "BTC", "trades"),),
+    )
+    row = report["channels"][0]
+    assert row["closed_windows"] == 1
+    assert row["provisional_windows"] == 3
+    assert row["usable_pct"] == 25
+    assert not row["passed"] and not report["passed"]
+
+
+async def test_acceptance_requires_channels_or_an_explicit_subset():
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report
+
+    store, gaps, _windows, ingest = await make_services()
+    await ingest.append_batch([event()], now_ms=MINUTE + 1_000)
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
+    report = await build_acceptance_report(store, start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS)
+    assert len(report["channels"]) == 4
+    assert len(report["missing_channels"]) == 3
+    assert not report["passed"]
+    subset = await build_acceptance_report(
+        store, start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS,
+        expected_channels=(("hyperliquid", "BTC", "trades"),),
+    )
+    assert subset["passed"]
+    assert subset["expected_channels"] == [["hyperliquid", "BTC", "trades"]]
+
+
+async def test_acceptance_passes_all_four_observed_channels():
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report, required_channels
+
+    store, gaps, _windows, ingest = await make_services()
+    for venue, market, channel in required_channels():
+        await gaps.on_connected(venue, market, channel, "epoch-1", MINUTE)
+        await ingest.append_batch([event(venue=venue, market=market)], now_ms=MINUTE + 1_000)
+        await gaps.on_heartbeat(venue, market, channel, MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
+    report = await build_acceptance_report(store, start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS)
+    assert report["passed"]
+    assert len(report["channels"]) == 4
+    assert report["missing_channels"] == []
+
+
+async def test_acceptance_uses_configured_markets(monkeypatch):
+    from hyperdata_terminal.market_pulse import service
+
+    store, _gaps, _windows, _ingest = await make_services()
+
+    async def connect(*args, **kwargs):
+        return store
+
+    monkeypatch.setenv("PULSE_MARKETS", "BTC")
+    monkeypatch.setattr(service.PostgresStore, "connect", connect)
+    result = json.loads(await service.acceptance(start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS))
+    assert result["expected_channels"] == [
+        ["hyperliquid", "BTC", "trades"], ["okx", "BTC-USDT-SWAP", "trades-all"],
+    ]
+    assert not result["passed"]
+
+
+async def test_no_coverage_does_not_create_zero_activity():
+    store = InMemoryMarketPulseStore()
+    window = await WindowService(store).rebuild(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE, now_ms=MINUTE + 65_001,
+    )
+    assert window.quality == "unavailable"
+    assert window.buy_base is None
+
+
+async def test_real_response_resets_heartbeat_deadline(tmp_path):
+    import aiohttp
+
+    from hyperdata_terminal.market_pulse.collectors.base import CollectorConfig
+    from hyperdata_terminal.market_pulse.collectors.okx import OkxCollector
+
+    stop = asyncio.Event()
+
+    class WS(_FakeWS):
+        async def receive(self, timeout=None):
+            message = self.messages.pop(0)
+            if message is None:
+                if not self.messages:
+                    stop.set()
+                raise asyncio.TimeoutError
+            return message
+
+    ws = WS([
+        _FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps({"event": "subscribe"})),
+        None, _FakeMessage(aiohttp.WSMsgType.TEXT, "pong"), None,
+    ], stop)
+    archive = RawArchive(tmp_path, "okx")
+    try:
+        collector = OkxCollector(CollectorConfig(
+            venue="okx", markets=("BTC",), raw_dir=str(tmp_path), ingest_url="http://unused",
+        ), archive, _NullSink())
+        await collector._run_connection(_FakeSession(ws), "e1", stop)
+    finally:
+        archive.close()
+    assert ws.sent.count("ping") == 2
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"expected_channels": ()}, {"required_pct": 0}, {"required_pct": 101},
+])
+async def test_acceptance_rejects_bypass_configuration(kwargs):
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report
+
+    store, _gaps, _windows, _ingest = await make_services()
+    with pytest.raises(ValueError):
+        await build_acceptance_report(store, start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS, **kwargs)

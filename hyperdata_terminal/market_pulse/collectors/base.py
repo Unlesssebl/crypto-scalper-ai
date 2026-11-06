@@ -14,7 +14,7 @@ import random
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence
 
 import aiohttp
@@ -61,6 +61,8 @@ class GapReporter(Protocol):
 
 
 class NullGapReporter:
+    async def released(self, *args, **kwargs):
+        return None
     async def connected(self, *args: Any, **kwargs: Any) -> None:
         return None
 
@@ -111,6 +113,73 @@ class StreamCollector(ABC):
         self._last_flush_ms = 0
         self._last_receive_ms: int | None = None
         self._session: aiohttp.ClientSession | None = None
+        self.dynamic = False
+        self._ws = None
+        self._epoch = None
+        self.confirmed = set()
+        self.pending_ack = {}
+        self.rejected_until = {}
+        self._flush_lock = asyncio.Lock()
+        self._reported_heartbeat = {}
+
+    async def auxiliary_connected(self, ws, epoch):
+        pass
+
+    async def auxiliary_payload(self, payload, epoch, received, raw_ref):
+        pass
+
+    def acknowledged_market(self, payload):
+        return None
+
+    def _messages_for(self, markets):
+        previous = self.config
+        try:
+            self.config = replace(previous, markets=tuple(markets))
+            return self.subscriptions()
+        finally:
+            self.config = previous
+
+    async def change_markets(self, markets, *, reason="attention_released"):
+        """Change subscriptions on one socket; keep retained markets and their epochs."""
+        wanted = tuple(markets)
+        removed = set(self.config.markets) - set(wanted)
+        self.config = replace(self.config, markets=wanted)
+        if self._ws is not None and not self._ws.closed:
+            for market in removed:
+                for message in self._messages_for((market,)):
+                    message = {**message, ("method" if self.venue == "hyperliquid" else "op"): "unsubscribe"}
+                    await self._ws.send_json(message)
+                native = self.native_market_id(market)
+                self.confirmed.discard(native)
+                self.pending_ack.pop(native, None)
+                if reason == "attention_released":
+                    await self.gaps.released(self.venue, native, self.channel, self._epoch, now_ms())
+                else:
+                    await self.gaps.disconnected(self.venue, native, self.channel, self._epoch, now_ms(),
+                                                 reason=reason, last_receive_ms=self._last_receive_ms)
+                    await self.gaps.unavailable(self.venue, native, self.channel, self._epoch, now_ms(), reason=reason)
+            for market in wanted:
+                native = self.native_market_id(market)
+                if (native not in self.confirmed and native not in self.pending_ack
+                        and self.rejected_until.get(native, 0) <= now_ms()):
+                    self.pending_ack[native] = now_ms() + self.config.ack_timeout_ms
+                    for message in self._messages_for((market,)):
+                        await self._ws.send_json(message)
+        self.config = replace(self.config, markets=wanted)
+
+    async def expire_pending(self):
+        for native, deadline in list(self.pending_ack.items()):
+            if now_ms() >= deadline:
+                self.pending_ack.pop(native, None)
+                self.rejected_until[native] = now_ms() + 60_000
+                await self.gaps.unavailable(self.venue, native, self.channel, self._epoch, now_ms(),
+                                            reason="subscription_ack_timeout")
+
+    async def _confirm(self, native, epoch, received):
+        if native in self.pending_ack:
+            await self.gaps.connected(self.venue, native, self.channel, epoch, received)
+            self.pending_ack.pop(native, None)
+            self.confirmed.add(native)
 
     @property
     @abstractmethod
@@ -210,9 +279,15 @@ class StreamCollector(ABC):
         stop: asyncio.Event,
     ) -> None:
         ws = await session.ws_connect(self.url, heartbeat=None, max_msg_size=8 * 1024**2)
+        self._ws, self._epoch = ws, epoch
+        if self.dynamic:
+            self.confirmed.clear()
+            self.pending_ack = {self.native_market_id(m): now_ms() + self.config.ack_timeout_ms
+                                for m in self.config.markets}
         try:
             for subscription in self.subscriptions():
                 await ws.send_json(subscription)
+            await self.auxiliary_connected(ws, epoch)
             early = await self._wait_for_subscription(ws)
             # Report the new epoch before ingesting anything: a data frame may
             # arrive before the subscription ack, and ingesting it first would
@@ -220,6 +295,7 @@ class StreamCollector(ABC):
             await self._report_connected(epoch)
             for raw_text in early:
                 await self._handle_payload(raw_text, epoch)
+            awaiting_response = False
             while not stop.is_set():
                 try:
                     message = await ws.receive(timeout=self.heartbeat_interval_ms / 1_000)
@@ -227,11 +303,16 @@ class StreamCollector(ABC):
                     # Sending a ping proves only that we tried.  Liveness is
                     # recorded when a frame actually arrives, so a dead socket
                     # cannot keep reporting itself healthy.
+                    if awaiting_response:
+                        raise TimeoutError(f"{self.venue} heartbeat response deadline exceeded")
                     await self._send_heartbeat(ws)
+                    awaiting_response = True
                     continue
                 if message.type == aiohttp.WSMsgType.TEXT:
+                    awaiting_response = False
                     await self._handle_payload(message.data, epoch)
                 elif message.type == aiohttp.WSMsgType.BINARY:
+                    awaiting_response = False
                     await self._handle_payload(message.data.decode("utf-8"), epoch)
                 elif message.type in {
                     aiohttp.WSMsgType.CLOSE,
@@ -241,6 +322,7 @@ class StreamCollector(ABC):
                     raise ConnectionError(f"{self.venue} websocket closed")
             return
         finally:
+            self._ws = None
             await ws.close()
 
     async def _wait_for_subscription(self, ws: aiohttp.ClientWebSocketResponse) -> list[str]:
@@ -263,7 +345,7 @@ class StreamCollector(ABC):
             if self.is_error(payload):
                 raise ConnectionError(f"{self.venue} subscription rejected: {payload}")
             if self.is_subscription_ack(payload):
-                return early
+                return [message.data, *early] if self.dynamic else early
             early.append(message.data)
             return early
         raise TimeoutError(f"{self.venue} subscription was not acknowledged")
@@ -278,9 +360,20 @@ class StreamCollector(ABC):
         except json.JSONDecodeError as exc:
             raise ConnectionError(f"{self.venue} sent invalid JSON") from exc
         if self.is_error(payload):
+            native = (payload.get("arg") or {}).get("instId") if isinstance(payload, dict) else None
+            if self.dynamic and native in {self.native_market_id(m) for m in self.config.markets}:
+                self.confirmed.discard(native)
+                self.pending_ack.pop(native, None)
+                self.rejected_until[native] = received + 60_000
+                await self.gaps.unavailable(self.venue, native, self.channel, epoch, received,
+                                            reason="subscription_rejected")
+                return
             raise ConnectionError(f"{self.venue} error message: {payload}")
         if self.is_heartbeat_response(payload):
             await self._report_heartbeat(received)
+            return
+        if self.dynamic and self.is_subscription_ack(payload):
+            await self._confirm(self.acknowledged_market(payload), epoch, received)
             return
         if self.is_ignorable(payload):
             # Subscription notices are operational, not market data.
@@ -288,12 +381,18 @@ class StreamCollector(ABC):
             return
         reference = self.archive.append(payload, receive_time_ms=received, source_epoch=epoch)
         self._last_receive_ms = received
+        await self.auxiliary_payload(payload, epoch, received, str(reference))
         events = self.normalize(
             payload,
             receive_time_ms=received,
             source_epoch=epoch,
             raw_ref=str(reference),
         )
+        if self.dynamic:
+            allowed = {self.native_market_id(m) for m in self.config.markets}
+            events = [event for event in events if event.native_market_id in allowed]
+            for native in {event.native_market_id for event in events}:
+                await self._confirm(native, epoch, received)
         if events:
             self._pending.extend(events)
         await self._report_heartbeat(received)
@@ -303,6 +402,10 @@ class StreamCollector(ABC):
             await self.flush()
 
     async def flush(self, *, force: bool = False) -> None:
+        async with self._flush_lock:
+            await self._flush(force=force)
+
+    async def _flush(self, *, force: bool = False) -> None:
         if not self._pending:
             self._last_flush_ms = now_ms()
             return
@@ -336,8 +439,14 @@ class StreamCollector(ABC):
                 )
             except Exception:
                 LOG.exception("Could not record %s/%s disconnect", self.venue, market)
+        if self.dynamic:
+            self.confirmed.clear()
+            self.pending_ack.clear()
+        self._reported_heartbeat.clear()
 
     async def _report_connected(self, epoch: str) -> None:
+        if self.dynamic:
+            return
         for market in self.config.markets:
             await self.gaps.connected(
                 self.venue, self.native_market_id(market), self.channel, epoch, now_ms()
@@ -345,9 +454,15 @@ class StreamCollector(ABC):
 
     async def _report_heartbeat(self, now: int) -> None:
         for market in self.config.markets:
+            native = self.native_market_id(market)
+            if self.dynamic and native not in self.confirmed:
+                continue
+            if now - self._reported_heartbeat.get(native, now - 1000) < 1000:
+                continue
             await self.gaps.heartbeat(
-                self.venue, self.native_market_id(market), self.channel, now
+                self.venue, native, self.channel, now
             )
+            self._reported_heartbeat[native] = now
 
     def _backoff_seconds(self, failure: int) -> float:
         base = min(self.config.max_backoff_ms, self.config.base_backoff_ms * 2 ** (failure - 1))

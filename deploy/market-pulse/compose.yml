@@ -78,6 +78,7 @@ services:
         "${PULSE_MARKETS:-BTC,XRP}",
       ]
     environment:
+      PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
       PULSE_RAW_DIR: /raw
@@ -99,6 +100,7 @@ services:
         "${PULSE_MARKETS:-BTC,XRP}",
       ]
     environment:
+      PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
       PULSE_RAW_DIR: /raw

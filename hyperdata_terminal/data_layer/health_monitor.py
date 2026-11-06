@@ -200,14 +200,18 @@ class DataHealthMonitor:
         # venue, because "order_flow: pass" while Binance has never delivered
         # a byte is exactly the half-truth this monitor exists to prevent.
         of_stale = hub.orderflow.is_stale()
+        idle = (getattr(hub.orderflow, "selective", False) and not hub.orderflow.symbols)
         contributing = hub.orderflow.contributing_venues()
         out.append(HealthCheck(
             "freshness", "order_flow",
-            "fail" if of_stale else "pass",
+            "fail" if of_stale and not idle else "pass",
+            "idle: no instrument assigned; trade freshness not evaluated" if idle else
             f"{hub.orderflow.data_age():.0f}s since last trade; "
             f"venues contributing: {', '.join(contributing) if contributing else 'none'}",
         ))
         for venue, info in hub.orderflow.venue_freshness().items():
+            if info["status"] == "disabled":
+                continue
             if info["status"] == "ok":
                 status = "pass"
             elif of_stale:
@@ -221,7 +225,8 @@ class DataHealthMonitor:
         ob_stale = hub.orderbook.is_stale()
         out.append(HealthCheck(
             "freshness", "orderbook",
-            "fail" if ob_stale else "pass",
+            "fail" if ob_stale and not idle else "pass",
+            "idle: no instrument assigned; book freshness not evaluated" if idle else
             f"{hub.orderbook.data_age():.0f}s since last book",
         ))
 

@@ -29,6 +29,20 @@ from .storage import (
 )
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS overview_candles (
+    symbol TEXT NOT NULL, start_ms BIGINT NOT NULL, received_at_ms BIGINT NOT NULL,
+    payload JSONB NOT NULL, PRIMARY KEY(symbol,start_ms)
+);
+CREATE INDEX IF NOT EXISTS overview_candles_time ON overview_candles(start_ms);
+CREATE TABLE IF NOT EXISTS pulse_control (
+    name TEXT PRIMARY KEY, updated_at_ms BIGINT NOT NULL, payload JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_quarantine (
+    event_seq BIGINT PRIMARY KEY, reason TEXT NOT NULL, at_ms BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attention_history (
+    at_ms BIGINT PRIMARY KEY, payload JSONB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS instrument_specs (
     venue text NOT NULL,
     native_market_id text NOT NULL,
@@ -182,6 +196,74 @@ class PostgresStore:
     async def initialize(self) -> None:
         async with self.pool.acquire() as connection:
             await connection.execute(SCHEMA_SQL)
+
+    async def put_overview(self, rows, now_ms):
+        async with self.pool.acquire() as connection, connection.transaction():
+            await connection.executemany("""INSERT INTO overview_candles VALUES($1,$2,$3,$4::jsonb)
+                ON CONFLICT(symbol,start_ms) DO UPDATE SET received_at_ms=EXCLUDED.received_at_ms,
+                payload=EXCLUDED.payload WHERE overview_candles.received_at_ms<=EXCLUDED.received_at_ms""",
+                [(r["symbol"], r["start_ms"], r["received_at_ms"], json.dumps(r)) for r in rows])
+            if now_ms - getattr(self, "_overview_pruned", 0) >= 3_600_000:
+                await connection.execute("DELETE FROM overview_candles WHERE start_ms<$1", now_ms - 30*86400_000)
+                self._overview_pruned = now_ms
+
+    async def get_overview(self, from_ms):
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch("SELECT payload FROM overview_candles WHERE start_ms>=$1 "
+                                          "ORDER BY start_ms,symbol LIMIT 16000", from_ms)
+        return [json.loads(r["payload"]) if isinstance(r["payload"], str) else dict(r["payload"]) for r in rows]
+
+    async def event_head(self):
+        async with self.pool.acquire() as connection:
+            return await connection.fetchval("SELECT COALESCE(MAX(event_seq),0) FROM execution_events")
+
+    async def get_control(self, name):
+        async with self.pool.acquire() as connection:
+            raw = await connection.fetchval("SELECT payload FROM pulse_control WHERE name=$1", name)
+        return None if raw is None else _json(raw)
+
+    async def resources(self):
+        async with self.pool.acquire() as connection:
+            size = await connection.fetchval("SELECT pg_database_size(current_database())")
+            oldest = await connection.fetchval("SELECT MIN(window_start_ms) FROM recalc_queue")
+        return {"database_bytes": size, "oldest_recalc_window_ms": oldest}
+
+    async def quarantine_events(self, sequences, reason, now_ms):
+        if not sequences:
+            return 0
+        async with self.pool.acquire() as connection, connection.transaction():
+            await connection.execute("SELECT pg_advisory_xact_lock($1)", _APPEND_LOCK)
+            inserted = await connection.fetch("""INSERT INTO event_quarantine
+                SELECT event_seq,$2,$3 FROM execution_events WHERE event_seq=ANY($1::bigint[])
+                ON CONFLICT DO NOTHING RETURNING event_seq""", sequences, reason, now_ms)
+            keys = await connection.fetch("""SELECT DISTINCT venue,native_market_id,channel,aggregation_kind,
+                event_time_ms/60000*60000 AS minute FROM execution_events WHERE event_seq=ANY($1::bigint[])""",
+                                          [r["event_seq"] for r in inserted])
+            for row in keys:
+                key = (row["venue"], row["native_market_id"], row["channel"], row["aggregation_kind"], row["minute"])
+                await connection.execute("""UPDATE windows SET quality='gap_detected',version=version+1,
+                    payload=jsonb_set(jsonb_set(payload,'{quality}',to_jsonb('gap_detected'::text)),
+                                      '{version}',to_jsonb(version+1))
+                    WHERE venue=$1 AND native_market_id=$2 AND channel=$3 AND aggregation_kind=$4
+                    AND window_start_ms=$5""", *key)
+                await self._queue_recalc(connection, key, "raw_identity_quarantine", now_ms)
+                await connection.execute("""INSERT INTO gaps
+                    (venue,native_market_id,channel,source_epoch,start_ms,end_ms,detected_at_ms,state,reason)
+                    VALUES($1,$2,$3,'raw-identity-audit-v1',$4,$5,$6,'gap_detected',$7)""",
+                                         key[0], key[1], key[2], key[4], key[4]+60000, now_ms, reason)
+        return len(inserted)
+
+    async def set_control(self, name, payload, now_ms):
+        async with self.pool.acquire() as connection, connection.transaction():
+            row = await connection.fetchval(
+                "INSERT INTO pulse_control VALUES($1,$2,$3::jsonb) "
+                "ON CONFLICT(name) DO UPDATE SET updated_at_ms=EXCLUDED.updated_at_ms,payload=EXCLUDED.payload "
+                "WHERE pulse_control.updated_at_ms<=EXCLUDED.updated_at_ms RETURNING payload",
+                name, now_ms, json.dumps(payload))
+            if row is not None and name == "attention":
+                await connection.execute("INSERT INTO attention_history VALUES($1,$2::jsonb) ON CONFLICT DO NOTHING",
+                                         now_ms, json.dumps(payload))
+        return row is not None
 
     async def register_instruments(self, specs: Iterable[InstrumentSpec]) -> None:
         rows = [
@@ -400,6 +482,7 @@ class PostgresStore:
                 SELECT payload FROM execution_events
                 WHERE venue=$1 AND native_market_id=$2 AND channel=$3
                   AND aggregation_kind=$4 AND event_time_ms >= $5 AND event_time_ms < $6
+                  AND NOT EXISTS(SELECT 1 FROM event_quarantine q WHERE q.event_seq=execution_events.event_seq)
                 ORDER BY event_time_ms, event_seq
                 """,
                 venue,
@@ -421,7 +504,8 @@ class PostgresStore:
         to_ms: int | None = None,
         limit: int = 500,
     ) -> list[StoredEvent]:
-        clauses = ["event_seq > $1"]
+        clauses = ["event_seq > $1", "NOT EXISTS(SELECT 1 FROM event_quarantine q "
+                   "WHERE q.event_seq=execution_events.event_seq)"]
         args: list[Any] = [cursor]
         if venue is not None:
             args.append(venue)
@@ -545,6 +629,17 @@ class PostgresStore:
                 *args,
             )
         return [WindowAggregate.from_payload(_json(row["payload"])) for row in rows]
+
+    async def due_windows(self, now_ms, grace_ms):
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch("""SELECT payload FROM windows
+                WHERE window_start_ms+60000+$2 <= $1 AND
+                ((payload->>'provisional')::boolean OR
+                 (payload->>'quality'='partial' AND
+                  payload->'coverage'->>'partial_reason'='no liveness at window end'))
+                ORDER BY (payload->>'provisional')::boolean DESC,window_start_ms DESC LIMIT 1000""",
+                                          now_ms, grace_ms)
+        return [WindowAggregate.from_payload(_json(r["payload"])) for r in rows]
 
     async def mark_window_quality(
         self,
@@ -720,7 +815,7 @@ class PostgresStore:
                 """
                 SELECT * FROM gaps
                 WHERE venue=$1 AND native_market_id=$2 AND channel=$3
-                  AND start_ms <= $5 AND (end_ms IS NULL OR end_ms >= $4)
+                  AND start_ms < $5 AND (end_ms IS NULL OR GREATEST(end_ms, start_ms + 1) > $4)
                 ORDER BY start_ms, gap_id
                 """,
                 venue,
@@ -880,8 +975,10 @@ class PostgresStore:
                 QualityState.UNAVAILABLE.value,
             )
             recalc = await connection.fetchval("SELECT COUNT(*) FROM recalc_queue")
+            quarantined = await connection.fetchval("SELECT COUNT(*) FROM event_quarantine")
         return {
-            "status": "degraded" if open_gaps or unavailable or conflicts else "ok",
+            "status": "degraded" if open_gaps or unavailable or conflicts or quarantined else "ok",
+            "quarantined_events": int(quarantined or 0),
             "events": int(events or 0),
             "windows": int(windows or 0),
             "cursor": int(cursor or 0),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable
@@ -287,7 +288,13 @@ class OrderFlowEngine:
     per-timeframe CVD / OFI buckets."""
 
     def __init__(self, symbols: list[str] | None = None, *, include_binance: bool = True) -> None:
-        self.symbols: list[str] = symbols or list(DEFAULT_SYMBOLS)
+        self.symbols: list[str] = list(DEFAULT_SYMBOLS) if symbols is None else list(symbols)
+        self.raw_callback = None
+        self.selective = False
+        self.pulse_external = False
+        self._external_epochs = {}
+        self._external_since = {}
+        self._attention_tasks: dict[int, asyncio.Task] = {}
         self.include_binance = include_binance
         self.timeframes: dict[str, int] = dict(TIMEFRAME_WINDOWS)
 
@@ -576,6 +583,10 @@ class OrderFlowEngine:
           stale         had trades, socket open, nothing for STALE_AFTER_SECONDS
           disconnected  socket not open (never connected, or between reconnects)
         """
+        if venue == "binance" and not self.include_binance:
+            return "disabled", "Binance not configured for this observation mode"
+        if venue == "hyperliquid" and self.selective and not self.symbols:
+            return "disabled", "No instrument currently assigned detailed observation"
         now = time.time() if now is None else now
         st = self.venues[venue]
         trade_age = self.venue_data_age(venue, now)
@@ -666,19 +677,25 @@ class OrderFlowEngine:
             logger.warning("OrderFlowEngine already running")
             return
         self._running = True
-        shards = self._hl_shards()
+        if self.pulse_external:
+            return
+        self._attention_tasks.clear()
+        shards = [[] for _ in range(8)] if self.selective else self._hl_shards()
         self._hl_shard_plan = shards
         now = time.time()
         self._hl_shard_state = {i: ShardState(down_since=now) for i in range(len(shards))}
+        for index, names in enumerate(shards):
+            if not names:
+                self._hl_shard_state[index].idle = True
         self._stop_event = asyncio.Event()
         self._hl_tasks = [
             asyncio.create_task(self._run_forever(i), name=f"orderflow-hl-{i}")
-            for i in range(len(shards))
+            for i in range(len(shards)) if shards[i]
         ]
         if self.include_binance:
             self._binance_task = asyncio.create_task(self._binance_trade_loop(), name="orderflow-binance")
         logger.info(
-            "OrderFlowEngine started for %d symbols: Hyperliquid on %d sockets of <=%d subscriptions (Binance enabled: %s)",
+            "OrderFlowEngine started for %d symbols: Hyperliquid on %d shards, <=%d subscriptions (Binance: %s)",
             len(self.symbols), len(shards), HL_SUBSCRIPTIONS_PER_SOCKET, self.include_binance,
         )
 
@@ -721,7 +738,51 @@ class OrderFlowEngine:
     def running(self) -> bool:
         return self._running
 
+    async def set_attention_symbols(self, symbols: list[str]) -> None:
+        """One stable shard per selected coin; other selected feeds stay connected."""
+        if not self.selective or len(symbols) > 8:
+            raise ValueError("selective engine required; at most eight symbols")
+        wanted = set(symbols)
+        if self.pulse_external:
+            for symbol in set(self.symbols) - wanted:
+                self._external_since.pop(symbol, None)
+                self._external_epochs.pop(symbol, None)
+            for symbol in wanted - set(self.symbols):
+                self.add_symbol(symbol)
+                self.reset_external(symbol)
+            self.symbols = sorted(wanted)
+            return
+        for index, names in enumerate(self._hl_shard_plan):
+            if names and names[0] not in wanted:
+                task = self._attention_tasks.pop(index, None)
+                if task:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                self._hl_shard_plan[index] = []
+                self._hl_shard_state[index].idle = True
+        assigned = {s for names in self._hl_shard_plan for s in names}
+        for symbol in sorted(wanted - assigned):
+            self.add_symbol(symbol)
+            # No old window can masquerade as observation of the new episode.
+            self.buckets[symbol] = {tf: TimeframeBucket(symbol, tf, secs)
+                                    for tf, secs in self.timeframes.items()}
+            for venue in self.venue_buckets.values():
+                venue[symbol] = {tf: TimeframeBucket(symbol, tf, self.timeframes[tf]) for tf in VENUE_TIMEFRAMES}
+            self.cumulative_cvd[symbol] = self.cumulative_cvd_hl[symbol] = self.cumulative_cvd_binance[symbol] = 0
+            self.recent_trades[symbol].clear()
+            for venue in self.recent_trades_by_venue.values():
+                venue[symbol].clear()
+            index = next(i for i, names in enumerate(self._hl_shard_plan) if not names)
+            self._hl_shard_plan[index] = [symbol]
+            self._hl_shard_state[index] = ShardState(down_since=time.time())
+            self._attention_tasks[index] = asyncio.create_task(self._run_forever(index),
+                                                               name=f"attention-trades-{index}")
+        self.symbols = sorted(wanted)
+        self._hl_tasks = list(self._attention_tasks.values())
+
     def hyperliquid_connected_at(self, symbol: str) -> float:
+        if self.pulse_external:
+            return self._external_since.get(symbol, 0.0)
         """Start of the current connection for this symbol, or zero."""
         for index, symbols in enumerate(self._hl_shard_plan):
             if symbol in symbols:
@@ -864,6 +925,46 @@ class OrderFlowEngine:
 
     # -- internal: process a single trade -----------------------------------
 
+    def reset_external(self, symbol):
+        self.buckets[symbol] = {tf: TimeframeBucket(symbol, tf, secs) for tf, secs in self.timeframes.items()}
+        for venue in self.venue_buckets.values():
+            venue[symbol] = {tf: TimeframeBucket(symbol, tf, self.timeframes[tf]) for tf in VENUE_TIMEFRAMES}
+        self.recent_trades[symbol].clear()
+        for venue in self.recent_trades_by_venue.values():
+            venue[symbol].clear()
+        self.cumulative_cvd[symbol] = self.cumulative_cvd_hl[symbol] = self.cumulative_cvd_binance[symbol] = 0
+        self._external_since[symbol] = time.time()
+
+    def accept_execution(self, event):
+        """Consume the durable canonical tape; never open an exchange socket."""
+        symbol = event["native_market_id"]
+        if (not self.pulse_external or event.get("venue") != "hyperliquid" or symbol not in self.symbols
+                or event.get("delivery_kind") != "live" or event.get("side") not in ("buy", "sell")):
+            return False
+        now = time.time()
+        if not 0 <= now-event["event_time_ms"]/1000 <= 15:
+            return False
+        identity = (symbol, event.get("trade_id"), event.get("event_time_ms"))
+        if event.get("trade_id") and identity in self._seen_hl_tids:
+            return False
+        if event.get("trade_id"):
+            self._seen_hl_tids[identity] = None
+            while len(self._seen_hl_tids) > MAX_SEEN_IDS:
+                self._seen_hl_tids.popitem(last=False)
+        epoch = event["source_epoch"]
+        if self._external_epochs.get(symbol) != epoch:
+            self.reset_external(symbol)
+            self._external_epochs[symbol] = epoch
+        trade = Trade(symbol=symbol, price=float(event["price"]),
+                      size=float(event["base_amount"]), size_usd=float(event["quote_amount"]), side=event["side"],
+                      timestamp=event["event_time_ms"]/1000)
+        if not self.venues["hyperliquid"].connected:
+            self._venue_connected("hyperliquid")
+        self._venue_frame("hyperliquid")
+        self._venue_trade("hyperliquid")
+        self._process_trade(trade, venue="hyperliquid")
+        return True
+
     def _process_trade(self, trade: Trade, venue: str | None = None) -> None:
         """Route a trade to all timeframe buckets and bookkeeping.
 
@@ -963,6 +1064,7 @@ class OrderFlowEngine:
         wanted = plan[shard] if shard < len(plan) else []
         state = self._shard_state(shard)
         session = aiohttp.ClientSession()
+        epoch = uuid.uuid4().hex
         self._hl_sessions[shard] = session
         ws = None
         try:
@@ -994,6 +1096,9 @@ class OrderFlowEngine:
                 if not self._running:
                     break
                 if ws_msg.type == aiohttp.WSMsgType.TEXT:
+                    if self.raw_callback:
+                        self.raw_callback("trades:" + ",".join(wanted), ws_msg.data, epoch,
+                                          time.time(), time.monotonic_ns())
                     self._handle_message(ws_msg.json())
                 elif ws_msg.type in (
                     aiohttp.WSMsgType.CLOSED,
@@ -1001,6 +1106,9 @@ class OrderFlowEngine:
                 ):
                     break
         finally:
+            if self.raw_callback:
+                self.raw_callback("trades:" + ",".join(wanted), None, epoch,
+                                  time.time(), time.monotonic_ns())
             self._hl_sockets.pop(shard, None)
             self._hl_sessions.pop(shard, None)
             if state.connected_at > 0:
@@ -1212,7 +1320,7 @@ class OrderFlowEngine:
         """
         if symbol in self.buckets:
             return
-        if self._running:
+        if self._running and not self.selective:
             logger.warning(
                 "[orderflow] %s added while running — the Hyperliquid shard plan is fixed at "
                 "start(), so it gets no HL trades subscription until restart", symbol,

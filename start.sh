@@ -12,7 +12,11 @@ usage() {
     cat <<'EOF'
 Usage: ./start.sh [options]
 
-Starts the native HyperData API (8420) and the external screener (8421).
+Starts the complete project: native API, screener, Market Pulse and PostgreSQL.
+  --stop              stop all project services, retaining data
+  --restart           restart all project services
+  --status            show combined service status
+  --without-pulse     run only the legacy native API and screener
 
   --demo              synthetic data; disables AI and Telegram
   --api-port N        native API port (default 8420)
@@ -92,4 +96,4 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-exec "${RUNNER[@]}" scripts/serve.py "${serve_args[@]}"
+exec "${RUNNER[@]}" scripts/project.py "${serve_args[@]}"

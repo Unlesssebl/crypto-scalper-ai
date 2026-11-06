@@ -2,7 +2,7 @@
 import math
 from dataclasses import asdict
 
-from .activity import CANDLE_SOURCE, tape_baseline
+from .activity import BASELINE_BARS, CANDLE_SOURCE, tape_baseline
 
 WINDOWS = {"1m": 60, "5m": 300}
 DIRECTIONS = {
@@ -105,6 +105,11 @@ def capture(hub, asset, window, now, candles=None):
         "symbol": asset.symbol, "exchange": "hyperliquid", "contract": f"{asset.symbol}-PERP",
         "window": window, "captured_at": now, "metrics": metrics,
     }
+    if baseline is not None and baseline > 0:
+        snapshot["activity_baseline"] = {
+            "kind": "median_trade_count", "samples": BASELINE_BARS,
+            "median_count": baseline, "window_seconds": seconds, "source": CANDLE_SOURCE,
+        }
     vote = {
         "direction": direction, "native_signal": flow.signal if flow_quality == "ok" else None,
         "source": flow_source, "evidence": ["ofi"] if direction != "NOT_AVAILABLE" else [],

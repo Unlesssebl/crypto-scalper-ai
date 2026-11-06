@@ -33,13 +33,31 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <body><main>
 <header><div class="kicker">HYPERDATA TERMINAL / HYPERLIQUID PERPETUALS</div>
 <h1>Crypto Scalper AI</h1>
-<p>Двадцать ликвидных контрактов Hyperliquid. Сортировка по силе находки. Выберите инструмент для деталей.</p>
+<p>Наблюдение за активностью Hyperliquid. Детали выбранных инструментов и проверяемые факты о рынке.</p>
+<div id="pulse-context"></div>
+<p id="pulse-status" role="status">Market Pulse: подключение…</p>
 <p id="status" role="status">Подключение к HyperData…</p></header>
 <section id="overview" class="overview" aria-label="Состояние рынка"></section>
+<section id="attention" class="panel quality-report" aria-label="Фокус наблюдения" hidden>
+<h2>Фокус наблюдения</h2><p id="attention-status" role="status"></p>
+<p>Обзор сравнивает движение и свечную активность с собственной историей инструмента. Полнота данных показана отдельно.
+Возраст плотности считается с начала непрерывного наблюдения; рекомендации входа AI отключены.</p>
+<div id="attention-cards" class="profile-grid"></div>
+</section>
+<section id="consistency" class="panel quality-report" aria-label="Проверка фактов и интерпретаций" hidden>
+<h2>Факты и интерпретации</h2>
+<p id="consistency-status" role="status"></p>
+<p>AI рассматривает зафиксированные измерения. Числа проверяются кодом; свободные интерпретации
+остаются гипотезами. Общие данные не считаются независимыми подтверждениями.</p>
+<table aria-label="Проверка утверждений за 24 часа"><thead><tr><th>Утверждения</th>
+<th>Подтверждено</th><th>Противоречит</th><th>Недостаточно данных</th><th>Гипотезы</th></tr></thead>
+<tbody id="consistency-counts"></tbody></table>
+<div id="consistency-reviews" class="profile-grid"></div>
+</section>
 <section aria-label="Фильтры" class="toolbar">
 <label>Окно<select id="window"><option>1m</option><option>5m</option></select></label>
 <label>Инструмент<input id="search" type="search" placeholder="Например, BTC"></label>
-<label>Последний Consensus<select id="filter"><option value="">Все</option></select></label>
+<label id="legacy-consensus-filter">Последний Consensus<select id="filter"><option value="">Все</option></select></label>
 <button id="metrics" type="button" aria-pressed="false">Все метрики</button>
 <button id="refresh" type="button">Обновить</button>
 </section>
@@ -60,7 +78,7 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <p>Отклонённые события тоже проверяются через 1/5/15 минут. Направление оценивается от цены обнаружения; сравнение AI, Rule Engine и Consensus — на одних событиях с успешным ответом AI, от цены снимка анализа, без комиссий и исполнения.</p>
 </details>
 <details class="panel quality-report">
-<summary>Качество анализов AI за последние 24 часа</summary>
+<summary>Архив: совпадение направления от исходного снимка за 24 часа</summary>
 <p>Верно — цена пошла в сторону оценки AI. Ошибки запросов и оценки без направления считаются отдельно.</p>
 <p id="quality-attempts" role="status">Фоновый расчёт ещё не готов.</p>
 <table aria-label="Проверка направления AI">
@@ -108,7 +126,7 @@ for (const category of categories) $("filter").add(new Option(category, category
 const number = new Intl.NumberFormat("ru-RU", {maximumSignificantDigits: 6});
 const stamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU") : "—";
 const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
-let data = [], symbol = "", sort = "strengthRank", ascending = false, generation = 0;
+let data = [], symbol = "", sort = "strengthRank", ascending = false, generation = 0, contextMode = false;
 let detailGeneration = 0;
 const allColumns = [
   ["symbol","Инструмент"],["strengthRank","Сила находки"],["movementPhase","Фаза движения"],["price","Mark, USD"],["activity_ratio","Темп к норме"],
@@ -122,7 +140,8 @@ const extraColumns = new Set(["btcCorrelation", "volume_24h", "range_ratio", "vo
 let columns;
 const tableRow = document.createElement("tr");
 function renderHead() {
-  columns = allColumns.filter(([key]) => $("metrics").ariaPressed === "true" || !extraColumns.has(key));
+  columns = allColumns.filter(([key]) => (!contextMode || !["summary", "category"].includes(key)) &&
+    ($("metrics").ariaPressed === "true" || !extraColumns.has(key)));
   if (!columns.some(([key]) => key === sort)) { sort = "strengthRank"; ascending = false; }
   tableRow.replaceChildren();
   for (const [key,label] of columns) {
@@ -231,7 +250,7 @@ function render() {
     ["В очереди и анализе", market.filter(row => row.queued).length],
     ["Согласия / расхождения", market.filter(row => row.category?.startsWith("CONSENSUS")).length
       + " / " + market.filter(row => row.category === "DIVERGENCE").length],
-  ]) {
+  ].filter(([label]) => !contextMode || !["Оценка AI в истории", "В очереди и анализе", "Согласия / расхождения"].includes(label))) {
     const card = node("div", null, $("overview"));
     card.className = "stat";
     node("small", label, card);
@@ -369,6 +388,13 @@ async function loadDetail() {
     const metricTable = node("div", null, metrics);
     metricTable.className = "metric-detail";
     const table = node("table", null, metricTable);
+    if (row.snapshot?.market_pulse) {
+      const pulse = row.snapshot.market_pulse;
+      node("p", "Market Pulse · " + pulse.status + " · закрытая минута UTC · " + pulse.flow, detail);
+      for (const venue of pulse.venues || []) node("p",
+        venue.venue + " · " + venue.quality + (venue.quote_volume != null
+          ? " · " + venue.execution_count + " исполнений · " + venue.quote_volume + " " + venue.currency : ""), detail);
+    }
     const header = node("tr", null, node("thead", null, table));
     for (const label of ["Метрика","Значение","Источник","Обновлено","Качество"]) node("th",label,header);
     const body = node("tbody", null, table);
@@ -560,6 +586,191 @@ function renderShadow(variants) {
 }
 
 let policyLoaded = false;
+const pendingReviews = new Set();
+const claimLabels = {supported:"Подтверждено измерениями", contradicted:"Противоречит измерениям",
+  unverifiable:"Недостаточно данных", hypothesis:"Гипотеза"};
+const sectionLabels = {observation:"Числа и факты", comparison:"Сравнения",
+  interpretation:"Интерпретации", missing_data:"Недостающие данные"};
+const reviewStatus = status => ({ok:"Ответ проверен", unconfigured:"Нет API-ключа", invalid_response:"Ответ не прошёл проверку",
+  pending:"Разбор выполняется", interrupted:"Разбор прерван", error:"Ошибка разбора", skipped:"Пропущено",
+  network_error:"Ошибка связи", incomplete:"Неполный ответ модели"}[status] ?? "Ошибка провайдера");
+const reviewReason = reason => ({no_api_key:"Нет API-ключа", demo:"Демонстрационный режим",
+  stale_or_unknown_packet:"Данные устарели или пакет недоступен", episode_changed_or_unavailable:"Эпизод изменился",
+  context_mode_required:"Нужен режим наблюдения", process_restarted:"Приложение перезапущено"}[reason] ??
+  aiReasonLabels[reason] ?? "Подробности сохранены в журнале");
+function factLabel(id) {
+  const labels = {"book.midpoint":"Середина спреда", "book.spread_bps":"Спред, б.п.",
+    "book.visible_bid_levels":"Видимых уровней покупки", "book.visible_ask_levels":"Видимых уровней продажи",
+    "activity.relative_score":"Активность относительно собственной нормы",
+    "tape.observed_trade_imbalance":"Перевес наблюдаемых сделок",
+    "tape.observed_trade_count_60s":"Наблюдаемых сделок за последние 60 с",
+    "tape.observed_turnover_60s":"Наблюдаемый объём последних 60 с",
+    "tape.full_window_coverage":"Полнота окна ленты", "history.before_attention":"История до начала наблюдения"};
+  if (labels[id]) return labels[id];
+  if (/^history\.\d+\./.test(id)) {
+    const parts = id.split(".");
+    return "Ранее " + stamp(Number(parts[1]) / 1000) + " · " +
+      ({midpoint:"цена", flow:"перевес потока", activity:"относительная активность"}[parts[2]] ?? parts[2]);
+  }
+  if (id.startsWith("frame.")) {
+    const parts = id.split(".");
+    return parts[1] + " · " + ({ofi:"Перевес потока сделок", cvd:"Дельта объёма", trade_count:"Число сделок",
+      first_trade_price:"Первая цена окна", last_trade_price:"Последняя цена окна",
+      observed_price_change_bps:"Наблюдаемое изменение цены, б.п.",
+      flow_price_conflict:"Противоречие потока и реакции цены"}[parts[2]] ?? parts[2]);
+  }
+  if (!id.startsWith("density.")) return "Неизвестный факт";
+  const field = id.split(".").at(-1);
+  const name = {price:"цена", size:"размер", notional_usd:"объём, USD", observed_age_seconds:"наблюдаемый возраст, с",
+    distance_bps:"расстояние, б.п.", relative_size:"размер к медиане видимой глубины",
+    size_change:"изменение размера", size_to_observed_turnover:"размер к наблюдаемому объёму",
+    actual_order_age:"фактический возраст заявки"}[field] ?? field;
+  return "Зона " + (id.startsWith("density.bid.") ? "покупки" : "продажи") + " · " + name;
+}
+function renderConsistency(context) {
+  $("consistency").hidden = !context?.enabled;
+  if (!context?.enabled) return;
+  const report = context.report;
+  if (context.routes) {
+    const r = context.routes;
+    $("consistency-status").textContent = "AI: бесплатный разбор " + r.free_hour_limit + "/час, " +
+      r.free_day_limit + "/сутки · платный: " + r.paid_hour_limit + "/час";
+  }
+  const automatic = context.automatic ?? {};
+  const selectionReason = reason => automatic.reason_labels?.[reason] ?? reviewReason(reason);
+  $("consistency-status").textContent = report ? "За 24 часа: эпизодов внимания " + report.observed_episodes +
+    " · разобрано " + report.reviewed_episodes + " · попыток " + report.attempts +
+    " · допущено запросов " + report.api_attempts +
+    " · автоматических попыток " + (report.origins?.automatic ?? 0) +
+    " · токенов по " + (report.usage_reported_attempts ?? 0) + " ответам: " +
+    (report.tokens?.total_tokens ?? "не сообщены") +
+    " · воздержаний " + report.abstentions + " · повторных утверждений " + (report.novelty.repeated ?? 0) +
+    (context.configured ? "" : " · API-ключ не настроен; карточки доступны без AI") : "Статистика накапливается.";
+  const body = $("consistency-counts");
+  body.replaceChildren();
+  for (const [section, counts] of Object.entries(report?.claims ?? {})) {
+    const row = node("tr", null, body);
+    node("th", sectionLabels[section], row).scope = "row";
+    for (const key of ["supported", "contradicted", "unverifiable", "hypothesis"]) node("td", counts[key] ?? 0, row);
+  }
+  const root = $("consistency-reviews");
+  root.replaceChildren();
+  node("p", "Автоматический разбор контекста: " + (automatic.enabled ? "включён" : "отключён") +
+    (automatic.last_error ? " · ошибка обработки: " + automatic.last_error : ""), root);
+  if (context.routes) {
+    node("p", "Бесплатная: " + context.routes.free_model + " · платная: " + context.routes.paid_model +
+      " · бюджеты: " + context.routes.free_hour_limit + "/час и " + context.routes.free_day_limit +
+      "/сутки бесплатно; " + context.routes.paid_hour_limit + "/час платно", root);
+    for (const r of context.routes.requests ?? []) node("p", r.route + ": " + r.count + " · " + r.status, root);
+    if (context.routes.free_error) node("p", "Бесплатный маршрут: " + context.routes.free_error, root);
+  }
+  const selections = node("details", null, root);
+  node("summary", "Причины отбора и пропуска за 24 часа", selections);
+  for (const decision of automatic.decisions ?? []) node("p", selectionReason(decision.reason) +
+    " · " + decision.status + " · ситуаций " + decision.episodes + " · проверок " + decision.checks, selections);
+  for (const item of context.packets ?? []) {
+    const packet = item.packet, card = node("div", null, root);
+    card.className = "stat";
+    node("h3", packet.symbol, card);
+    node("p", "Зафиксировано " + stamp(packet.captured_at), card);
+    if (item.selection) node("p", "Отбор: " + selectionReason(item.selection.reason) +
+      " · " + item.selection.status, card);
+    const facts = new Map(packet.facts.map(f => [f.id, f]));
+    const details = node("details", null, card);
+    node("summary", "Измерения и ограничения", details);
+    for (const fact of packet.facts) {
+      node("p", factLabel(fact.id) + ": " + (fact.quality === "ok" ? fact.value : "неизвестно или устарело"), details);
+    }
+    const button = node("button", pendingReviews.has(packet.symbol) ? "Проверяется…" : "Разобрать факты с AI", card);
+    button.disabled = !context.configured || pendingReviews.has(packet.symbol);
+    const status = node("p", "", card);
+    status.setAttribute("role", "status");
+    button.onclick = async () => {
+      pendingReviews.add(packet.symbol);
+      button.disabled = true;
+      status.textContent = "Проверяем данные и возможность разбора…";
+      try {
+        const response = await fetch("/v1/scalper/context/" + encodeURIComponent(packet.symbol), {
+          method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({packet_id:packet.packet_id})});
+        if (!response.ok) throw new Error(await response.text());
+        const result = await response.json();
+        status.textContent = result.status === "ok" ? "Разбор сохранён." : "Разбор не выполнен: " +
+          reviewReason(result.review?.reason ?? result.reason ?? result.status);
+      } catch (error) { status.textContent = "Не удалось выполнить разбор: " + error.message; }
+      finally { pendingReviews.delete(packet.symbol); button.disabled = !context.configured; }
+    };
+    if (item.latest) {
+      const review = item.latest;
+      node("p", "Последняя попытка: " + stamp(review.at) + " · " + reviewStatus(review.status), card);
+      node("p", "Измерения разбора: " + stamp(review.packet_at), card);
+      if (review.packet_id !== packet.packet_id) node("p", "Разбор относится к ранее зафиксированным измерениям.", card);
+      if (review.reason) node("p", "Причина: " + reviewReason(review.reason), card);
+      if (review.result?.abstention) node("p", "Модель воздержалась от заключения.", card);
+      if (review.trigger_reason) node("p", "Повод разбора: " + selectionReason(review.trigger_reason), card);
+      if (review.result) node("p", "Утверждения проверены относительно сохранённого пакета фактов.", card);
+      if (review.result?.expired_at_completion) node("p", "К завершению ответа пакет устарел; текущая ситуация могла измениться.", card);
+      for (const claim of review.result?.claims ?? []) {
+        const assertion = claim.assertion;
+        const comparison = assertion.relation ? ({greater:" > ", less:" < ", equal:" = "}[assertion.relation]) : " / ";
+        const content = assertion.text ?? claim.references.map(factLabel).join(comparison) +
+          (Object.hasOwn(assertion, "value") ? " = " + String(assertion.value) : "");
+        const explanation = {value_mismatch:"значение не совпало с пакетом",
+          insufficient_hypothesis_evidence:"нет необходимых подтверждающих измерений",
+          incompatible_facts:"измерения несопоставимы", unknown_or_stale_fact:"факт недоступен или устарел"}[claim.reason];
+        node("p", claimLabels[claim.status] + " · " + content +
+          (explanation ? " · " + explanation : "") +
+          (claim.novelty === "repeated" ? " · повтор" : ""), card);
+      }
+    }
+  }
+}
+function renderAttention(attention) {
+  const nextMode = Boolean(attention?.context_only);
+  if (contextMode !== nextMode) {
+    contextMode = nextMode;
+    $("filter").value = "";
+    $("legacy-consensus-filter").hidden = contextMode;
+    renderHead();
+  }
+  $("attention").hidden = !attention?.enabled;
+  for (const control of $("ai-policy").elements) control.disabled = Boolean(attention?.context_only) &&
+    ["ai-experiments"].includes(control.id);
+  if (!attention?.enabled) return;
+  $("ai-policy-status").textContent = "AI разбирает только отобранные изменения контекста. Общий бюджет действует на автоматические и ручные запросы.";
+  const archive = attention.archive ?? {};
+  $("attention-status").textContent = "В обзоре: " + attention.scout_count + " · набирают историю: " +
+    attention.warming + " · в детализации: " + attention.active.length + "/" + attention.policy.slots +
+    " · сохранено сообщений: " + (archive.written ?? 0) +
+    " · эпизодов отказа по слотам: " + (attention.capacity_rejections ?? 0) +
+    " · инструментов: " + (attention.capacity_rejected_symbols ?? 0) +
+    " · проверок занятых слотов: " + (attention.capacity_checks ?? 0) +
+    (archive.error ? " · История неполная: " + archive.error : "") +
+    (attention.subscription_error ? " · Не удалось подключить данные" : "");
+  const root = $("attention-cards");
+  root.replaceChildren();
+  if (!attention.active.length) node("p", "Ожидаем существенного изменения активности.", root);
+  for (const item of attention.active) {
+    const card = node("div", null, root);
+    card.className = "stat";
+    const state = {probe:"Проверка", focus:"Фокус", cooling:"Затухание", control:"Контроль"}[item.state] ?? item.state;
+    node("h3", item.symbol + " · " + state, card);
+    if (item.context_until > Date.now() / 1000) node("p", "Сохраняем историю для контекста 5m · ещё " +
+      Math.ceil((item.context_until - Date.now() / 1000) / 60) + " мин. Готовность зависит от поступления данных.", card);
+    const facts = item.facts ?? {};
+    if (facts.status !== "observing") {
+      node("p", "Ожидаем свежий стакан.", card);
+      continue;
+    }
+    node("p", "Спред " + facts.spread_bps.toFixed(1) + " б.п. · уровней " + facts.observed_levels.join(" / "), card);
+    for (const zone of facts.densities ?? []) {
+      node("p", (zone.side === "bid" ? "Покупки" : "Продажи") + " · " + zone.price +
+        " · $" + Math.round(zone.notional_usd).toLocaleString("ru-RU") + " · " +
+        zone.relative_size.toFixed(1) + "× медианы видимой глубины · наблюдается " +
+        Math.floor(zone.observed_age_seconds) + " с · " + zone.distance_bps.toFixed(1) + " б.п.", card);
+    }
+    if (!facts.densities?.length) node("p", "Крупных зон по текущему правилу не найдено.", card);
+  }
+}
 let aiReasonLabels = {};
 function renderSelection(result) {
   aiReasonLabels = result.ai_reasons ?? {};
@@ -619,9 +830,37 @@ async function refresh() {
     data = result.rows;
     renderQuality(result.quality_report);
     renderSelection(result);
+    renderAttention(result.attention);
+    renderConsistency(result.consistency);
     renderMarketContext(result.context);
+    const pulse = result.market_pulse || {status:"disabled"};
+    const attention = result.attention_plan || result.attention?.plan || {};
+    $("pulse-status").textContent = "Межбиржевые данные · свежих потоков " + (pulse.fresh_channels || 0) +
+      "/" + ((pulse.markets || []).length * 2) + " · исторических пропусков " + (pulse.historical_gaps || 0) +
+      " · обзор " + (attention.universe_size || 0) + " инструментов · внимание " +
+      (attention.selected || []).length + " · подробный сбор " + (attention.detail || []).join(", ") +
+      " · редкость активности пока не оценена";
+    $("pulse-context").replaceChildren();
+    for (const [symbol, facts] of Object.entries(pulse.symbols || {})) {
+      const label = {ready:"данные двух бирж", partial:"неполное покрытие", unavailable:"данные не готовы"}[facts.status] || facts.status;
+      const minute = facts.window_start_ms ? new Date(facts.window_start_ms).toISOString().slice(11,16) + " UTC · " : "";
+      node("p", symbol + " · " + minute + label + " · " + (facts.venues || []).map(v =>
+        v.venue + ": " + (v.quote_volume != null ? v.execution_count + " исполнений, " + Number(v.quote_volume).toLocaleString("ru-RU", {maximumFractionDigits:2}) + " " + v.currency : "нет пригодной минуты")
+      ).join(" / "), $("pulse-context"));
+      for (const venue of facts.venues || []) {
+        const assessment = venue.shadow?.metrics?.execution_count;
+        if (assessment) node("p", symbol + " · " + venue.venue + " · теневая база: " +
+          assessment.samples + " пригодных минут, покрытие " + Math.round(assessment.coverage * 100) +
+          "% · пороги не утверждены", $("pulse-context"));
+      }
+    }
     $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
       " · " + result.ai_provider + " " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
+    try {
+      const system = await request("/v1/system");
+      if (sequence === generation) $("status").textContent += " · " + Object.entries(system.services).map(
+        ([name, service]) => name + ": " + service.status).join(" · ");
+    } catch (_) { /* Standalone screener remains usable without the supervisor. */ }
     render();
   } catch (error) {
     if (sequence === generation) $("status").textContent = "Обновление недоступно · " + error.message;

@@ -203,6 +203,7 @@ class HyperDataHub:
 
         # ── Status tracking ──────────────────────────────────────
         self.status = HubStatus()
+        self.observation = None
 
         # ── Event bus — anyone can subscribe ─────────────────────
         self._on_liquidation_cbs: list[Callable] = []
@@ -415,6 +416,8 @@ class HyperDataHub:
         log) instead of being silently swallowed.
         """
         s = self.status
+        from extensions.scalper.history.runtime import configure
+        self.observation = configure(self)
         # WS-driven components: start() only creates tasks and returns before
         # any handshake, so a successful start() means 'connecting', not
         # 'connected'. The staleness watchdog promotes to 'connected' on the
@@ -520,6 +523,11 @@ class HyperDataHub:
                     logger.exception("Error stopping %s (continuing shutdown)", name)
 
         # Stop API server
+        if self.observation is not None:
+            try:
+                await self.observation.close()
+            except Exception:
+                logger.exception("Error finalizing research history")
         if self._api_server:
             try:
                 await self._api_server.stop()
@@ -594,6 +602,12 @@ class HyperDataHub:
                 if not self.demo:
                     self.status.market_data = "error"
                 logger.exception("Market refresh error")
+
+            if self.observation is not None:
+                try:
+                    await self.observation.tick(time.time())
+                except Exception:
+                    logger.exception("Attention update failed")
 
             await asyncio.sleep(self.market_refresh_interval)
 
@@ -756,11 +770,13 @@ class HyperDataHub:
         # Order flow (Hyperliquid + Binance trades).
         if self.status.orderflow_engine in ("connecting", "connected", "partial", "stale"):
             fresh = self.orderflow.venue_freshness()
-            statuses = {v: info["status"] for v, info in fresh.items()}
+            statuses = {v: info["status"] for v, info in fresh.items() if info["status"] != "disabled"}
             # The hub's own first seconds: sockets are still being opened, so
             # 'never connected' is expected and must not read as stale.
             in_startup_grace = (time.time() - self.status.started_at) < ORDERFLOW_STALE_AFTER
-            if self.orderflow.last_message_at <= 0:
+            if not statuses:
+                state = "connected"  # Idle selective mode: no trade stream is requested.
+            elif self.orderflow.last_message_at <= 0:
                 # No venue has delivered a trade yet: 'connecting' while the
                 # hub or any venue is inside its grace window, otherwise
                 # nothing is flowing and that is 'stale', not 'connected'.
@@ -782,7 +798,7 @@ class HyperDataHub:
             now_w = time.time()
             contributing = self.orderflow.contributing_venues()
             for venue, info in fresh.items():
-                if info["status"] in ("ok", "connecting") or in_startup_grace:
+                if info["status"] in ("ok", "connecting", "disabled") or in_startup_grace:
                     continue
                 if now_w - self._venue_stale_warned_at.get(venue, 0.0) > self.VENUE_WARN_INTERVAL:
                     self._venue_stale_warned_at[venue] = now_w
@@ -803,7 +819,7 @@ class HyperDataHub:
             cooldown = ORDERFLOW_STALE_AFTER * 2
             had_data = self.orderflow.last_message_at > 0
             since_last_force = now - getattr(self, "_last_of_force_reconnect", 0.0)
-            if had_data and self.orderflow.data_age() > cooldown and since_last_force > cooldown:
+            if statuses and had_data and self.orderflow.data_age() > cooldown and since_last_force > cooldown:
                 if self.orderflow.hl_sockets_open:
                     self._last_of_force_reconnect = now
                     logger.warning(

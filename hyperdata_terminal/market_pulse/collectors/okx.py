@@ -21,7 +21,7 @@ from ..contracts import (
     normalize_epoch_ms,
 )
 from .base import CollectorConfig, StreamCollector
-from .specs import OKX_DEFAULT_CONTRACT_SIZE, OKX_MARKET_IDS, okx_spec
+from .specs import OKX_DEFAULT_CONTRACT_SIZE, OKX_MARKET_IDS, market_for_venue, okx_spec
 
 
 def normalize_okx_trades(
@@ -116,8 +116,8 @@ class OkxInstrumentCatalog:
     def __init__(self, base_url: str = "https://www.okx.com") -> None:
         self.base_url = base_url.rstrip("/")
 
-    async def fetch(self, session: aiohttp.ClientSession, market: str) -> InstrumentSpec:
-        inst_id = OKX_MARKET_IDS[market]
+    async def fetch(self, session: aiohttp.ClientSession, market: str, *, verify=False) -> InstrumentSpec:
+        inst_id = market_for_venue("okx", market)
         async with session.get(
             f"{self.base_url}/api/v5/public/instruments",
             params={"instType": "SWAP", "instId": inst_id},
@@ -128,6 +128,10 @@ class OkxInstrumentCatalog:
         if body.get("code") != "0" or not body.get("data"):
             raise ValueError(f"OKX instrument catalog rejected {inst_id}: {body.get('msg')}")
         row = body["data"][0]
+        if verify and (row.get("instId") != inst_id or row.get("ctType") != "linear"
+                       or row.get("settleCcy") != "USDT" or row.get("ctValCcy") != market.upper()
+                       or row.get("state") != "live"):
+            raise ValueError("unsupported OKX contract specification: " + inst_id)
         contract_size = _decimal(row["ctVal"])
         multiplier = _decimal(row.get("ctMult") or "1")
         if contract_size <= 0 or multiplier <= 0:
@@ -161,7 +165,7 @@ class OkxCollector(StreamCollector):
     def native_market_id(self, market: str) -> str:
         # Coverage and gaps must be keyed like the events themselves, or the
         # store ends up with both "BTC" and "BTC-USDT-SWAP" channels.
-        return OKX_MARKET_IDS[market]
+        return market_for_venue("okx", market)
 
     @property
     def url(self) -> str:
@@ -174,13 +178,16 @@ class OkxCollector(StreamCollector):
         return [
             {
                 "op": "subscribe",
-                "args": [{"channel": "trades-all", "instId": OKX_MARKET_IDS[market]}],
+                "args": [{"channel": "trades-all", "instId": market_for_venue("okx", market)}],
             }
             for market in self.config.markets
         ]
 
     def is_subscription_ack(self, payload: Any) -> bool:
         return isinstance(payload, dict) and payload.get("event") == "subscribe"
+
+    def acknowledged_market(self, payload):
+        return (payload.get("arg") or {}).get("instId") if self.is_subscription_ack(payload) else None
 
     def is_error(self, payload: Any) -> bool:
         return isinstance(payload, dict) and payload.get("event") == "error"
