@@ -132,7 +132,7 @@ def test_collector_normalizers_convert_contracts_to_base_quantity():
                     "sz": "3",
                     "side": "sell",
                     "ts": "1700000000123",
-                    "count": "3",
+                    "source": "0",
                 }
             ],
         },
@@ -141,7 +141,9 @@ def test_collector_normalizers_convert_contracts_to_base_quantity():
         source_epoch="e1",
         raw_ref="seg:2",
     )
-    assert okx[0].execution_count == 3
+    # Live `trades-all` rows carry no aggregation count: one row, one execution.
+    assert okx[0].execution_count == 1
+    assert okx[0].aggregation_kind == "execution"
     assert okx[0].base_amount == Decimal("0.03")
     assert okx[0].quote_amount == Decimal("1260.00")
 
@@ -152,20 +154,20 @@ async def test_okx_aggregated_channel_is_never_mixed_with_execution():
     event_time = MINUTE + 1_000
 
     def payload(channel: str) -> dict:
-        return {
-            "arg": {"channel": channel, "instId": "BTC-USDT-SWAP"},
-            "data": [
-                {
-                    "instId": "BTC-USDT-SWAP",
-                    "tradeId": "77",
-                    "px": "42000",
-                    "sz": "3",
-                    "side": "sell",
-                    "ts": str(event_time),
-                    "count": "3",
-                }
-            ],
+        row = {
+            "instId": "BTC-USDT-SWAP",
+            "tradeId": "77",
+            "px": "42000",
+            "sz": "3",
+            "side": "sell",
+            "ts": str(event_time),
+            "source": "0",
         }
+        if channel == "trades":
+            # Only the aggregated public channel carries a count.
+            row["count"] = "3"
+            row["seqId"] = 123
+        return {"arg": {"channel": channel, "instId": "BTC-USDT-SWAP"}, "data": [row]}
 
     execution = normalize_okx_trades(
         payload("trades-all"), spec, receive_time_ms=event_time, source_epoch="e1", raw_ref="a:1"
@@ -175,6 +177,8 @@ async def test_okx_aggregated_channel_is_never_mixed_with_execution():
     )[0]
     assert execution.aggregation_kind == "execution"
     assert aggregated.aggregation_kind == "aggregated"
+    assert execution.execution_count == 1
+    assert aggregated.execution_count == 3
     assert execution.dedup_key != aggregated.dedup_key
     assert execution.content_fingerprint() != aggregated.content_fingerprint()
 
@@ -414,6 +418,62 @@ async def test_raw_recovery_leaves_uncovered_gap_open(tmp_path):
     assert (await store.list_gaps())[0].state == QualityState.GAP_DETECTED.value
 
 
+async def test_reconnect_records_gap_and_raw_cannot_fake_coverage(tmp_path):
+    archive = RawArchive(tmp_path, "hyperliquid")
+    boundary_time = MINUTE + 1_000
+    archive.append(
+        {
+            "channel": "trades",
+            "data": [
+                {"coin": "BTC", "side": "B", "px": "100", "sz": "2", "time": boundary_time, "tid": 12}
+            ],
+        },
+        receive_time_ms=boundary_time,
+        source_epoch="e1",
+    )
+    archive.close()
+
+    store, gaps, _windows, ingest = await make_services()
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            state=QualityState.OBSERVED_NO_DETECTED_GAP.value,
+            updated_at_ms=boundary_time,
+            last_event_ms=boundary_time,
+            last_receive_ms=boundary_time,
+        )
+    )
+    # A clean restart has no disconnect callback, but the hole is still real.
+    coverage = await gaps.on_connected(
+        "hyperliquid", "BTC", "trades", "e2", MINUTE + 60_000
+    )
+    assert coverage.state == QualityState.RECOVERING.value
+    stored = await store.list_gaps()
+    assert len(stored) == 1
+    assert stored[0].start_ms == boundary_time
+    assert stored[0].state == QualityState.GAP_DETECTED.value
+
+    # Only the pre-restart boundary frame exists, so replay must not reconcile.
+    recovery = RawRecoveryService(store, ingest, gaps)
+    spec = spec_for("hyperliquid", "BTC")
+    result = await recovery.recover_from_raw(
+        RawArchive(tmp_path, "hyperliquid", read_only=True),
+        venue="hyperliquid",
+        market="BTC",
+        channel="trades",
+        start_ms=boundary_time,
+        end_ms=MINUTE + 60_000,
+        normalize=lambda payload, **kwargs: normalize_hyperliquid_trades(payload, spec, **kwargs),
+        now_ms=MINUTE + 60_001,
+    )
+    assert result["reconciled_gaps"] == 0
+    assert result["remaining_gaps"] == 1
+    assert (await store.list_gaps())[0].state == QualityState.GAP_DETECTED.value
+
+
 async def test_auto_recovery_only_after_reconnect_and_raw_coverage(tmp_path):
     archive = RawArchive(tmp_path, "hyperliquid")
     event_time = MINUTE + 1_000
@@ -482,3 +542,208 @@ async def test_read_only_api_cursor_and_versions():
         assert payload["next_cursor"] == 2
         bad = await client.get("/events", params={"cursor": "nope"})
         assert bad.status == 400
+
+
+class _NullSink:
+    async def append_batch(self, events):
+        return {"accepted": len(events)}
+
+    async def report(self, payload):
+        return {"status": "ok"}
+
+    async def close(self):
+        return None
+
+
+def test_collector_wiring_matches_live_exchange_protocols(tmp_path):
+    from hyperdata_terminal.market_pulse.collectors.base import CollectorConfig
+    from hyperdata_terminal.market_pulse.collectors.hyperliquid import HyperliquidCollector
+    from hyperdata_terminal.market_pulse.collectors.okx import OkxCollector
+
+    config = CollectorConfig(
+        venue="okx",
+        markets=("BTC",),
+        raw_dir=str(tmp_path),
+        ingest_url="http://127.0.0.1:8430",
+    )
+    archive = RawArchive(tmp_path, "okx")
+    try:
+        okx = OkxCollector(config, archive, _NullSink())
+        # `trades-all` is a business-channel stream; the public endpoint rejects it.
+        assert "v5/business" in okx.url
+        assert "8443" not in okx.url
+        assert okx.is_ignorable({"event": "notice", "code": "64010"})
+        assert okx.is_ignorable({"event": "subscribe", "arg": {"channel": "trades-all"}})
+        assert okx.is_heartbeat_response("pong") is True
+        assert okx.is_heartbeat_response({"channel": "trades"}) is False
+        # Gap/coverage keys must match the native ids used by the events.
+        assert okx.native_market_id("BTC") == "BTC-USDT-SWAP"
+        assert okx.native_market_id("XRP") == "XRP-USDT-SWAP"
+
+        hyperliquid = HyperliquidCollector(
+            replace(config, venue="hyperliquid"), archive, _NullSink()
+        )
+        # A dict payload must never reach an unhashable set-membership test.
+        assert hyperliquid.is_heartbeat_response({"channel": "pong"}) is True
+        assert hyperliquid.is_heartbeat_response({"channel": "trades", "data": []}) is False
+        assert hyperliquid.native_market_id("BTC") == "BTC"
+
+        # A control frame after data must not be archived or normalized.
+        import asyncio as _asyncio
+        import json as _json
+
+        _asyncio.run(
+            okx._handle_payload(
+                _json.dumps(
+                    {
+                        "event": "subscribe",
+                        "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
+                    }
+                ),
+                "epoch-1",
+            )
+        )
+        assert okx._pending == []
+    finally:
+        archive.close()
+
+
+class _FakeMessage:
+    def __init__(self, type_, data):
+        self.type = type_
+        self.data = data
+
+
+class _FakeWS:
+    def __init__(self, messages, stop):
+        self.messages = list(messages)
+        self.stop = stop
+        self.sent = []
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def send_str(self, payload):
+        self.sent.append(payload)
+
+    async def receive(self, timeout=None):
+        import asyncio
+
+        if self.messages:
+            return self.messages.pop(0)
+        self.stop.set()
+        raise asyncio.TimeoutError
+
+    async def close(self):
+        return None
+
+
+class _FakeSession:
+    def __init__(self, ws):
+        self.ws = ws
+
+    async def ws_connect(self, *args, **kwargs):
+        return self.ws
+
+
+class _OrderGaps:
+    def __init__(self, order):
+        self.order = order
+
+    async def connected(self, *args, **kwargs):
+        self.order.append("connected")
+
+    async def disconnected(self, *args, **kwargs):
+        return None
+
+    async def heartbeat(self, *args, **kwargs):
+        return None
+
+    async def unavailable(self, *args, **kwargs):
+        return None
+
+
+class _OrderSink:
+    def __init__(self, order):
+        self.order = order
+
+    async def append_batch(self, events):
+        self.order.append("append_batch")
+        return {"accepted": len(events)}
+
+    async def report(self, payload):
+        return {"status": "ok"}
+
+    async def close(self):
+        return None
+
+
+def test_connection_is_reported_before_early_data_is_ingested(tmp_path):
+    import asyncio
+    import json
+
+    import aiohttp
+
+    from hyperdata_terminal.market_pulse.collectors.base import CollectorConfig
+    from hyperdata_terminal.market_pulse.collectors.okx import OkxCollector
+
+    data_frame = {
+        "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
+        "data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "tradeId": "1",
+                "px": "100",
+                "sz": "1",
+                "side": "buy",
+                "ts": str(MINUTE + 1_000),
+                "source": "0",
+            }
+        ],
+    }
+    ack_frame = {
+        "event": "subscribe",
+        "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
+    }
+    stop = asyncio.Event()
+    ws = _FakeWS(
+        [
+            _FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps(data_frame)),
+            _FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps(ack_frame)),
+        ],
+        stop,
+    )
+    order: list[str] = []
+    config = CollectorConfig(
+        venue="okx",
+        markets=("BTC",),
+        raw_dir=str(tmp_path),
+        ingest_url="http://127.0.0.1:8430",
+    )
+    archive = RawArchive(tmp_path, "okx")
+    try:
+        collector = OkxCollector(config, archive, _OrderSink(order), _OrderGaps(order))
+        asyncio.run(collector._run_connection(_FakeSession(ws), "epoch-1", stop))
+        # The epoch must be observed before early data can overwrite it.
+        assert order.index("connected") < order.index("append_batch")
+    finally:
+        archive.close()
+
+
+def test_cli_entrypoint_and_service_import(monkeypatch):
+    from datetime import datetime, timezone
+
+    from hyperdata_terminal.market_pulse import __main__ as cli
+    from hyperdata_terminal.market_pulse import service
+
+    monkeypatch.setenv("PULSE_MARKETS", " btc, xrp ")
+    assert service.markets() == ("BTC", "XRP")
+    assert cli.build_parser().parse_args(["init-db"]).command == "init-db"
+    expected = int(datetime(2026, 11, 6, 10, tzinfo=timezone.utc).timestamp() * 1_000)
+    assert service.parse_boundary("2026-11-06T10:00:00Z", default_ms=0) == expected
+    assert service.parse_boundary("1793959200", default_ms=0) == expected
+    assert (
+        service.safe_database_url("postgresql://user:s3cret@db:5432/marketpulse")
+        == "postgresql://user:***@db:5432/marketpulse"
+    )
+    assert service.safe_database_url("postgresql://db/marketpulse") == "postgresql://db/marketpulse"

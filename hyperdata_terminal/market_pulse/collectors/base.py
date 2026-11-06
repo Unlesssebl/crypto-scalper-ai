@@ -127,9 +127,25 @@ class StreamCollector(ABC):
     def is_error(self, payload: Any) -> bool: ...
 
     def is_heartbeat_response(self, payload: Any) -> bool:
-        return payload in {"pong", "ping"} or (
-            isinstance(payload, dict) and payload.get("channel") in {"pong", "ping"}
-        )
+        # Text pings arrive as bare strings; OKX/Hyperliquid also send
+        # ``{"channel": "pong"}``.  Test the type first: a dict is unhashable and
+        # a set-membership test would raise on every data message.
+        if isinstance(payload, str):
+            return payload in {"pong", "ping"}
+        return isinstance(payload, dict) and payload.get("channel") in {"pong", "ping"}
+
+    def is_ignorable(self, payload: Any) -> bool:
+        """True for control frames that must not enter the raw archive.
+
+        OKX sends data *before* the subscribe ack and may emit operational
+        notices later, so any frame carrying an ``event`` is control traffic,
+        not market data.  Real errors are rejected earlier by ``is_error``.
+        """
+        return isinstance(payload, dict) and payload.get("event") is not None
+
+    def native_market_id(self, market: str) -> str:
+        """Map a V1 label (``BTC``) to the venue's native instrument id."""
+        return market
 
     @abstractmethod
     def normalize(
@@ -170,7 +186,7 @@ class StreamCollector(ABC):
                             for market in self.config.markets:
                                 await self.gaps.unavailable(
                                     self.venue,
-                                    market,
+                                    self.native_market_id(market),
                                     self.channel,
                                     epoch,
                                     now,
@@ -197,8 +213,13 @@ class StreamCollector(ABC):
         try:
             for subscription in self.subscriptions():
                 await ws.send_json(subscription)
-            await self._wait_for_subscription(ws, epoch)
+            early = await self._wait_for_subscription(ws)
+            # Report the new epoch before ingesting anything: a data frame may
+            # arrive before the subscription ack, and ingesting it first would
+            # overwrite the previous epoch before the restart gap is recorded.
             await self._report_connected(epoch)
+            for raw_text in early:
+                await self._handle_payload(raw_text, epoch)
             while not stop.is_set():
                 try:
                     message = await ws.receive(timeout=self.heartbeat_interval_ms / 1_000)
@@ -220,8 +241,15 @@ class StreamCollector(ABC):
         finally:
             await ws.close()
 
-    async def _wait_for_subscription(self, ws: aiohttp.ClientWebSocketResponse, epoch: str) -> None:
+    async def _wait_for_subscription(self, ws: aiohttp.ClientWebSocketResponse) -> list[str]:
+        """Return messages that arrived before an explicit acknowledgement.
+
+        Some feeds (OKX) push data before the subscribe ack, and others never
+        send an ack at all.  Returning the raw frames lets the caller report the
+        connection first and only then normalize them.
+        """
         deadline = time.monotonic() + self.config.ack_timeout_ms / 1_000
+        early: list[str] = []
         while time.monotonic() < deadline:
             try:
                 message = await ws.receive(timeout=max(0.1, deadline - time.monotonic()))
@@ -233,11 +261,9 @@ class StreamCollector(ABC):
             if self.is_error(payload):
                 raise ConnectionError(f"{self.venue} subscription rejected: {payload}")
             if self.is_subscription_ack(payload):
-                return
-            # Some feeds start with data before an explicit acknowledgement.
-            await self._handle_payload(message.data, epoch)
-            if self._pending:
-                return
+                return early
+            early.append(message.data)
+            return early
         raise TimeoutError(f"{self.venue} subscription was not acknowledged")
 
     async def _handle_payload(self, raw_text: str, epoch: str) -> None:
@@ -252,6 +278,10 @@ class StreamCollector(ABC):
         if self.is_error(payload):
             raise ConnectionError(f"{self.venue} error message: {payload}")
         if self.is_heartbeat_response(payload):
+            await self._report_heartbeat(received)
+            return
+        if self.is_ignorable(payload):
+            # Subscription notices are operational, not market data.
             await self._report_heartbeat(received)
             return
         reference = self.archive.append(payload, receive_time_ms=received, source_epoch=epoch)
@@ -295,7 +325,7 @@ class StreamCollector(ABC):
             try:
                 await self.gaps.disconnected(
                     self.venue,
-                    market,
+                    self.native_market_id(market),
                     self.channel,
                     epoch,
                     now,
@@ -307,11 +337,15 @@ class StreamCollector(ABC):
 
     async def _report_connected(self, epoch: str) -> None:
         for market in self.config.markets:
-            await self.gaps.connected(self.venue, market, self.channel, epoch, now_ms())
+            await self.gaps.connected(
+                self.venue, self.native_market_id(market), self.channel, epoch, now_ms()
+            )
 
     async def _report_heartbeat(self, now: int) -> None:
         for market in self.config.markets:
-            await self.gaps.heartbeat(self.venue, market, self.channel, now)
+            await self.gaps.heartbeat(
+                self.venue, self.native_market_id(market), self.channel, now
+            )
 
     def _backoff_seconds(self, failure: int) -> float:
         base = min(self.config.max_backoff_ms, self.config.base_backoff_ms * 2 ** (failure - 1))

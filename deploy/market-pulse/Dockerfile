@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir "aiohttp>=3.9,<4" "asyncpg>=0.29,<1"
 COPY hyperdata_terminal ./hyperdata_terminal
 
 RUN useradd --create-home --uid 10001 pulse \
-    && mkdir -p /raw \
+    && mkdir -p /raw/hyperliquid /raw/okx \
     && chown -R pulse:pulse /app /raw
 USER pulse
 

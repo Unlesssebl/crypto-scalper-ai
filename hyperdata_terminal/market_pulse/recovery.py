@@ -97,10 +97,13 @@ class RawRecoveryService:
                     # not silently turn it into a reconciled window.
                     remaining += 1
                     continue
-                if gap.start_ms >= min_receive and (gap.end_ms is None or gap.end_ms <= max_receive):
+                # An open-ended gap must be covered all the way to the requested
+                # end, not merely by a frame sitting on its lower boundary.
+                covered_end = gap.end_ms if gap.end_ms is not None else end_ms
+                if min_receive <= gap.start_ms and max_receive >= covered_end:
                     await self.gaps.mark_reconciled(
                         gap.gap_id,
-                        end_ms=gap.end_ms or max_receive,
+                        end_ms=covered_end,
                         method="raw",
                         now_ms=now_ms,
                         venue=venue,

@@ -8,7 +8,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
+from ..paths import DATA_DIR
 from .api import run_api
 from .collectors.base import CollectorConfig, StreamCollector
 from .collectors.hyperliquid import HyperliquidCollector, normalize_hyperliquid_trades
@@ -17,7 +19,6 @@ from .collectors.specs import default_instruments, spec_index
 from .gaps import GapTracker
 from .ingest import GapControlService, IngestionService
 from .ingest_http import run_ingest
-from .paths import DATA_DIR
 from .postgres import PostgresStore
 from .raw_archive import RawArchive
 from .recovery import AutoRawRecovery, RawRecoveryService
@@ -30,6 +31,17 @@ DEFAULT_DATABASE_URL = "postgresql://marketpulse:marketpulse@127.0.0.1:5432/mark
 
 def database_url() -> str:
     return os.getenv("PULSE_DATABASE_URL", DEFAULT_DATABASE_URL)
+
+
+def safe_database_url(value: str) -> str:
+    """Redact the password so status output can be pasted into a ticket."""
+    parts = urlsplit(value)
+    if not parts.password:
+        return value
+    netloc = f"{parts.username or ''}:***@{parts.hostname or ''}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def raw_root() -> Path:
@@ -67,7 +79,7 @@ async def init_db() -> dict[str, Any]:
     try:
         await store.register_instruments(default_instruments(markets()))
         health = await store.health()
-        return {"status": "ok", "database": database_url(), "storage": health}
+        return {"status": "ok", "database": safe_database_url(database_url()), "storage": health}
     finally:
         await store.close()
 

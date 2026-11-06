@@ -28,14 +28,42 @@ class GapTracker:
         source_epoch: str,
         now_ms: int,
     ) -> ChannelCoverage:
+        current = await self._coverage(venue, native_market_id, channel)
         open_gaps = await self.store.list_gaps(
             venue=venue,
             native_market_id=native_market_id,
             channel=channel,
             state=QualityState.GAP_DETECTED.value,
         )
-        state = QualityState.RECOVERING.value if open_gaps else QualityState.OBSERVED_NO_DETECTED_GAP.value
-        current = await self._coverage(venue, native_market_id, channel)
+        reason: str | None = None
+        if open_gaps:
+            state = QualityState.RECOVERING.value
+            reason = "subscription acknowledged; interval is not reconciled"
+        elif (
+            current is not None
+            and current.last_receive_ms is not None
+            and current.source_epoch != source_epoch
+        ):
+            # A new epoch means the collector restarted.  A clean stop does not
+            # raise a disconnect, but the downtime is still missing data, so the
+            # interval from the last received trade is recorded explicitly.
+            await self.store.add_gap(
+                Gap(
+                    gap_id=0,
+                    venue=venue,
+                    native_market_id=native_market_id,
+                    channel=channel,
+                    source_epoch=source_epoch,
+                    start_ms=current.last_receive_ms,
+                    detected_at_ms=now_ms,
+                    state=QualityState.GAP_DETECTED.value,
+                    reason="source epoch changed: collector restarted",
+                )
+            )
+            state = QualityState.RECOVERING.value
+            reason = "source epoch changed; interval is not reconciled"
+        else:
+            state = QualityState.OBSERVED_NO_DETECTED_GAP.value
         coverage = ChannelCoverage(
             venue=venue,
             native_market_id=native_market_id,
@@ -47,7 +75,7 @@ class GapTracker:
             last_receive_ms=None if current is None else current.last_receive_ms,
             heartbeat_ms=now_ms,
             connected_since_ms=now_ms,
-            reason="subscription acknowledged; interval is not reconciled" if open_gaps else None,
+            reason=reason,
         )
         await self.store.set_coverage(coverage)
         return coverage

@@ -5,8 +5,20 @@ cp .env.example .env
 # edit POSTGRES_PASSWORD and PULSE_INGEST_TOKEN
 docker compose up -d --build
 docker compose ps
-curl http://127.0.0.1:8431/health
+curl -i http://127.0.0.1:8431/health
 ```
+
+`init-db` is optional: the ingest and API apply the schema on connect. Run it
+explicitly when you want an empty, verified database before starting collectors:
+
+```bash
+docker compose run --rm ingest init-db
+```
+
+`/health` returns `200` when every channel is observed without an open gap and
+`503` when at least one gap is open or a channel is unavailable. A degraded
+response is expected after any collector restart until the gap is reconciled or
+declared; it is not a process failure.
 
 Two collectors are separate containers with separate raw volumes.  The ingest
 container mounts both volumes read-only in practice (it only reads them for the
@@ -19,5 +31,11 @@ docker compose run --rm ingest recover --venue hyperliquid --market BTC \
   --from 2026-11-06T10:00:00Z --to 2026-11-06T10:15:00Z
 ```
 
+Recovery is idempotent: replaying an interval that is already ingested returns
+`accepted: 0` and only counts `duplicates`. It does not reconcile a gap whose
+raw archive does not cover both boundaries.
+
 The API and ingest ports are published on loopback only.  Do not expose them
 directly; put an authenticated proxy in front if remote access is required.
+
+Note: `docker compose down -v` deletes the database and both raw volumes.

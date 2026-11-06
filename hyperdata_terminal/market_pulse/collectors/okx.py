@@ -158,9 +158,17 @@ class OkxCollector(StreamCollector):
                 for market in config.markets
             }
 
+    def native_market_id(self, market: str) -> str:
+        # Coverage and gaps must be keyed like the events themselves, or the
+        # store ends up with both "BTC" and "BTC-USDT-SWAP" channels.
+        return OKX_MARKET_IDS[market]
+
     @property
     def url(self) -> str:
-        return "wss://ws.okx.com:8443/ws/v5/public"
+        # ``trades-all`` is served by the business endpoint, not /public.
+        # Verified live: /public rejects it with code 60018, while /business
+        # streams execution rows without an aggregation ``count``.
+        return "wss://ws.okx.com:443/ws/v5/business"
 
     def subscriptions(self) -> list[dict[str, Any]]:
         return [
