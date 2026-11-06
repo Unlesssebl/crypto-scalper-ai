@@ -15,10 +15,10 @@ explicitly when you want an empty, verified database before starting collectors:
 docker compose run --rm ingest init-db
 ```
 
-`/health` returns `200` when every channel is observed without an open gap and
-`503` when at least one gap is open or a channel is unavailable. A degraded
-response is expected after any collector restart until the gap is reconciled or
-declared; it is not a process failure.
+`/health` возвращает `200` когда все каналы наблюдаются без открытых gap и
+`503` при открытом gap, недоступном или устаревшем канале. `degraded` после
+перезапуска коллектора ожидаем, пока gap не согласован или не объявлен; это не
+падение процесса.
 
 Two collectors are separate containers with separate raw volumes.  The ingest
 container mounts both volumes read-only in practice (it only reads them for the
@@ -56,7 +56,8 @@ docker compose run --rm ingest acceptance \
 
 Only closed windows count. Minutes before the channel's first observed window
 are reported as `outside`, quiet minutes are not treated as losses, and any
-minute the channel cannot vouch for fails the run.
+minute the channel cannot vouch for fails the run. A short run cannot pass a
+long window: the observed span must also reach the required share.
 
 The API and ingest ports are published on loopback only.  Do not expose them
 directly; put an authenticated proxy in front if remote access is required.

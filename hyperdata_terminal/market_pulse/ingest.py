@@ -16,6 +16,7 @@ from .contracts import (
     ExecutionEvent,
     InstrumentSpec,
     QualityState,
+    known_channel,
 )
 from .gaps import GapTracker
 from .storage import AppendResult, MarketPulseStore
@@ -113,6 +114,36 @@ class IngestionService:
             windows = await self.windows.close_due(now_ms=now_ms)
             return [window.to_payload() for window in windows]
 
+    async def rebuild_range(
+        self,
+        venue: str,
+        native_market_id: str,
+        channel: str,
+        aggregation_kind: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        now_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Rebuild every minute touched by a gap after its state changed."""
+        from .contracts import WINDOW_MS
+
+        first = start_ms // WINDOW_MS * WINDOW_MS
+        last = max(first, (max(start_ms + 1, end_ms) - 1) // WINDOW_MS * WINDOW_MS)
+        rebuilt = []
+        for window_start in range(first, last + WINDOW_MS, WINDOW_MS):
+            rebuilt.append(
+                await self.windows.rebuild(
+                    venue,
+                    native_market_id,
+                    channel,
+                    aggregation_kind,
+                    window_start,
+                    now_ms=now_ms,
+                )
+            )
+        return [window.to_payload() for window in rebuilt]
+
     async def _touch_coverage(self, events: Iterable[ExecutionEvent], *, now_ms: int) -> None:
         latest: dict[tuple[str, str, str], ExecutionEvent] = {}
         for event in events:
@@ -201,6 +232,24 @@ class GapControlService:
         )
         if gap is None:
             raise BatchError(f"gap {gap_id} not found")
+        # Reconciled quality must reach the windows even when the interval had
+        # no recovered trades to trigger a rebuild.
+        from .contracts import WINDOW_MS
+        from .windows import WindowService
+
+        windows = WindowService(self.store)
+        kind = known_channel(gap.venue, gap.channel).value
+        first = gap.start_ms // WINDOW_MS * WINDOW_MS
+        last = max(first, (max(gap.start_ms + 1, end_ms) - 1) // WINDOW_MS * WINDOW_MS)
+        for window_start in range(first, last + WINDOW_MS, WINDOW_MS):
+            await windows.rebuild(
+                gap.venue,
+                gap.native_market_id,
+                gap.channel,
+                kind,
+                window_start,
+                now_ms=now_ms,
+            )
         return {"status": "ok", "gap": gap.to_payload()}
 
 

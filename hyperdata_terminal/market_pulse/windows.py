@@ -258,6 +258,19 @@ class WindowService:
             if gap.state == QualityState.GAP_DETECTED.value:
                 conflict_marked = True
                 break
+        # Liveness must be proven by a received frame, not by a heartbeat we
+        # sent ourselves.  The collector reports heartbeats only on received
+        # messages after the fix in base.py.
+        evidence = [
+            value
+            for value in (
+                None if coverage is None else coverage.heartbeat_ms,
+                None if coverage is None else coverage.last_receive_ms,
+            )
+            if value is not None
+        ]
+        last_evidence = max(evidence) if evidence else None
+        window_closed = now_ms >= window_end_ms + self.grace_ms
         recovery_events = sum(
             1 for event in events if event.delivery_kind == DeliveryKind.RECOVERY.value
         )
@@ -291,8 +304,27 @@ class WindowService:
             return QualityState.RECONCILED.value, coverage_payload
         if gaps and all(gap.state == QualityState.RECONCILED.value for gap in gaps):
             return QualityState.RECONCILED.value, coverage_payload
+        if (
+            coverage is not None
+            and coverage.connected_since_ms is not None
+            and window_start_ms < coverage.connected_since_ms < window_end_ms
+        ):
+            # The first part of this minute happened before the connection
+            # existed.  It is not a full minute and must not be compared with
+            # complete minutes.
+            coverage_payload["partial_reason"] = "connected during window"
+            return QualityState.PARTIAL.value, coverage_payload
         if now_ms < window_end_ms + self.grace_ms:
             return QualityState.WARMING_UP.value, coverage_payload
+        if (
+            window_closed
+            and coverage is not None
+            and (last_evidence is None or last_evidence < window_end_ms)
+        ):
+            # The channel never proved it was alive through the end of this
+            # minute.  A stale socket must not look like a complete minute.
+            coverage_payload["partial_reason"] = "no liveness at window end"
+            return QualityState.PARTIAL.value, coverage_payload
         if coverage is None and not events:
             return QualityState.UNAVAILABLE.value, coverage_payload
         if conflict_marked:
@@ -309,6 +341,7 @@ def _zero_if_covered(value: Decimal | None, event_count: int, quality: str) -> D
         QualityState.GAP_DETECTED.value,
         QualityState.RECOVERING.value,
         QualityState.DECLARED_OUTAGE.value,
+        QualityState.PARTIAL.value,
     }:
         return Decimal(0)
     return None

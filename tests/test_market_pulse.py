@@ -1,6 +1,9 @@
 """P0-P2 Market Pulse contract, ingestion, window, recovery and API tests."""
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from dataclasses import replace
 from decimal import Decimal
 
@@ -14,12 +17,14 @@ from hyperdata_terminal.market_pulse.collectors.hyperliquid import (
 from hyperdata_terminal.market_pulse.collectors.okx import normalize_okx_trades
 from hyperdata_terminal.market_pulse.collectors.specs import default_instruments, spec_index
 from hyperdata_terminal.market_pulse.contracts import (
+    WINDOW_MS,
     ContractError,
     DeliveryKind,
     ExecutionEvent,
     Gap,
     InstrumentSpec,
     QualityState,
+    WindowAggregate,
 )
 from hyperdata_terminal.market_pulse.gaps import GapTracker
 from hyperdata_terminal.market_pulse.ingest import IngestionService
@@ -227,12 +232,15 @@ async def test_ingest_is_idempotent_and_conflicts_are_explicit():
 
 
 async def test_window_closes_after_grace_and_late_trade_revises_version():
-    store, _gaps, windows, ingest = await make_services()
+    store, gaps, windows, ingest = await make_services()
     result = await ingest.append_batch([event()], now_ms=MINUTE + 1_000)
     window = result["windows"][0]
     assert window["provisional"] is True
     assert window["quality"] == QualityState.WARMING_UP.value
 
+    # Liveness must be proven through the end of the minute; a sent heartbeat
+    # is not enough, so the collector reports a received frame here.
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
     closed = await ingest.close_due(now_ms=MINUTE + 60_000 + 5_001)
     assert closed[0]["provisional"] is False
     assert closed[0]["quality"] == QualityState.OBSERVED_NO_DETECTED_GAP.value
@@ -603,10 +611,14 @@ async def test_acceptance_report_counts_only_closed_usable_minutes():
     await ingest.append_batch(
         [event(trade_id="t0", event_time_ms=MINUTE + 1_000)], now_ms=MINUTE + 2_000
     )
-    await ingest.close_due(now_ms=MINUTE + 60_000 + 6_000)
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
     await ingest.append_batch(
         [event(trade_id="t2", event_time_ms=MINUTE + 2 * 60_000 + 1_000)],
         now_ms=MINUTE + 2 * 60_000 + 2_000,
+    )
+    await gaps.on_heartbeat(
+        "hyperliquid", "BTC", "trades", MINUTE + 3 * 60_000 + 1_000
     )
 
     # Minute 2 is lost and declared.
@@ -639,15 +651,30 @@ async def test_acceptance_report_counts_only_closed_usable_minutes():
         now_ms=MINUTE + 10 * 60_000,
     )
 
-    report = await build_acceptance_report(
+    # A 5-minute request observed for only 3 minutes cannot pass, even though
+    # every observed minute is usable.
+    wide = await build_acceptance_report(
         store,
         start_ms=MINUTE,
         end_ms=MINUTE + 5 * 60_000,
         required_pct=99.0,
     )
+    wide_row = wide["channels"][0]
+    assert wide_row["effective_minutes"] == 3
+    assert wide_row["outside_coverage_minutes"] == 2
+    assert wide_row["coverage_span_pct"] == 60.0
+    assert wide_row["usable_pct"] == 100.0
+    assert wide_row["passed"] is False
+
+    report = await build_acceptance_report(
+        store,
+        start_ms=MINUTE,
+        end_ms=MINUTE + 3 * 60_000,
+        required_pct=99.0,
+    )
     row = report["channels"][0]
     assert row["effective_minutes"] == 3
-    assert row["outside_coverage_minutes"] == 2
+    assert row["outside_coverage_minutes"] == 0
     assert row["closed_windows"] == 2
     assert row["declared_outage_windows"] == 1
     assert row["usable_windows"] == 2  # 1 observed + 1 quiet minute
@@ -655,6 +682,7 @@ async def test_acceptance_report_counts_only_closed_usable_minutes():
     assert row["missing_windows"] == 0
     # Declared minutes are excluded from the denominator.
     assert row["usable_pct"] == 100.0
+    assert row["coverage_span_pct"] == 100.0
     assert row["gap_states"] == {"declared_outage": 1}
     assert row["passed"] is True
 
@@ -673,7 +701,7 @@ async def test_acceptance_report_counts_only_closed_usable_minutes():
     degraded = await build_acceptance_report(
         store,
         start_ms=MINUTE,
-        end_ms=MINUTE + 5 * 60_000,
+        end_ms=MINUTE + 3 * 60_000,
         required_pct=99.0,
     )
     row = degraded["channels"][0]
@@ -689,8 +717,13 @@ async def test_acceptance_report_counts_only_closed_usable_minutes():
 
 
 async def test_read_only_api_cursor_and_versions():
-    store, _gaps, _windows, ingest = await make_services()
+    store, gaps, _windows, ingest = await make_services()
     await ingest.append_batch([event(), event(trade_id="t2", event_time_ms=MINUTE + 2_000)], now_ms=MINUTE + 2_000)
+    # Fixed test timestamps are far in the past; refresh liveness so the
+    # staleness guard does not (correctly) report the channel as dead.
+    await gaps.on_heartbeat(
+        "hyperliquid", "BTC", "trades", int(time.time() * 1_000)
+    )
     app = create_app(store)
     async with TestClient(TestServer(app)) as client:
         health = await client.get("/health")
@@ -822,7 +855,7 @@ class _OrderGaps:
         return None
 
     async def heartbeat(self, *args, **kwargs):
-        return None
+        self.order.append("heartbeat")
 
     async def unavailable(self, *args, **kwargs):
         return None
@@ -917,3 +950,338 @@ def test_cli_entrypoint_and_service_import(monkeypatch):
         == "postgresql://user:***@db:5432/marketpulse"
     )
     assert service.safe_database_url("postgresql://db/marketpulse") == "postgresql://db/marketpulse"
+
+
+def test_sent_ping_is_not_recorded_as_liveness(tmp_path):
+    import aiohttp
+
+    from hyperdata_terminal.market_pulse.collectors.base import CollectorConfig
+    from hyperdata_terminal.market_pulse.collectors.okx import OkxCollector
+
+    ack = {
+        "event": "subscribe",
+        "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
+    }
+
+    def run(messages):
+        stop = asyncio.Event()
+        ws = _FakeWS(messages, stop)
+        order: list[str] = []
+        config = CollectorConfig(
+            venue="okx",
+            markets=("BTC",),
+            raw_dir=str(tmp_path),
+            ingest_url="http://127.0.0.1:8430",
+        )
+        archive = RawArchive(tmp_path, "okx")
+        try:
+            collector = OkxCollector(config, archive, _OrderSink(order), _OrderGaps(order))
+            asyncio.run(collector._run_connection(_FakeSession(ws), "epoch-1", stop))
+            return order, ws.sent
+        finally:
+            archive.close()
+
+    # Only the ack arrives: the collector sends a ping but must not claim that
+    # the channel is alive.
+    order, sent = run([_FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps(ack))])
+    assert order == ["connected"]
+    assert "ping" in sent
+
+    # A real pong is evidence and is recorded.
+    order, _sent = run(
+        [
+            _FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps(ack)),
+            _FakeMessage(aiohttp.WSMsgType.TEXT, "pong"),
+        ]
+    )
+    assert order == ["connected", "heartbeat"]
+
+
+async def test_window_touching_connection_is_partial():
+    store, gaps, windows, _ingest = await make_services()
+    connect = MINUTE + 30_000
+    await gaps.on_connected("hyperliquid", "BTC", "trades", "epoch-1", connect)
+    await _ingest.append_batch(
+        [event(trade_id="p1", event_time_ms=connect + 1_000, receive_time_ms=connect + 1_000)],
+        now_ms=connect + 1_000,
+    )
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    window = await windows.rebuild(
+        "hyperliquid",
+        "BTC",
+        "trades",
+        "execution",
+        MINUTE,
+        now_ms=MINUTE + 65_000,
+    )
+    assert window.quality == QualityState.PARTIAL.value
+
+    # The next minute was observed from its start and is a full minute.
+    await _ingest.append_batch(
+        [
+            event(
+                trade_id="p2",
+                event_time_ms=MINUTE + 61_000,
+                receive_time_ms=MINUTE + 61_000,
+            )
+        ],
+        now_ms=MINUTE + 61_000,
+    )
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 125_000)
+    full = await windows.rebuild(
+        "hyperliquid",
+        "BTC",
+        "trades",
+        "execution",
+        MINUTE + WINDOW_MS,
+        now_ms=MINUTE + 125_000,
+    )
+    assert full.quality == QualityState.OBSERVED_NO_DETECTED_GAP.value
+
+
+async def test_auto_recovery_closes_covered_open_gap(tmp_path):
+    archive = RawArchive(tmp_path, "hyperliquid")
+    first = MINUTE + 1_000
+    last = MINUTE + 181_000
+    for tid, stamp in ((21, first), (22, last)):
+        archive.append(
+            {
+                "channel": "trades",
+                "data": [
+                    {"coin": "BTC", "side": "B", "px": "100", "sz": "1", "time": stamp, "tid": tid}
+                ],
+            },
+            receive_time_ms=stamp,
+            source_epoch="e1",
+        )
+    archive.close()
+
+    store, gaps, _windows, ingest = await make_services()
+    await store.add_gap(
+        Gap(
+            gap_id=0,
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            start_ms=first,
+            end_ms=None,
+            detected_at_ms=first,
+            state=QualityState.GAP_DETECTED.value,
+            reason="network",
+        )
+    )
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e2",
+            state=QualityState.RECOVERING.value,
+            updated_at_ms=first,
+            last_receive_ms=last,
+            connected_since_ms=last + 1_000,
+        )
+    )
+    from hyperdata_terminal.market_pulse.recovery import AutoRawRecovery
+
+    auto = AutoRawRecovery(store, ingest, gaps, raw_root=str(tmp_path), min_attempt_interval_ms=0)
+    results = await auto.run_once(now_ms=last + 2_000)
+    assert results and results[0]["reconciled_gaps"] == 1
+    assert (await store.list_gaps())[0].state == QualityState.RECONCILED.value
+    # Minutes fully inside the reconciled gap have no trades, but they are
+    # rebuilt as reconciled instead of staying ``recovering`` forever.
+    middle = await store.get_window(
+        "hyperliquid", "BTC", "trades", "execution", MINUTE + WINDOW_MS
+    )
+    assert middle is not None
+    assert middle.quality == QualityState.RECONCILED.value
+
+
+async def test_acceptance_known_gap_is_never_called_quiet():
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report
+
+    store, gaps, windows, ingest = await make_services()
+    await ingest.append_batch(
+        [event(trade_id="g0", event_time_ms=MINUTE + 1_000)], now_ms=MINUTE + 1_000
+    )
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
+    # A known gap with no window row must still poison the minute.
+    await store.add_gap(
+        Gap(
+            gap_id=0,
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            start_ms=MINUTE + WINDOW_MS,
+            end_ms=MINUTE + 2 * WINDOW_MS,
+            detected_at_ms=MINUTE + WINDOW_MS,
+            state=QualityState.GAP_DETECTED.value,
+            reason="network",
+        )
+    )
+    report = await build_acceptance_report(
+        store,
+        start_ms=MINUTE,
+        end_ms=MINUTE + 2 * WINDOW_MS,
+        required_pct=99.0,
+    )
+    row = report["channels"][0]
+    assert row["quiet_minutes"] == 0
+    assert row["unusable_windows"] == 1
+    assert row["usable_pct"] == 50.0
+    assert row["passed"] is False
+
+
+async def test_conflict_marks_both_minutes_unusable():
+    store, _gaps, _windows, ingest = await make_services()
+    await ingest.append_batch(
+        [event(trade_id="c1", event_time_ms=MINUTE + 1_000)], now_ms=MINUTE + 2_000
+    )
+    result = await ingest.append_batch(
+        [event(trade_id="c1", event_time_ms=MINUTE + 61_000, price="101")],
+        now_ms=MINUTE + 62_000,
+    )
+    assert result["conflicts"] == 1
+    for start in (MINUTE, MINUTE + WINDOW_MS):
+        window = await store.get_window("hyperliquid", "BTC", "trades", "execution", start)
+        assert window is not None
+        assert window.quality == QualityState.GAP_DETECTED.value
+    conflicts = [
+        gap for gap in await store.list_gaps() if "conflict" in (gap.reason or "")
+    ]
+    assert {gap.start_ms for gap in conflicts} == {MINUTE, MINUTE + WINDOW_MS}
+
+
+async def test_spec_reregistration_keeps_historical_availability():
+    store, _gaps, _windows, _ingest = await make_services()
+    base = spec_for("okx", "BTC-USDT-SWAP")
+    early = replace(base, spec_version="same-v1", valid_from_ms=MINUTE)
+    later = replace(base, spec_version="same-v1", valid_from_ms=MINUTE + 100_000)
+    await store.register_instruments([early])
+    await store.register_instruments([later])
+    found = await store.get_instrument_spec("okx", "BTC-USDT-SWAP", MINUTE + 500)
+    assert found is not None
+    assert found.valid_from_ms == MINUTE
+
+
+async def test_windows_api_pagination_does_not_split_a_minute():
+    store, _gaps, _windows, _ingest = await make_services()
+    channels = [
+        ("hyperliquid", "BTC", "trades", "execution"),
+        ("hyperliquid", "XRP", "trades", "execution"),
+        ("okx", "BTC-USDT-SWAP", "trades-all", "execution"),
+        ("okx", "XRP-USDT-SWAP", "trades-all", "execution"),
+    ]
+    expected = set()
+    for index in range(8):
+        start = MINUTE + index * WINDOW_MS
+        for venue, market, channel, kind in channels:
+            await store.upsert_window(
+                WindowAggregate(
+                    venue=venue,
+                    native_market_id=market,
+                    channel=channel,
+                    aggregation_kind=kind,
+                    window_start_ms=start,
+                    window_end_ms=start + WINDOW_MS,
+                    version=1,
+                    quality=QualityState.OBSERVED_NO_DETECTED_GAP.value,
+                    event_count=1,
+                    execution_count=1,
+                    buy_base=Decimal("1"),
+                    sell_base=None,
+                    buy_quote=Decimal("1"),
+                    sell_quote=None,
+                    open=Decimal("100"),
+                    high=Decimal("100"),
+                    low=Decimal("100"),
+                    close=Decimal("100"),
+                    first_event_ms=start + 1_000,
+                    last_event_ms=start + 1_000,
+                    provisional=False,
+                )
+            )
+            expected.add((start, venue, market, channel))
+
+    app = create_app(store)
+    seen = set()
+    cursor = MINUTE
+    async with TestClient(TestServer(app)) as client:
+        for _ in range(20):
+            response = await client.get(
+                "/windows", params={"from_ms": cursor, "limit": 10}
+            )
+            body = await response.json()
+            for row in body["windows"]:
+                seen.add(
+                    (
+                        row["window_start_ms"],
+                        row["venue"],
+                        row["native_market_id"],
+                        row["channel"],
+                    )
+                )
+            if body["next_from_ms"] is None:
+                break
+            cursor = body["next_from_ms"]
+    assert len(expected) == 32
+    assert seen == expected
+
+
+async def test_stale_channel_degrades_health_and_is_flagged():
+    store, gaps, _windows, ingest = await make_services()
+    now = int(time.time() * 1_000)
+    await ingest.append_batch(
+        [event(trade_id="s1", event_time_ms=now - 1_000)], now_ms=now - 1_000
+    )
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            state=QualityState.OBSERVED_NO_DETECTED_GAP.value,
+            updated_at_ms=now - 300_000,
+            last_event_ms=now - 300_000,
+            last_receive_ms=now - 300_000,
+            heartbeat_ms=now - 300_000,
+        )
+    )
+    app = create_app(store)
+    async with TestClient(TestServer(app)) as client:
+        health = await client.get("/health")
+        assert health.status == 503
+        body = await health.json()
+        assert body["status"] == "degraded"
+        assert body["stale_channels"]
+        coverage = await client.get("/coverage")
+        payload = await coverage.json()
+        assert payload["channels"][0]["stale"] is True
+        assert payload["channels"][0]["silence_ms"] > 120_000
+
+
+async def test_acceptance_rejects_one_minute_for_a_24h_window():
+    from hyperdata_terminal.market_pulse.acceptance import build_acceptance_report
+
+    store, gaps, _windows, ingest = await make_services()
+    await ingest.append_batch(
+        [event(trade_id="one", event_time_ms=MINUTE + 1_000)], now_ms=MINUTE + 1_000
+    )
+    await gaps.on_heartbeat("hyperliquid", "BTC", "trades", MINUTE + 65_000)
+    await ingest.close_due(now_ms=MINUTE + 66_000)
+    report = await build_acceptance_report(
+        store,
+        start_ms=MINUTE,
+        end_ms=MINUTE + 24 * 60 * 60 * 1_000,
+        required_pct=99.0,
+    )
+    row = report["channels"][0]
+    assert row["effective_minutes"] == 1
+    assert row["expected_minutes"] == 1_440
+    assert row["usable_pct"] == 100.0
+    assert row["coverage_span_pct"] < 1.0
+    assert row["passed"] is False
+    assert report["passed"] is False

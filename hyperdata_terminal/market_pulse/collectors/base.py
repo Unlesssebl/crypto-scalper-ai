@@ -224,8 +224,10 @@ class StreamCollector(ABC):
                 try:
                     message = await ws.receive(timeout=self.heartbeat_interval_ms / 1_000)
                 except asyncio.TimeoutError:
+                    # Sending a ping proves only that we tried.  Liveness is
+                    # recorded when a frame actually arrives, so a dead socket
+                    # cannot keep reporting itself healthy.
                     await self._send_heartbeat(ws)
-                    await self._report_heartbeat(now_ms())
                     continue
                 if message.type == aiohttp.WSMsgType.TEXT:
                     await self._handle_payload(message.data, epoch)

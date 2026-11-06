@@ -6,12 +6,16 @@ sockets or the PostgreSQL writer directly.  Events expose their durable
 """
 from __future__ import annotations
 
+import os
 import time
 
 from aiohttp import web
 
 from .contracts import SCHEMA_VERSION, WINDOW_SCHEMA_VERSION
+from .paging import page_windows
 from .storage import MarketPulseStore
+
+STALE_AFTER_MS = 120_000
 
 STORE_KEY = web.AppKey("store", object)
 VERSION_KEY = web.AppKey("service_version", str)
@@ -46,21 +50,26 @@ async def health(request: web.Request) -> web.Response:
     detail = await store.health()
     coverage = await store.list_coverage()
     gaps = await store.list_gaps(limit=10_000)
-    open_gaps = [gap.to_payload() for gap in gaps if gap.end_ms is None]
+    open_gaps = [gap.to_payload() for gap in gaps if gap.state == "gap_detected"]
+    stale = _stale_channels(coverage)
+    status = detail.get("status", "ok")
+    if stale:
+        status = "degraded"
     body = {
         "service": "market-pulse",
         "version": request.app[VERSION_KEY],
         "schema_version": SCHEMA_VERSION,
-        "status": detail.get("status", "ok"),
+        "status": status,
         "storage": detail,
-        "channels": [item.to_payload() for item in coverage],
+        "channels": [_channel_payload(item) for item in coverage],
+        "stale_channels": stale,
         "open_gaps": open_gaps,
         "limits": {
             "full_exchange_completeness": "not claimed",
             "note": "observed_no_detected_gap is not absolute exchange completeness",
         },
     }
-    return web.json_response(body, status=200 if detail.get("status") == "ok" else 503)
+    return web.json_response(body, status=200 if status == "ok" else 503)
 
 
 async def coverage(request: web.Request) -> web.Response:
@@ -75,7 +84,7 @@ async def coverage(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "schema_version": WINDOW_SCHEMA_VERSION,
-            "channels": [item.to_payload() for item in channels],
+            "channels": [_channel_payload(item) for item in channels],
             "gaps": [gap.to_payload() for gap in gaps],
             "note": "A live order book or heartbeat does not prove trade-channel completeness.",
         }
@@ -85,7 +94,8 @@ async def coverage(request: web.Request) -> web.Response:
 async def windows(request: web.Request) -> web.Response:
     store: MarketPulseStore = request.app[STORE_KEY]
     limit = _int_query(request, "limit", 500, minimum=1, maximum=10_000)
-    rows = await store.list_windows(
+    rows, next_from_ms = await page_windows(
+        store,
         venue=request.query.get("venue"),
         native_market_id=request.query.get("market"),
         from_ms=_optional_int_query(request, "from_ms"),
@@ -97,7 +107,7 @@ async def windows(request: web.Request) -> web.Response:
         {
             "schema_version": WINDOW_SCHEMA_VERSION,
             "windows": payload,
-            "next_from_ms": rows[-1].window_end_ms if len(rows) == limit else None,
+            "next_from_ms": next_from_ms,
         }
     )
 
@@ -122,6 +132,53 @@ async def events(request: web.Request) -> web.Response:
             "events": [row.to_payload() for row in rows],
         }
     )
+
+
+def _stale_after_ms() -> int:
+    raw = os.getenv("PULSE_STALE_AFTER_MS", str(STALE_AFTER_MS))
+    try:
+        return max(1_000, int(raw))
+    except ValueError:
+        return STALE_AFTER_MS
+
+
+def _channel_payload(item) -> dict:
+    last = _last_evidence(item)
+    now = now_ms()
+    silence = None if last is None else max(0, now - last)
+    payload = item.to_payload()
+    payload["stale"] = last is None or silence > _stale_after_ms()
+    payload["silence_ms"] = silence
+    return payload
+
+
+def _last_evidence(item) -> int | None:
+    values = [
+        value
+        for value in (item.heartbeat_ms, item.last_receive_ms)
+        if value is not None
+    ]
+    return max(values) if values else None
+
+
+def _stale_channels(channels) -> list[dict]:
+    stale: list[dict] = []
+    threshold = _stale_after_ms()
+    now = now_ms()
+    for item in channels:
+        last = _last_evidence(item)
+        silence = None if last is None else max(0, now - last)
+        if last is None or silence > threshold:
+            stale.append(
+                {
+                    "venue": item.venue,
+                    "native_market_id": item.native_market_id,
+                    "channel": item.channel,
+                    "silence_ms": silence,
+                    "coverage_state": item.state,
+                }
+            )
+    return stale
 
 
 @web.middleware

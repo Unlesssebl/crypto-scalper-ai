@@ -252,8 +252,13 @@ class InMemoryMarketPulseStore:
         self._recalc: set[tuple[str, str, str, str, int]] = set()
 
     async def register_instruments(self, specs: Iterable[InstrumentSpec]) -> None:
+        # First registration wins for a given spec version.  Re-registering the
+        # same version must not move ``valid_from_ms`` forward, or historical
+        # recovery would lose the spec for older events.  A changed contract
+        # value must arrive under a new ``spec_version``.
         for spec in specs:
-            self._instruments[(spec.venue, spec.native_market_id, spec.spec_version)] = spec
+            key = (spec.venue, spec.native_market_id, spec.spec_version)
+            self._instruments.setdefault(key, spec)
 
     async def get_instrument_spec(
         self, venue: str, native_market_id: str, at_ms: int
@@ -297,24 +302,27 @@ class InMemoryMarketPulseStore:
                 duplicates += 1
                 continue
             conflicts += 1
-            key = affected_window(existing.event)
-            affected.add(key)
-            self._conflict_windows.add(key)
-            self._recalc.add(key)
-            await self.add_gap(
-                Gap(
-                    gap_id=0,
-                    venue=event.venue,
-                    native_market_id=event.native_market_id,
-                    channel=event.channel,
-                    source_epoch=event.source_epoch,
-                    start_ms=key[4],
-                    end_ms=key[4] + WINDOW_MS,
-                    detected_at_ms=now_ms,
-                    state=QualityState.GAP_DETECTED.value,
-                    reason=f"trade id conflict: {event.trade_id}",
+            # A conflicting trade invalidates both minutes: we no longer know
+            # which version of the execution is correct.
+            keys = {affected_window(existing.event), affected_window(event)}
+            for key in keys:
+                affected.add(key)
+                self._conflict_windows.add(key)
+                self._recalc.add(key)
+                await self.add_gap(
+                    Gap(
+                        gap_id=0,
+                        venue=event.venue,
+                        native_market_id=event.native_market_id,
+                        channel=event.channel,
+                        source_epoch=event.source_epoch,
+                        start_ms=key[4],
+                        end_ms=key[4] + WINDOW_MS,
+                        detected_at_ms=now_ms,
+                        state=QualityState.GAP_DETECTED.value,
+                        reason=f"trade id conflict: {event.trade_id}",
+                    )
                 )
-            )
             self._conflicts.append(
                 ConflictRecord(
                     venue=event.venue,
@@ -555,7 +563,12 @@ class InMemoryMarketPulseStore:
             self._recalc.discard(key)
 
     async def health(self) -> dict[str, Any]:
-        open_gaps = sum(1 for gap in self._gaps if gap.end_ms is None)
+        open_gaps = sum(
+            1 for gap in self._gaps if gap.state == QualityState.GAP_DETECTED.value
+        )
+        declared = sum(
+            1 for gap in self._gaps if gap.state == QualityState.DECLARED_OUTAGE.value
+        )
         coverage = await self.list_coverage()
         unavailable = [item for item in coverage if item.state == QualityState.UNAVAILABLE.value]
         return {
@@ -565,7 +578,9 @@ class InMemoryMarketPulseStore:
             "cursor": self._next_seq - 1,
             "conflicts": len(self._conflicts),
             "open_gaps": open_gaps,
+            "declared_outages": declared,
             "unavailable_channels": len(unavailable),
+            "pending_recalc": len(self._recalc),
         }
 
     async def close(self) -> None:

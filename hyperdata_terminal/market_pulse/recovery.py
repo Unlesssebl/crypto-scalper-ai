@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .contracts import DeliveryKind, ExecutionEvent, QualityState
+from .contracts import DeliveryKind, ExecutionEvent, QualityState, known_channel
 from .gaps import GapTracker
 from .ingest import IngestionService
 from .raw_archive import RawArchive
@@ -97,18 +97,34 @@ class RawRecoveryService:
                     # not silently turn it into a reconciled window.
                     remaining += 1
                     continue
-                # An open-ended gap must be covered all the way to the requested
-                # end, not merely by a frame sitting on its lower boundary.
-                covered_end = gap.end_ms if gap.end_ms is not None else end_ms
-                if min_receive <= gap.start_ms and max_receive >= covered_end:
+                # A closed gap needs records at both boundaries.  An open gap
+                # is proven by a boundary frame at its start plus data that
+                # continued after it: a socket outage leaves only the boundary
+                # frame, while an ingest outage leaves records throughout.
+                if gap.end_ms is None:
+                    covered = min_receive <= gap.start_ms and max_receive > gap.start_ms
+                    reconcile_end = max_receive
+                else:
+                    covered = min_receive <= gap.start_ms and max_receive >= gap.end_ms
+                    reconcile_end = gap.end_ms
+                if covered:
                     await self.gaps.mark_reconciled(
                         gap.gap_id,
-                        end_ms=covered_end,
+                        end_ms=reconcile_end,
                         method="raw",
                         now_ms=now_ms,
                         venue=venue,
                         native_market_id=market,
                         channel=channel,
+                    )
+                    await self.ingest.rebuild_range(
+                        venue,
+                        market,
+                        channel,
+                        known_channel(venue, channel).value,
+                        gap.start_ms,
+                        reconcile_end,
+                        now_ms=now_ms,
                     )
                     reconciled += 1
                 else:

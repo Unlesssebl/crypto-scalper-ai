@@ -69,6 +69,7 @@ class DeliveryKind(StrEnum):
 
 class QualityState(StrEnum):
     WARMING_UP = "warming_up"
+    PARTIAL = "partial"
     OBSERVED_NO_DETECTED_GAP = "observed_no_detected_gap"
     GAP_DETECTED = "gap_detected"
     RECOVERING = "recovering"

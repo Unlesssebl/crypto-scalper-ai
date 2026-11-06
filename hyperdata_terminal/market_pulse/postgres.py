@@ -205,10 +205,7 @@ class PostgresStore:
                     (venue, native_market_id, spec_version, base_asset,
                      valid_from_ms, valid_to_ms, payload)
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                ON CONFLICT (venue, native_market_id, spec_version) DO UPDATE
-                SET payload = EXCLUDED.payload,
-                    valid_from_ms = EXCLUDED.valid_from_ms,
-                    valid_to_ms = EXCLUDED.valid_to_ms
+                ON CONFLICT (venue, native_market_id, spec_version) DO NOTHING
                 """,
                 rows,
             )
@@ -284,7 +281,7 @@ class PostgresStore:
                         continue
                     existing = await connection.fetchrow(
                         """
-                        SELECT event_seq, fingerprint FROM execution_events
+                        SELECT event_seq, fingerprint, event_time_ms FROM execution_events
                         WHERE venue=$1 AND native_market_id=$2 AND channel=$3
                           AND aggregation_kind=$4 AND trade_id=$5
                         """,
@@ -298,8 +295,40 @@ class PostgresStore:
                         duplicates += 1
                         continue
                     conflicts += 1
-                    key = affected_window(event)
-                    affected.add(key)
+                    # Both the stored minute and the incoming minute are
+                    # affected: the true execution time is now ambiguous.
+                    keys = {affected_window(event)}
+                    if existing is not None:
+                        old_time = int(existing["event_time_ms"])
+                        keys.add(
+                            (
+                                event.venue,
+                                event.native_market_id,
+                                event.channel,
+                                event.aggregation_kind,
+                                old_time // WINDOW_MS * WINDOW_MS,
+                            )
+                        )
+                    for key in keys:
+                        affected.add(key)
+                        await connection.execute(
+                            """
+                            INSERT INTO gaps
+                                (venue, native_market_id, channel, source_epoch, start_ms, end_ms,
+                                 detected_at_ms, state, reason)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            """,
+                            event.venue,
+                            event.native_market_id,
+                            event.channel,
+                            event.source_epoch,
+                            key[4],
+                            key[4] + WINDOW_MS,
+                            now_ms,
+                            QualityState.GAP_DETECTED.value,
+                            f"trade id conflict: {event.trade_id}",
+                        )
+                        await self._queue_recalc(connection, key, "conflict", now_ms)
                     errors = await connection.execute(
                         """
                         INSERT INTO event_conflicts
@@ -320,24 +349,6 @@ class PostgresStore:
                         "same dedup key with different content",
                     )
                     _ = errors
-                    await connection.execute(
-                        """
-                        INSERT INTO gaps
-                            (venue, native_market_id, channel, source_epoch, start_ms, end_ms,
-                             detected_at_ms, state, reason)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        """,
-                        event.venue,
-                        event.native_market_id,
-                        event.channel,
-                        event.source_epoch,
-                        key[4],
-                        key[4] + WINDOW_MS,
-                        now_ms,
-                        QualityState.GAP_DETECTED.value,
-                        f"trade id conflict: {event.trade_id}",
-                    )
-                    await self._queue_recalc(connection, key, "conflict", now_ms)
                 cursor = await connection.fetchval("SELECT COALESCE(MAX(event_seq), 0) FROM execution_events")
                 await connection.execute(
                     "UPDATE ingest_cursor SET last_event_seq=$1 WHERE id=1",
@@ -856,7 +867,14 @@ class PostgresStore:
             windows = await connection.fetchval("SELECT COUNT(*) FROM windows")
             cursor = await connection.fetchval("SELECT COALESCE(MAX(event_seq), 0) FROM execution_events")
             conflicts = await connection.fetchval("SELECT COUNT(*) FROM event_conflicts")
-            open_gaps = await connection.fetchval("SELECT COUNT(*) FROM gaps WHERE end_ms IS NULL")
+            open_gaps = await connection.fetchval(
+                "SELECT COUNT(*) FROM gaps WHERE state = $1",
+                QualityState.GAP_DETECTED.value,
+            )
+            declared_outages = await connection.fetchval(
+                "SELECT COUNT(*) FROM gaps WHERE state = $1",
+                QualityState.DECLARED_OUTAGE.value,
+            )
             unavailable = await connection.fetchval(
                 "SELECT COUNT(*) FROM coverage WHERE state = $1",
                 QualityState.UNAVAILABLE.value,
@@ -869,6 +887,7 @@ class PostgresStore:
             "cursor": int(cursor or 0),
             "conflicts": int(conflicts or 0),
             "open_gaps": int(open_gaps or 0),
+            "declared_outages": int(declared_outages or 0),
             "unavailable_channels": int(unavailable or 0),
             "pending_recalc": int(recalc or 0),
         }

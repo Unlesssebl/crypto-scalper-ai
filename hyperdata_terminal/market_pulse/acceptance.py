@@ -1,15 +1,17 @@
 """P3 acceptance report over closed UTC minutes.
 
 The report is deliberately explicit about what it can and cannot prove.  It
-counts only closed windows, never treats a missing window as a healthy minute,
-and separates declared outages and startup warming from real losses.
+never treats a missing minute as healthy, accounts for known gap intervals even
+when they produced no window row, and refuses to pass a long run that was only
+observed for a small part of the requested interval.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .contracts import WINDOW_MS, QualityState, known_channel
+from .paging import page_windows
 from .storage import MarketPulseStore
 
 REPORT_SCHEMA = "market-pulse.acceptance.v1"
@@ -20,10 +22,15 @@ USABLE_STATES = {
 }
 EXCLUDED_STATES = {QualityState.DECLARED_OUTAGE.value}
 UNUSABLE_STATES = {
+    QualityState.PARTIAL.value,
     QualityState.GAP_DETECTED.value,
     QualityState.RECOVERING.value,
     QualityState.UNAVAILABLE.value,
     QualityState.WARMING_UP.value,
+}
+ACTIVE_GAP_STATES = {
+    QualityState.GAP_DETECTED.value,
+    QualityState.RECOVERING.value,
 }
 
 
@@ -66,14 +73,22 @@ class ChannelAcceptance:
         return self.usable_windows / self.denominator * 100
 
     @property
+    def coverage_span_pct(self) -> float | None:
+        if self.expected_minutes <= 0:
+            return None
+        return self.effective_minutes / self.expected_minutes * 100
+
+    @property
     def passed(self) -> bool:
-        # Public trade websockets cannot prove completeness; a pass means the
-        # measured usable minutes met the target, not that nothing was missed.
+        # A pass means the measured usable minutes met the target over a span
+        # that actually covers the requested interval.  Public trade
+        # websockets still cannot prove that nothing was missed.
         return (
             self.usable_pct is not None
+            and self.coverage_span_pct is not None
             and self.usable_pct >= self.required_pct
+            and self.coverage_span_pct >= self.required_pct
             and self.conflicts == 0
-            and self.unusable_windows == 0
             and self.missing_windows == 0
         )
 
@@ -97,6 +112,9 @@ class ChannelAcceptance:
             "unusable_windows": self.unusable_windows,
             "quiet_minutes": self.quiet_minutes,
             "usable_pct": None if self.usable_pct is None else round(self.usable_pct, 3),
+            "coverage_span_pct": (
+                None if self.coverage_span_pct is None else round(self.coverage_span_pct, 3)
+            ),
             "qualities": dict(sorted(self.qualities.items())),
             "gap_states": dict(sorted(self.gap_states.items())),
             "conflicts": self.conflicts,
@@ -105,7 +123,21 @@ class ChannelAcceptance:
         }
 
 
-async def _windows_for_channel(
+def _overlaps(gap: Any, window_start_ms: int) -> bool:
+    window_end_ms = window_start_ms + WINDOW_MS
+    return gap.start_ms < window_end_ms and (
+        gap.end_ms is None or gap.end_ms > window_start_ms
+    )
+
+
+def _count(values: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+async def _channel_windows(
     store: MarketPulseStore,
     venue: str,
     native_market_id: str,
@@ -114,32 +146,24 @@ async def _windows_for_channel(
     start_ms: int,
     end_ms: int,
 ) -> list[Any]:
-    """Page through windows by ``window_start_ms`` without an OFFSET scan."""
     rows: list[Any] = []
     cursor = start_ms
     while cursor < end_ms:
-        batch = await store.list_windows(
+        page, next_cursor = await page_windows(
+            store,
             venue=venue,
             native_market_id=native_market_id,
             from_ms=cursor,
             to_ms=end_ms,
             limit=5_000,
         )
-        if not batch:
+        if not page:
             break
-        rows.extend(item for item in batch if item.channel == channel)
-        next_cursor = max(item.window_start_ms for item in batch) + 1
-        if next_cursor <= cursor:
+        rows.extend(item for item in page if item.channel == channel)
+        if next_cursor is None:
             break
         cursor = next_cursor
     return rows
-
-
-def _count(values: Iterable[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for value in values:
-        counts[value] = counts.get(value, 0) + 1
-    return counts
 
 
 async def build_acceptance_report(
@@ -162,7 +186,7 @@ async def build_acceptance_report(
     channels: list[ChannelAcceptance] = []
     for item in coverage:
         kind = known_channel(item.venue, item.channel).value
-        windows = await _windows_for_channel(
+        windows = await _channel_windows(
             store,
             item.venue,
             item.native_market_id,
@@ -170,21 +194,13 @@ async def build_acceptance_report(
             start_ms=start_ms,
             end_ms=end_ms,
         )
-        closed = [window for window in windows if not window.provisional]
-        provisional = len(windows) - len(closed)
-        starts = sorted({window.window_start_ms for window in windows})
-        if starts:
-            span_start: int | None = max(start_ms, starts[0])
-            span_end: int | None = min(end_ms, starts[-1] + WINDOW_MS)
-            outside = max(0, (span_start - start_ms) // WINDOW_MS) + max(
-                0, (end_ms - span_end) // WINDOW_MS
-            )
-            effective = max(0, (span_end - span_start) // WINDOW_MS)
-        else:
-            span_start = span_end = None
-            outside = expected
-            effective = 0
-        qualities = _count(window.quality for window in closed)
+        channel_conflicts = [
+            conflict
+            for conflict in conflicts
+            if conflict.venue == item.venue
+            and conflict.native_market_id == item.native_market_id
+            and conflict.channel == item.channel
+        ]
         channel_gaps = [
             gap
             for gap in gaps
@@ -194,26 +210,91 @@ async def build_acceptance_report(
             and gap.start_ms < end_ms
             and (gap.end_ms is None or gap.end_ms > start_ms)
         ]
-        channel_conflicts = [
-            conflict
-            for conflict in conflicts
-            if conflict.venue == item.venue
-            and conflict.native_market_id == item.native_market_id
-            and conflict.channel == item.channel
-        ]
-        usable = sum(qualities.get(state, 0) for state in USABLE_STATES)
-        declared = sum(qualities.get(state, 0) for state in EXCLUDED_STATES)
-        unusable = sum(qualities.get(state, 0) for state in UNUSABLE_STATES)
-        # Minutes with no window row are either genuinely quiet or unobserved.
-        # A live, gap-free channel can vouch for quiet minutes; anything else
-        # must be reported as a missing minute, never silently assumed healthy.
-        unaccounted = max(0, effective - len(closed) - provisional)
-        if item.state in USABLE_STATES:
-            quiet = unaccounted
-            missing = 0
+
+        # The observed span includes known gaps, so an outage is never trimmed
+        # away as "outside coverage".
+        span_points_start: list[int] = []
+        span_points_end: list[int] = []
+        if windows:
+            span_points_start.append(min(window.window_start_ms for window in windows))
+            span_points_end.append(max(window.window_start_ms for window in windows) + WINDOW_MS)
+        for gap in channel_gaps:
+            span_points_start.append(max(start_ms, gap.start_ms))
+            span_points_end.append(
+                end_ms if gap.end_ms is None else min(end_ms, gap.end_ms)
+            )
+        if span_points_start and span_points_end:
+            span_start: int | None = min(span_points_start)
+            span_end: int | None = max(span_points_end)
+            span_start = max(start_ms, span_start) // WINDOW_MS * WINDOW_MS
+            span_end = min(
+                end_ms, ((span_end + WINDOW_MS - 1) // WINDOW_MS) * WINDOW_MS
+            )
+            effective = max(0, (span_end - span_start) // WINDOW_MS)
+            outside = max(0, (span_start - start_ms) // WINDOW_MS) + max(
+                0, (end_ms - span_end) // WINDOW_MS
+            )
         else:
-            quiet = 0
-            missing = unaccounted
+            span_start = span_end = None
+            effective = 0
+            outside = expected
+
+        by_start = {window.window_start_ms: window for window in windows}
+        qualities: dict[str, int] = {}
+        closed_windows = 0
+        provisional = 0
+        missing = 0
+        usable = 0
+        declared = 0
+        unusable = 0
+        quiet = 0
+        for window_start in range(
+            0 if span_start is None else span_start,
+            0 if span_end is None else span_end,
+            WINDOW_MS,
+        ):
+            states = {
+                gap.state
+                for gap in channel_gaps
+                if _overlaps(gap, window_start)
+            }
+            window = by_start.get(window_start)
+            if window is not None and window.provisional:
+                provisional += 1
+                continue
+            if window is not None:
+                closed_windows += 1
+            if QualityState.DECLARED_OUTAGE.value in states:
+                declared += 1
+                qualities[QualityState.DECLARED_OUTAGE.value] = (
+                    qualities.get(QualityState.DECLARED_OUTAGE.value, 0) + 1
+                )
+                continue
+            if states & ACTIVE_GAP_STATES:
+                unusable += 1
+                qualities[QualityState.GAP_DETECTED.value] = (
+                    qualities.get(QualityState.GAP_DETECTED.value, 0) + 1
+                )
+                continue
+            if window is not None:
+                qualities[window.quality] = qualities.get(window.quality, 0) + 1
+                if window.quality in USABLE_STATES:
+                    usable += 1
+                elif window.quality in EXCLUDED_STATES:
+                    declared += 1
+                else:
+                    unusable += 1
+                continue
+            if QualityState.RECONCILED.value in states:
+                usable += 1
+            elif item.state in USABLE_STATES:
+                # A live, gap-free channel can vouch for a minute without
+                # trades: it is quiet, not missing.
+                quiet += 1
+                usable += 1
+            else:
+                missing += 1
+
         channels.append(
             ChannelAcceptance(
                 venue=item.venue,
@@ -226,10 +307,10 @@ async def build_acceptance_report(
                 observed_span_start_ms=span_start,
                 observed_span_end_ms=span_end,
                 outside_coverage_minutes=outside,
-                closed_windows=len(closed),
+                closed_windows=closed_windows,
                 provisional_windows=provisional,
                 missing_windows=missing,
-                usable_windows=usable + quiet,
+                usable_windows=usable,
                 declared_outage_windows=declared,
                 unusable_windows=unusable,
                 quiet_minutes=quiet,
@@ -252,8 +333,9 @@ async def build_acceptance_report(
         "limits": {
             "completeness_proof": "not claimed",
             "note": (
-                "A pass means measured usable minutes met the target; public "
-                "trade websockets cannot prove that nothing was missed."
+                "A pass means measured usable minutes met the target over a span "
+                "that covers the requested interval; public trade websockets "
+                "cannot prove that nothing was missed."
             ),
         },
     }
@@ -268,18 +350,19 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Required usable: {report['required_pct']}%",
         f"- Overall: **{'PASS' if report['passed'] else 'FAIL'}**",
         "",
-        "| venue | market | channel | effective | outside | closed | open "
+        "| venue | market | channel | span % | effective | outside | closed | open "
         "| quiet | usable | declared | unusable | missing | usable % "
         "| gaps | conflicts | pass |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:"
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:"
         "|---|---|---|",
     ]
     for row in report["channels"]:
         pct = "n/a" if row["usable_pct"] is None else f"{row['usable_pct']:.2f}"
+        span = "n/a" if row["coverage_span_pct"] is None else f"{row['coverage_span_pct']:.2f}"
         gaps = ", ".join(f"{key}={value}" for key, value in row["gap_states"].items()) or "-"
         lines.append(
             f"| {row['venue']} | {row['native_market_id']} | {row['channel']} "
-            f"| {row['effective_minutes']} | {row['outside_coverage_minutes']} "
+            f"| {span} | {row['effective_minutes']} | {row['outside_coverage_minutes']} "
             f"| {row['closed_windows']} | {row['provisional_windows']} "
             f"| {row['quiet_minutes']} | {row['usable_windows']} "
             f"| {row['declared_outage_windows']} | {row['unusable_windows']} "
@@ -291,6 +374,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "Declared outage minutes are excluded from the denominator. "
             "They are known losses, not recovered data.",
+            "",
+            "A channel must be observed for at least the required share of the "
+            "requested window; one healthy minute cannot pass a 24-hour report.",
             "",
             "Completeness proof is not claimed: `observed_no_detected_gap` only "
             "means no gap was detected on the trade channel.",
