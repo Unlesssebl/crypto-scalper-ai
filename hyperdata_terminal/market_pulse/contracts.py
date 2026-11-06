@@ -73,6 +73,7 @@ class QualityState(StrEnum):
     GAP_DETECTED = "gap_detected"
     RECOVERING = "recovering"
     RECONCILED = "reconciled"
+    DECLARED_OUTAGE = "declared_outage"
     UNAVAILABLE = "unavailable"
 
 

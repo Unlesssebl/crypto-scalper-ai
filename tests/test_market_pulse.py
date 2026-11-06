@@ -320,6 +320,58 @@ def test_raw_archive_keeps_readable_prefix_and_rotates(tmp_path):
     assert broken.last_error is not None
 
 
+async def test_declared_outage_is_audited_and_not_zero_filled():
+    store, gaps, windows, _ingest = await make_services()
+    gap = await store.add_gap(
+        Gap(
+            gap_id=0,
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            start_ms=MINUTE,
+            end_ms=None,
+            detected_at_ms=MINUTE,
+            state=QualityState.GAP_DETECTED.value,
+            reason="source epoch changed: collector restarted",
+        )
+    )
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e2",
+            state=QualityState.RECOVERING.value,
+            updated_at_ms=MINUTE,
+            connected_since_ms=MINUTE + 5_000,
+        )
+    )
+    declared = await gaps.declare_outage(
+        gap.gap_id, end_ms=MINUTE + 5_000, reason="planned redeploy", now_ms=MINUTE + 6_000
+    )
+    assert declared is not None
+    assert declared.state == QualityState.DECLARED_OUTAGE.value
+    assert declared.end_ms == MINUTE + 5_000
+    assert declared.reason == "declared outage: planned redeploy"
+    coverage = await store.get_coverage("hyperliquid", "BTC", "trades")
+    assert coverage.state == QualityState.OBSERVED_NO_DETECTED_GAP.value
+    assert "declared outage" in (coverage.reason or "")
+
+    window = await windows.rebuild(
+        "hyperliquid",
+        "BTC",
+        "trades",
+        "execution",
+        MINUTE,
+        now_ms=MINUTE + 60_000 + 10_000,
+    )
+    assert window.quality == QualityState.DECLARED_OUTAGE.value
+    # A declared outage is missing data, never a real zero.
+    assert window.buy_base is None
+    assert window.sell_base is None
+
+
 async def test_raw_recovery_marks_only_covered_gap_reconciled(tmp_path):
     archive = RawArchive(tmp_path, "hyperliquid")
     event_time = MINUTE + 1_000
@@ -472,6 +524,22 @@ async def test_reconnect_records_gap_and_raw_cannot_fake_coverage(tmp_path):
     assert result["reconciled_gaps"] == 0
     assert result["remaining_gaps"] == 1
     assert (await store.list_gaps())[0].state == QualityState.GAP_DETECTED.value
+
+    # A later reconnect while the first gap is still open must also be recorded.
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e2",
+            state=QualityState.RECOVERING.value,
+            updated_at_ms=MINUTE + 90_000,
+            last_event_ms=MINUTE + 89_000,
+            last_receive_ms=MINUTE + 89_500,
+        )
+    )
+    await gaps.on_connected("hyperliquid", "BTC", "trades", "e3", MINUTE + 120_000)
+    assert len(await store.list_gaps()) == 2
 
 
 async def test_auto_recovery_only_after_reconnect_and_raw_coverage(tmp_path):
@@ -739,6 +807,11 @@ def test_cli_entrypoint_and_service_import(monkeypatch):
     monkeypatch.setenv("PULSE_MARKETS", " btc, xrp ")
     assert service.markets() == ("BTC", "XRP")
     assert cli.build_parser().parse_args(["init-db"]).command == "init-db"
+    outage = cli.build_parser().parse_args(
+        ["declare-outage", "--gap-id", "7", "--reason", "planned"]
+    )
+    assert outage.command == "declare-outage"
+    assert outage.gap_id == 7
     expected = int(datetime(2026, 11, 6, 10, tzinfo=timezone.utc).timestamp() * 1_000)
     assert service.parse_boundary("2026-11-06T10:00:00Z", default_ms=0) == expected
     assert service.parse_boundary("1793959200", default_ms=0) == expected

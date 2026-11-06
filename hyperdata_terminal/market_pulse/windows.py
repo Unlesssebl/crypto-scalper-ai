@@ -285,6 +285,8 @@ class WindowService:
             return QualityState.RECOVERING.value, coverage_payload
         if any(gap.state in {QualityState.GAP_DETECTED.value, QualityState.RECOVERING.value} for gap in gaps):
             return QualityState.GAP_DETECTED.value, coverage_payload
+        if any(gap.state == QualityState.DECLARED_OUTAGE.value for gap in gaps):
+            return QualityState.DECLARED_OUTAGE.value, coverage_payload
         if coverage is not None and coverage.state == QualityState.RECONCILED.value:
             return QualityState.RECONCILED.value, coverage_payload
         if gaps and all(gap.state == QualityState.RECONCILED.value for gap in gaps):
@@ -306,6 +308,7 @@ def _zero_if_covered(value: Decimal | None, event_count: int, quality: str) -> D
         QualityState.UNAVAILABLE.value,
         QualityState.GAP_DETECTED.value,
         QualityState.RECOVERING.value,
+        QualityState.DECLARED_OUTAGE.value,
     }:
         return Decimal(0)
     return None

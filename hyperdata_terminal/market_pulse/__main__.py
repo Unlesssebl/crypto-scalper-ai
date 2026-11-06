@@ -38,6 +38,19 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--to", dest="end", default=None, help="ISO-8601 or epoch ms")
 
     sub.add_parser("status", help="print storage, coverage and open gaps")
+
+    outage = sub.add_parser(
+        "declare-outage",
+        help="close a gap as a declared outage excluded from acceptance",
+    )
+    outage.add_argument("--gap-id", type=int, required=True)
+    outage.add_argument(
+        "--to",
+        dest="end",
+        default=None,
+        help="ISO-8601 or epoch ms; defaults to now",
+    )
+    outage.add_argument("--reason", required=True)
     return parser
 
 
@@ -84,6 +97,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "status":
             print(service.dumps(asyncio.run(service.status())))
+        elif args.command == "declare-outage":
+            now = int(time.time() * 1_000)
+            end = service.parse_boundary(args.end, default_ms=now)
+            print(
+                service.dumps(
+                    asyncio.run(
+                        service.declare_outage(
+                            args.gap_id,
+                            end_ms=end,
+                            reason=args.reason,
+                        )
+                    )
+                )
+            )
         return 0
     except KeyboardInterrupt:
         return 130

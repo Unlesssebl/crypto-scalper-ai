@@ -35,6 +35,17 @@ Recovery is idempotent: replaying an interval that is already ingested returns
 `accepted: 0` and only counts `duplicates`. It does not reconcile a gap whose
 raw archive does not cover both boundaries.
 
+Declare a planned hole (for example a collector redeploy) so it is audited but
+excluded from the acceptance metric:
+
+```bash
+docker compose run --rm ingest declare-outage --gap-id 12 \
+  --to 2026-11-06T10:05:00Z --reason "planned redeploy"
+```
+
+The gap keeps the `declared_outage` state and its windows are never zero-filled
+or counted as recovered.
+
 The API and ingest ports are published on loopback only.  Do not expose them
 directly; put an authenticated proxy in front if remote access is required.
 

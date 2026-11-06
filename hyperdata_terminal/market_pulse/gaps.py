@@ -29,24 +29,17 @@ class GapTracker:
         now_ms: int,
     ) -> ChannelCoverage:
         current = await self._coverage(venue, native_market_id, channel)
-        open_gaps = await self.store.list_gaps(
-            venue=venue,
-            native_market_id=native_market_id,
-            channel=channel,
-            state=QualityState.GAP_DETECTED.value,
-        )
         reason: str | None = None
-        if open_gaps:
-            state = QualityState.RECOVERING.value
-            reason = "subscription acknowledged; interval is not reconciled"
-        elif (
+        if (
             current is not None
             and current.last_receive_ms is not None
             and current.source_epoch != source_epoch
         ):
             # A new epoch means the collector restarted.  A clean stop does not
             # raise a disconnect, but the downtime is still missing data, so the
-            # interval from the last received trade is recorded explicitly.
+            # interval from the last received trade is recorded explicitly.  This
+            # must run even when an older gap is still open, or later reconnects
+            # would silently stop being recorded.
             await self.store.add_gap(
                 Gap(
                     gap_id=0,
@@ -60,8 +53,16 @@ class GapTracker:
                     reason="source epoch changed: collector restarted",
                 )
             )
-            state = QualityState.RECOVERING.value
             reason = "source epoch changed; interval is not reconciled"
+        open_gaps = await self.store.list_gaps(
+            venue=venue,
+            native_market_id=native_market_id,
+            channel=channel,
+            state=QualityState.GAP_DETECTED.value,
+        )
+        if open_gaps:
+            state = QualityState.RECOVERING.value
+            reason = reason or "subscription acknowledged; interval is not reconciled"
         else:
             state = QualityState.OBSERVED_NO_DETECTED_GAP.value
         coverage = ChannelCoverage(
@@ -224,6 +225,62 @@ class GapTracker:
                     heartbeat_ms=current.heartbeat_ms,
                     connected_since_ms=current.connected_since_ms,
                     reason=f"reconciled via {method}",
+                )
+            )
+        return gap
+
+    async def declare_outage(
+        self,
+        gap_id: int,
+        *,
+        end_ms: int,
+        reason: str,
+        now_ms: int,
+    ) -> Gap | None:
+        """Close a known hole as a declared outage, not as recovered data.
+
+        The gap stays in the journal so the missing interval is auditable, and
+        overlapping windows keep the ``declared_outage`` quality instead of
+        being promoted to observed.
+        """
+        gap = await self.store.update_gap(
+            gap_id,
+            end_ms=end_ms,
+            state=QualityState.DECLARED_OUTAGE.value,
+            method="declared_outage",
+            reason=f"declared outage: {reason}",
+        )
+        if gap is None:
+            return None
+        remaining = await self.store.list_gaps(
+            venue=gap.venue,
+            native_market_id=gap.native_market_id,
+            channel=gap.channel,
+            state=QualityState.GAP_DETECTED.value,
+        )
+        current = await self._coverage(gap.venue, gap.native_market_id, gap.channel)
+        if current is not None:
+            await self.store.set_coverage(
+                ChannelCoverage(
+                    venue=gap.venue,
+                    native_market_id=gap.native_market_id,
+                    channel=gap.channel,
+                    source_epoch=current.source_epoch,
+                    state=(
+                        QualityState.RECOVERING.value
+                        if remaining
+                        else QualityState.OBSERVED_NO_DETECTED_GAP.value
+                    ),
+                    updated_at_ms=now_ms,
+                    last_event_ms=current.last_event_ms,
+                    last_receive_ms=current.last_receive_ms,
+                    heartbeat_ms=current.heartbeat_ms,
+                    connected_since_ms=current.connected_since_ms,
+                    reason=(
+                        "other gaps are still unreconciled"
+                        if remaining
+                        else "declared outage excluded from acceptance"
+                    ),
                 )
             )
         return gap

@@ -16,6 +16,7 @@ from .collectors.base import CollectorConfig, StreamCollector
 from .collectors.hyperliquid import HyperliquidCollector, normalize_hyperliquid_trades
 from .collectors.okx import OkxCollector, OkxInstrumentCatalog, normalize_okx_trades
 from .collectors.specs import default_instruments, spec_index
+from .contracts import QualityState
 from .gaps import GapTracker
 from .ingest import GapControlService, IngestionService
 from .ingest_http import run_ingest
@@ -260,7 +261,38 @@ async def status() -> dict[str, Any]:
         health = await store.health()
         coverage = [item.to_payload() for item in await store.list_coverage()]
         gaps = [gap.to_payload() for gap in await store.list_gaps(state="gap_detected", limit=100)]
-        return {"storage": health, "channels": coverage, "open_gaps": gaps}
+        declared = [
+            gap.to_payload()
+            for gap in await store.list_gaps(state=QualityState.DECLARED_OUTAGE.value, limit=100)
+        ]
+        return {
+            "storage": health,
+            "channels": coverage,
+            "open_gaps": gaps,
+            "declared_outages": declared,
+        }
+    finally:
+        await store.close()
+
+
+async def declare_outage(
+    gap_id: int,
+    *,
+    end_ms: int,
+    reason: str,
+) -> dict[str, Any]:
+    store = await PostgresStore.connect(database_url())
+    try:
+        gaps = GapTracker(store)
+        gap = await gaps.declare_outage(
+            gap_id,
+            end_ms=end_ms,
+            reason=reason,
+            now_ms=_now_ms(),
+        )
+        if gap is None:
+            return {"status": "not_found", "gap_id": gap_id}
+        return {"status": "ok", "gap": gap.to_payload()}
     finally:
         await store.close()
 
