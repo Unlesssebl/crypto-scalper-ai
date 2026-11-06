@@ -226,6 +226,22 @@ uv run hyperdata-parity baseline.jsonl candidate.jsonl --report parity-report.js
 
 Details: [docs/crypto-scalper.md](docs/crypto-scalper.md), [docs/native-migration.md](docs/native-migration.md), [docs/operations.md](docs/operations.md).
 
+### Market Pulse (P0–P2)
+
+A separate durable BTC/XRP trade path now exists alongside the live screener:
+two isolated collectors, raw archives, PostgreSQL-backed idempotent ingest,
+UTC-minute windows with late-data revisions, gap/recovery states, and a
+read-only API for future screener integration. See
+[docs/market-pulse.md](docs/market-pulse.md) and the deployment bundle in
+`deploy/market-pulse/`.
+
+```bash
+pip install -e ".[pulse]"
+hyperdata-pulse init-db
+hyperdata-pulse ingest
+hyperdata-pulse collector --venue hyperliquid
+```
+
 ## Development
 
 ```bash

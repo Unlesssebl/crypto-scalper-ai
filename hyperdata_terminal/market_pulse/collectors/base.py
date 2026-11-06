@@ -1,0 +1,323 @@
+"""Shared websocket collector loop.
+
+Collectors own exchange sockets and raw archives only.  They never write the
+normalized journal directly: batches go to the ingest service, which is the
+single writer.  A failed batch leaves the events in a bounded local queue and
+the connection is treated as interrupted until a retry succeeds.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import random
+import time
+import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Protocol, Sequence
+
+import aiohttp
+
+from ..contracts import ExecutionEvent
+from ..raw_archive import RawArchive
+
+LOG = logging.getLogger(__name__)
+
+
+class CollectorUnavailable(RuntimeError):
+    pass
+
+
+class EventSink(Protocol):
+    async def append_batch(self, events: Sequence[ExecutionEvent]) -> dict[str, Any]: ...
+
+    async def report(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def close(self) -> None: ...
+
+
+class GapReporter(Protocol):
+    async def connected(
+        self, venue: str, market: str, channel: str, source_epoch: str, now_ms: int
+    ) -> None: ...
+    async def disconnected(
+        self,
+        venue: str,
+        market: str,
+        channel: str,
+        source_epoch: str,
+        now_ms: int,
+        *,
+        reason: str,
+        last_receive_ms: int | None,
+    ) -> None: ...
+    async def heartbeat(
+        self, venue: str, market: str, channel: str, now_ms: int
+    ) -> None: ...
+    async def unavailable(
+        self, venue: str, market: str, channel: str, source_epoch: str, now_ms: int, *, reason: str
+    ) -> None: ...
+
+
+class NullGapReporter:
+    async def connected(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def disconnected(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def heartbeat(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def unavailable(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorConfig:
+    venue: str
+    markets: tuple[str, ...]
+    raw_dir: str
+    ingest_url: str
+    token: str | None = None
+    base_backoff_ms: int = 500
+    max_backoff_ms: int = 30_000
+    max_consecutive_failures: int = 10
+    batch_size: int = 200
+    flush_interval_ms: int = 1_000
+    ack_timeout_ms: int = 10_000
+    max_raw_bytes: int = 5 * 1024**3
+    raw_max_age_ms: int = 48 * 60 * 60 * 1_000
+    fsync_raw: bool = False
+
+
+class StreamCollector(ABC):
+    venue: str
+    channel: str
+
+    def __init__(
+        self,
+        config: CollectorConfig,
+        archive: RawArchive,
+        sink: EventSink,
+        gaps: GapReporter | None = None,
+    ) -> None:
+        self.config = config
+        self.archive = archive
+        self.sink = sink
+        self.gaps = gaps or NullGapReporter()
+        self._pending: list[ExecutionEvent] = []
+        self._last_flush_ms = 0
+        self._last_receive_ms: int | None = None
+        self._session: aiohttp.ClientSession | None = None
+
+    @property
+    @abstractmethod
+    def url(self) -> str: ...
+
+    @abstractmethod
+    def subscriptions(self) -> list[dict[str, Any]]:
+        """Messages sent immediately after opening the socket."""
+
+    @abstractmethod
+    def is_subscription_ack(self, payload: Any) -> bool: ...
+
+    @abstractmethod
+    def is_error(self, payload: Any) -> bool: ...
+
+    def is_heartbeat_response(self, payload: Any) -> bool:
+        return payload in {"pong", "ping"} or (
+            isinstance(payload, dict) and payload.get("channel") in {"pong", "ping"}
+        )
+
+    @abstractmethod
+    def normalize(
+        self,
+        payload: Any,
+        *,
+        receive_time_ms: int,
+        source_epoch: str,
+        raw_ref: str,
+    ) -> list[ExecutionEvent]: ...
+
+    def heartbeat_payload(self) -> Any:
+        return None
+
+    @property
+    def heartbeat_interval_ms(self) -> int:
+        return 25_000
+
+    async def run(self, stop: asyncio.Event | None = None) -> None:
+        stop = stop or asyncio.Event()
+        failures = 0
+        async with aiohttp.ClientSession() as session:
+            self._session = session
+            try:
+                while not stop.is_set():
+                    epoch = uuid.uuid4().hex
+                    try:
+                        await self._run_connection(session, epoch, stop)
+                        failures = 0
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        failures += 1
+                        now = now_ms()
+                        LOG.warning("%s collector interrupted: %s", self.venue, exc)
+                        await self._report_disconnect(epoch, now, str(exc))
+                        if failures >= self.config.max_consecutive_failures:
+                            for market in self.config.markets:
+                                await self.gaps.unavailable(
+                                    self.venue,
+                                    market,
+                                    self.channel,
+                                    epoch,
+                                    now,
+                                    reason=f"{failures} consecutive failures: {exc}",
+                                )
+                            raise CollectorUnavailable(
+                                f"{self.venue} collector failed {failures} times"
+                            ) from exc
+                        await asyncio.sleep(self._backoff_seconds(failures))
+            finally:
+                try:
+                    await self.flush(force=True)
+                except Exception:
+                    LOG.exception("Could not flush pending %s events at stop", self.venue)
+                self._session = None
+
+    async def _run_connection(
+        self,
+        session: aiohttp.ClientSession,
+        epoch: str,
+        stop: asyncio.Event,
+    ) -> None:
+        ws = await session.ws_connect(self.url, heartbeat=None, max_msg_size=8 * 1024**2)
+        try:
+            for subscription in self.subscriptions():
+                await ws.send_json(subscription)
+            await self._wait_for_subscription(ws, epoch)
+            await self._report_connected(epoch)
+            while not stop.is_set():
+                try:
+                    message = await ws.receive(timeout=self.heartbeat_interval_ms / 1_000)
+                except asyncio.TimeoutError:
+                    await self._send_heartbeat(ws)
+                    await self._report_heartbeat(now_ms())
+                    continue
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    await self._handle_payload(message.data, epoch)
+                elif message.type == aiohttp.WSMsgType.BINARY:
+                    await self._handle_payload(message.data.decode("utf-8"), epoch)
+                elif message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    raise ConnectionError(f"{self.venue} websocket closed")
+            return
+        finally:
+            await ws.close()
+
+    async def _wait_for_subscription(self, ws: aiohttp.ClientWebSocketResponse, epoch: str) -> None:
+        deadline = time.monotonic() + self.config.ack_timeout_ms / 1_000
+        while time.monotonic() < deadline:
+            try:
+                message = await ws.receive(timeout=max(0.1, deadline - time.monotonic()))
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"{self.venue} subscription was not acknowledged") from exc
+            if message.type != aiohttp.WSMsgType.TEXT:
+                continue
+            payload = json.loads(message.data)
+            if self.is_error(payload):
+                raise ConnectionError(f"{self.venue} subscription rejected: {payload}")
+            if self.is_subscription_ack(payload):
+                return
+            # Some feeds start with data before an explicit acknowledgement.
+            await self._handle_payload(message.data, epoch)
+            if self._pending:
+                return
+        raise TimeoutError(f"{self.venue} subscription was not acknowledged")
+
+    async def _handle_payload(self, raw_text: str, epoch: str) -> None:
+        received = now_ms()
+        if raw_text.strip() in {"pong", "ping"}:
+            await self._report_heartbeat(received)
+            return
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ConnectionError(f"{self.venue} sent invalid JSON") from exc
+        if self.is_error(payload):
+            raise ConnectionError(f"{self.venue} error message: {payload}")
+        if self.is_heartbeat_response(payload):
+            await self._report_heartbeat(received)
+            return
+        reference = self.archive.append(payload, receive_time_ms=received, source_epoch=epoch)
+        self._last_receive_ms = received
+        events = self.normalize(
+            payload,
+            receive_time_ms=received,
+            source_epoch=epoch,
+            raw_ref=str(reference),
+        )
+        if events:
+            self._pending.extend(events)
+        await self._report_heartbeat(received)
+        if len(self._pending) >= self.config.batch_size:
+            await self.flush(force=True)
+        elif received - self._last_flush_ms >= self.config.flush_interval_ms:
+            await self.flush()
+
+    async def flush(self, *, force: bool = False) -> None:
+        if not self._pending:
+            self._last_flush_ms = now_ms()
+            return
+        if not force and now_ms() - self._last_flush_ms < self.config.flush_interval_ms:
+            return
+        batch = self._pending[: self.config.batch_size]
+        await self.sink.append_batch(batch)
+        del self._pending[: len(batch)]
+        self._last_flush_ms = now_ms()
+
+    async def _send_heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        payload = self.heartbeat_payload()
+        if payload is None:
+            return
+        if isinstance(payload, str):
+            await ws.send_str(payload)
+        else:
+            await ws.send_json(payload)
+
+    async def _report_disconnect(self, epoch: str, now: int, reason: str) -> None:
+        for market in self.config.markets:
+            try:
+                await self.gaps.disconnected(
+                    self.venue,
+                    market,
+                    self.channel,
+                    epoch,
+                    now,
+                    reason=reason,
+                    last_receive_ms=self._last_receive_ms,
+                )
+            except Exception:
+                LOG.exception("Could not record %s/%s disconnect", self.venue, market)
+
+    async def _report_connected(self, epoch: str) -> None:
+        for market in self.config.markets:
+            await self.gaps.connected(self.venue, market, self.channel, epoch, now_ms())
+
+    async def _report_heartbeat(self, now: int) -> None:
+        for market in self.config.markets:
+            await self.gaps.heartbeat(self.venue, market, self.channel, now)
+
+    def _backoff_seconds(self, failure: int) -> float:
+        base = min(self.config.max_backoff_ms, self.config.base_backoff_ms * 2 ** (failure - 1))
+        jitter = random.uniform(0, base * 0.25)
+        return (base + jitter) / 1_000
+
+
+def now_ms() -> int:
+    return int(time.time() * 1_000)

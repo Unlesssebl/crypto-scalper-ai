@@ -47,6 +47,8 @@ dependencies = [
 [project.optional-dependencies]
 # `hyperdata mcp`: serve the live data to AI agents over the Model Context Protocol.
 mcp = ["mcp>=2.2,<3"]
+# `hyperdata-pulse`: durable market-pulse ingest/API in PostgreSQL.
+pulse = ["asyncpg>=0.29,<1"]
 
 [dependency-groups]
 # `uv run pytest` / `uv run ruff` work in any checkout without a manual install.
@@ -60,6 +62,8 @@ Issues = "https://github.com/Co-Messi/HyperData-Terminal/issues"
 [project.scripts]
 hyperdata = "hyperdata_terminal.cli:main"
 hyperdata-screener = "apps.screener_web.__main__:main"
+# Durable BTC/XRP market-pulse collector, ingest and read-only API.
+hyperdata-pulse = "hyperdata_terminal.market_pulse.__main__:main"
 # Regression/diagnostic tool: compare two JSONL screener recordings.
 hyperdata-parity = "extensions.scalper.parity:main"
 # Same command under the distribution name, so `uvx hyperdata-terminal` works.

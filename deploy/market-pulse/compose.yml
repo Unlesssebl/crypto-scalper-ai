@@ -1,0 +1,115 @@
+name: market-pulse
+
+x-pulse: &pulse
+  build:
+    context: ../..
+    dockerfile: deploy/market-pulse/Dockerfile
+  image: market-pulse:local
+  restart: unless-stopped
+  env_file: .env
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: marketpulse
+      POSTGRES_USER: marketpulse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketpulse}
+    volumes:
+      - pulse-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketpulse -d marketpulse"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ingest:
+    <<: *pulse
+    command: ["ingest"]
+    environment:
+      PULSE_DATABASE_URL: postgresql://marketpulse:${POSTGRES_PASSWORD:-marketpulse}@postgres:5432/marketpulse
+      PULSE_HOST: 0.0.0.0
+      PULSE_INGEST_PORT: "8430"
+      PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
+      PULSE_RAW_DIR: /raw
+      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+    ports:
+      - "127.0.0.1:8430:8430"
+    volumes:
+      - pulse-raw-hl:/raw/hyperliquid
+      - pulse-raw-okx:/raw/okx
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8430/ingest/v1/health', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *pulse
+    command: ["api"]
+    environment:
+      PULSE_DATABASE_URL: postgresql://marketpulse:${POSTGRES_PASSWORD:-marketpulse}@postgres:5432/marketpulse
+      PULSE_HOST: 0.0.0.0
+      PULSE_API_PORT: "8431"
+    ports:
+      - "127.0.0.1:8431:8431"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  collector-hyperliquid:
+    <<: *pulse
+    command:
+      [
+        "collector",
+        "--venue",
+        "hyperliquid",
+        "--markets",
+        "${PULSE_MARKETS:-BTC,XRP}",
+      ]
+    environment:
+      PULSE_INGEST_URL: http://ingest:8430
+      PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
+      PULSE_RAW_DIR: /raw
+      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+    volumes:
+      - pulse-raw-hl:/raw/hyperliquid
+    depends_on:
+      ingest:
+        condition: service_healthy
+
+  collector-okx:
+    <<: *pulse
+    command:
+      [
+        "collector",
+        "--venue",
+        "okx",
+        "--markets",
+        "${PULSE_MARKETS:-BTC,XRP}",
+      ]
+    environment:
+      PULSE_INGEST_URL: http://ingest:8430
+      PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
+      PULSE_RAW_DIR: /raw
+      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+    volumes:
+      - pulse-raw-okx:/raw/okx
+    depends_on:
+      ingest:
+        condition: service_healthy
+
+volumes:
+  pulse-db:
+  pulse-raw-hl:
+  pulse-raw-okx:
