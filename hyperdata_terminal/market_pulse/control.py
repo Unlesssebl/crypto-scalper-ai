@@ -1,6 +1,8 @@
 """Versioned attention plans; no symbol is silently assumed to be observed."""
+
 from __future__ import annotations
 
+import math
 import re
 
 VERSION = "attention.v1"
@@ -11,16 +13,43 @@ def validate_plan(payload, now_ms):
         raise ValueError("unsupported attention schema")
     for field, maximum in (("selected", 20), ("detail", 8), ("controls", 2)):
         items = payload.get(field)
-        if (not isinstance(items, list) or len(items) > maximum
-                or any(not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", s) for s in items)
-                or len(set(items)) != len(items)):
+        if (
+            not isinstance(items, list)
+            or len(items) > maximum
+            or any(not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", s) for s in items)
+            or len(set(items)) != len(items)
+        ):
             raise ValueError("invalid attention " + field)
     if not set(payload["detail"]) <= set(payload["selected"]):
         raise ValueError("detail must belong to selected")
     start, end = payload.get("generated_at_ms"), payload.get("expires_at_ms")
-    if (type(start) is not int or type(end) is not int or start > now_ms + 5000
-            or not now_ms < end <= now_ms + 600_000 or end <= start):
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or start > now_ms + 5000
+        or not now_ms < end <= now_ms + 600_000
+        or end <= start
+    ):
         raise ValueError("invalid or expired attention lease")
+    if payload.get("policy_version") == 4:
+        active = payload.get("active")
+        if (
+            not isinstance(active, list)
+            or any(not isinstance(r, dict) for r in active)
+            or {r.get("symbol") for r in active} != set(payload["detail"])
+            or len(active) != len(payload["detail"])
+        ):
+            raise ValueError("active assignments must match detail")
+        for row in active:
+            stamp = row.get("assigned_at")
+            if (
+                type(stamp) not in (int, float)
+                or not math.isfinite(stamp)
+                or stamp < 0
+                or stamp > now_ms / 1000 + 5
+                or row.get("state") not in {"probe", "focus", "cooling"}
+            ):
+                raise ValueError("invalid active assignment")
     return payload
 
 

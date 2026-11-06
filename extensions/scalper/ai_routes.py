@@ -22,6 +22,7 @@ class AIRoutes:
             proxy=getattr(paid, "proxy", None),
         )
         self.free.timeout_seconds = 20
+        self.free.disable_reasoning = True
         self.catalog_until, self.free_available, self.catalog_error = 0, False, None
         self.db.executescript("""CREATE TABLE IF NOT EXISTS ai_route_requests(
             job_id TEXT PRIMARY KEY,episode_id TEXT NOT NULL,route TEXT NOT NULL,at REAL NOT NULL,
@@ -120,7 +121,7 @@ class AIRoutes:
             self.db.execute(
                 "UPDATE ai_route_requests SET status=?,review_id=? WHERE job_id=?", (status, review_id, job)
             )
-            if status == "http_429" and row:
+            if status in {"http_429", "billing_mismatch"} and row:
                 delay = retry_after if type(retry_after) in (int, float) and math.isfinite(retry_after) else 3600
                 self.db.execute(
                     "INSERT OR REPLACE INTO ai_route_blocks VALUES(?,?)", (row[0], time.time() + max(1, delay))

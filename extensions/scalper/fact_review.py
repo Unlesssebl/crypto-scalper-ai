@@ -297,6 +297,8 @@ class FactReviewer:
         if analyst.provider == "openrouter":
             request["messages"][0]["content"] = PROMPT
             request["max_tokens"] = 2200
+            if getattr(analyst, "disable_reasoning", False):
+                request["reasoning"] = {"enabled": False}
             request["response_format"]["json_schema"]["name"] = "fact_review"
         else:
             request["systemInstruction"] = {"parts": [{"text": PROMPT}]}

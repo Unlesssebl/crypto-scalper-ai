@@ -74,7 +74,7 @@ class MarketData:
         observed_fields: dict[str, set[str]] = {}
         for asset_meta, ctx in zip(universe, asset_ctxs):
             symbol = asset_meta.get("name", "")
-            if not symbol:
+            if not symbol or asset_meta.get("isDelisted"):
                 continue
 
             try:

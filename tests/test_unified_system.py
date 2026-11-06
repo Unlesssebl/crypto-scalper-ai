@@ -23,7 +23,8 @@ from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
 
 
 @pytest.fixture
-def journal(tmp_path):
+def journal(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCALPER_CONTEXT_AUTO", "true")
     j = Journal(tmp_path / "journal.sqlite")
     yield j
     j.close()
@@ -408,3 +409,46 @@ async def test_one_plan_updates_native_l2_and_flow_cursor_skips_duplicates(tmp_p
     await observation.close()
     await engine.stop()
     assert replay(observation.archive.path)["verified"]
+
+
+@pytest.mark.asyncio
+async def test_free_transport_disables_reasoning_to_preserve_json_budget(journal):
+    from unittest.mock import MagicMock
+
+    from extensions.scalper.fact_review import FactReviewer
+
+    response = SimpleNamespace(
+        status=200,
+        json=AsyncMock(
+            return_value=dict(
+                choices=[dict(finish_reason="stop", message=dict(content="{}"))], model="free", usage=dict(cost=0)
+            )
+        ),
+    )
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=None)
+    client = paid()
+    client.session = SimpleNamespace(post=MagicMock(return_value=context))
+    routes = AIRoutes(journal, client)
+    routes.free.key = "test"
+    a = attention(time.time())
+    packet = build_packet(a, a["active"][0], time.time())
+    assert (await FactReviewer(routes.free).review(packet))["status"] == "ok"
+    body = client.session.post.call_args.kwargs["json"]
+    assert body["reasoning"] == {"enabled": False}
+    assert body["model"] == "nvidia/nemotron-3.5-super-vl:free"
+
+
+@pytest.mark.asyncio
+async def test_delisted_markets_are_excluded_without_a_volume_floor(monkeypatch):
+    from hyperdata_terminal.data_layer.market_data import MarketData
+
+    engine = MarketData()
+    response = [
+        dict(universe=[dict(name="OLD", isDelisted=True), dict(name="SMALL")]),
+        [dict(markPx="1", dayNtlVlm="0"), dict(markPx="1", dayNtlVlm="0")],
+    ]
+    monkeypatch.setattr(engine, "_post", AsyncMock(return_value=response))
+    await engine.refresh()
+    assert set(engine.assets) == {"SMALL"}

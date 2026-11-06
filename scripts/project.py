@@ -118,7 +118,10 @@ def worker(args, forwarded):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.wfile.write(encoded)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass
 
         def do_GET(self):
             if self.path != "/status":
