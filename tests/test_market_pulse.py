@@ -591,6 +591,103 @@ async def test_auto_recovery_only_after_reconnect_and_raw_coverage(tmp_path):
     assert (await store.list_gaps())[0].state == QualityState.RECONCILED.value
 
 
+async def test_acceptance_report_counts_only_closed_usable_minutes():
+    from hyperdata_terminal.market_pulse.acceptance import (
+        build_acceptance_report,
+        render_markdown,
+    )
+
+    store, gaps, windows, ingest = await make_services()
+    # Observed minutes 0 and 2; minute 1 is quiet inside the observed span;
+    # minutes 3 and 4 are outside the observed span.
+    await ingest.append_batch(
+        [event(trade_id="t0", event_time_ms=MINUTE + 1_000)], now_ms=MINUTE + 2_000
+    )
+    await ingest.close_due(now_ms=MINUTE + 60_000 + 6_000)
+    await ingest.append_batch(
+        [event(trade_id="t2", event_time_ms=MINUTE + 2 * 60_000 + 1_000)],
+        now_ms=MINUTE + 2 * 60_000 + 2_000,
+    )
+
+    # Minute 2 is lost and declared.
+    gap = await store.add_gap(
+        Gap(
+            gap_id=0,
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            start_ms=MINUTE + 2 * 60_000,
+            end_ms=None,
+            detected_at_ms=MINUTE + 2 * 60_000,
+            state=QualityState.GAP_DETECTED.value,
+            reason="test",
+        )
+    )
+    await gaps.declare_outage(
+        gap.gap_id,
+        end_ms=MINUTE + 3 * 60_000,
+        reason="planned",
+        now_ms=MINUTE + 10 * 60_000,
+    )
+    await windows.rebuild(
+        "hyperliquid",
+        "BTC",
+        "trades",
+        "execution",
+        MINUTE + 2 * 60_000,
+        now_ms=MINUTE + 10 * 60_000,
+    )
+
+    report = await build_acceptance_report(
+        store,
+        start_ms=MINUTE,
+        end_ms=MINUTE + 5 * 60_000,
+        required_pct=99.0,
+    )
+    row = report["channels"][0]
+    assert row["effective_minutes"] == 3
+    assert row["outside_coverage_minutes"] == 2
+    assert row["closed_windows"] == 2
+    assert row["declared_outage_windows"] == 1
+    assert row["usable_windows"] == 2  # 1 observed + 1 quiet minute
+    assert row["quiet_minutes"] == 1
+    assert row["missing_windows"] == 0
+    # Declared minutes are excluded from the denominator.
+    assert row["usable_pct"] == 100.0
+    assert row["gap_states"] == {"declared_outage": 1}
+    assert row["passed"] is True
+
+    # If the channel cannot vouch for the quiet minute, it is a real loss.
+    await store.set_coverage(
+        ChannelCoverage(
+            venue="hyperliquid",
+            native_market_id="BTC",
+            channel="trades",
+            source_epoch="e1",
+            state=QualityState.UNAVAILABLE.value,
+            updated_at_ms=MINUTE + 9 * 60_000,
+            reason="collector down",
+        )
+    )
+    degraded = await build_acceptance_report(
+        store,
+        start_ms=MINUTE,
+        end_ms=MINUTE + 5 * 60_000,
+        required_pct=99.0,
+    )
+    row = degraded["channels"][0]
+    assert row["missing_windows"] == 1
+    assert row["quiet_minutes"] == 0
+    assert row["usable_pct"] < 99.0
+    assert row["passed"] is False
+    assert degraded["passed"] is False
+
+    rendered = render_markdown(degraded)
+    assert "Market Pulse P3 acceptance" in rendered
+    assert "hyperliquid" in rendered
+
+
 async def test_read_only_api_cursor_and_versions():
     store, _gaps, _windows, ingest = await make_services()
     await ingest.append_batch([event(), event(trade_id="t2", event_time_ms=MINUTE + 2_000)], now_ms=MINUTE + 2_000)

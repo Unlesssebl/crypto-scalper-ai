@@ -46,6 +46,18 @@ docker compose run --rm ingest declare-outage --gap-id 12 \
 The gap keeps the `declared_outage` state and its windows are never zero-filled
 or counted as recovered.
 
+Acceptance report for a 24-hour run:
+
+```bash
+docker compose run --rm ingest acceptance \
+  --from 2026-11-06T10:00:00Z --to 2026-11-07T10:00:00Z \
+  --required-pct 99 --format markdown
+```
+
+Only closed windows count. Minutes before the channel's first observed window
+are reported as `outside`, quiet minutes are not treated as losses, and any
+minute the channel cannot vouch for fails the run.
+
 The API and ingest ports are published on loopback only.  Do not expose them
 directly; put an authenticated proxy in front if remote access is required.
 

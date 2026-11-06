@@ -51,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO-8601 or epoch ms; defaults to now",
     )
     outage.add_argument("--reason", required=True)
+
+    accept = sub.add_parser(
+        "acceptance",
+        help="build a P3 acceptance report from closed minute windows",
+    )
+    accept.add_argument("--from", dest="start", default=None, help="ISO-8601 or epoch ms")
+    accept.add_argument("--to", dest="end", default=None, help="ISO-8601 or epoch ms")
+    accept.add_argument("--required-pct", type=float, default=99.0)
+    accept.add_argument("--format", choices=("json", "markdown"), default="json")
     return parser
 
 
@@ -108,6 +117,22 @@ def main(argv: list[str] | None = None) -> int:
                             end_ms=end,
                             reason=args.reason,
                         )
+                    )
+                )
+            )
+        elif args.command == "acceptance":
+            now = int(time.time() * 1_000)
+            start = service.parse_boundary(args.start, default_ms=now - 24 * 60 * 60 * 1_000)
+            end = service.parse_boundary(args.end, default_ms=now)
+            if end <= start:
+                parser.error("--to must be after --from")
+            print(
+                asyncio.run(
+                    service.acceptance(
+                        start_ms=start,
+                        end_ms=end,
+                        required_pct=args.required_pct,
+                        report_format=args.format,
                     )
                 )
             )

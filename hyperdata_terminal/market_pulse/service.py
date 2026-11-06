@@ -11,12 +11,13 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..paths import DATA_DIR
+from .acceptance import build_acceptance_report, render_markdown
 from .api import run_api
 from .collectors.base import CollectorConfig, StreamCollector
 from .collectors.hyperliquid import HyperliquidCollector, normalize_hyperliquid_trades
 from .collectors.okx import OkxCollector, OkxInstrumentCatalog, normalize_okx_trades
 from .collectors.specs import default_instruments, spec_index
-from .contracts import QualityState
+from .contracts import WINDOW_MS, QualityState, known_channel
 from .gaps import GapTracker
 from .ingest import GapControlService, IngestionService
 from .ingest_http import run_ingest
@@ -284,15 +285,51 @@ async def declare_outage(
     store = await PostgresStore.connect(database_url())
     try:
         gaps = GapTracker(store)
+        now_ms = _now_ms()
         gap = await gaps.declare_outage(
             gap_id,
             end_ms=end_ms,
             reason=reason,
-            now_ms=_now_ms(),
+            now_ms=now_ms,
         )
         if gap is None:
             return {"status": "not_found", "gap_id": gap_id}
+        # Recompute the affected minutes so they immediately show the declared
+        # state instead of a stale ``recovering`` value.
+        windows = WindowService(store)
+        kind = known_channel(gap.venue, gap.channel).value
+        first = gap.start_ms // WINDOW_MS * WINDOW_MS
+        last = max(first, (min(end_ms, now_ms) - 1) // WINDOW_MS * WINDOW_MS)
+        for window_start in range(first, last + WINDOW_MS, WINDOW_MS):
+            await windows.rebuild(
+                gap.venue,
+                gap.native_market_id,
+                gap.channel,
+                kind,
+                window_start,
+                now_ms=now_ms,
+            )
         return {"status": "ok", "gap": gap.to_payload()}
+    finally:
+        await store.close()
+
+
+async def acceptance(
+    *,
+    start_ms: int,
+    end_ms: int,
+    required_pct: float = 99.0,
+    report_format: str = "json",
+) -> str:
+    store = await PostgresStore.connect(database_url())
+    try:
+        report = await build_acceptance_report(
+            store,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            required_pct=required_pct,
+        )
+        return render_markdown(report) if report_format == "markdown" else dumps(report)
     finally:
         await store.close()
 
