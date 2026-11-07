@@ -97,6 +97,7 @@ class UnifiedAttention:
             warming=sum(r["state"] == "warming" for r in self.engine.scouts.values()),
             slots=self.slots,
             detail_slots=self.engine.policy.slots,
+            decision_archive=self.archive.report() if self.archive else None,
             policy_version=4,
             hold_seconds=600,
             active=list(self.engine.active.values()),

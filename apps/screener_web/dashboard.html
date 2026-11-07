@@ -668,7 +668,7 @@ function renderConsistency(context) {
   node("summary", "Причины отбора и пропуска за 24 часа", selections);
   for (const decision of automatic.decisions ?? []) node("p", selectionReason(decision.reason) +
     " · " + decision.status + " · ситуаций " + decision.episodes + " · проверок " + decision.checks, selections);
-  for (const item of context.packets ?? []) {
+  for (const item of [...(context.packets ?? []), ...(context.meta ? [{packet:context.meta.packet,latest:context.meta.review,is_meta:true}] : [])]) {
     const packet = item.packet, card = node("div", null, root);
     card.className = "stat";
     node("h3", packet.symbol, card);
@@ -682,7 +682,7 @@ function renderConsistency(context) {
       node("p", factLabel(fact.id) + ": " + (fact.quality === "ok" ? fact.value : "неизвестно или устарело"), details);
     }
     const button = node("button", pendingReviews.has(packet.symbol) ? "Проверяется…" : "Разобрать факты с AI", card);
-    button.disabled = !context.configured || pendingReviews.has(packet.symbol);
+    button.disabled = item.is_meta || !context.configured || pendingReviews.has(packet.symbol);
     const status = node("p", "", card);
     status.setAttribute("role", "status");
     button.onclick = async () => {
@@ -701,6 +701,8 @@ function renderConsistency(context) {
     };
     if (item.latest) {
       const review = item.latest;
+      node("p", "Маршрут: " + ({free:"бесплатный", strong:"платный эпизод", meta:"платный метаобзор"}[review.route] ?? "прежний") +
+        " · " + review.model + " · стоимость: " + (review.usage?.cost ?? "не сообщена"), card);
       node("p", "Последняя попытка: " + stamp(review.at) + " · " + reviewStatus(review.status), card);
       node("p", "Измерения разбора: " + stamp(review.packet_at), card);
       if (review.packet_id !== packet.packet_id) node("p", "Разбор относится к ранее зафиксированным измерениям.", card);

@@ -11,6 +11,7 @@ from .fact_packet import canonical, checksum, verify_packet
 
 STATUSES = ("supported", "contradicted", "unverifiable", "hypothesis")
 VALIDATOR_VERSION = "context-checks-v2"
+META_VALIDATOR_VERSION = "context-meta-checks-v1"
 LABELS = {
     "supported": "Подтверждено измерениями",
     "contradicted": "Противоречит измерениям",
@@ -240,9 +241,16 @@ def validate_review(raw, packet, now):
             enough = enough and any(
                 r.endswith(".flow_price_conflict") and facts[r]["value"] is True for r in refs if r in facts
             )
-        elif item["kind"] in {"possible_replenishment", "context_link"}:
-            # Current packets cannot establish execution at a zone or relations between instruments.
-            enough = False
+        elif item["kind"] == "context_link":
+            symbols = {r.split(":", 1)[0] for r in refs if ":" in r}
+            enough = (
+                enough
+                and packet.get("scope") == "market_meta"
+                and len(symbols) >= 2
+                and len(packet.get("input_packets", [])) >= 2
+            )
+        elif item["kind"] == "possible_replenishment":
+            enough = False  # Top-N L2 still cannot establish execution at a specific zone.
         emit(
             item,
             "interpretation",
@@ -269,7 +277,7 @@ def validate_review(raw, packet, now):
     referenced = {r for c in claims for r in c["references"] if r in facts}
     groups = sorted({facts[r]["source"] for r in referenced})
     return dict(
-        validator_version=VALIDATOR_VERSION,
+        validator_version=META_VALIDATOR_VERSION if packet.get("scope") == "market_meta" else VALIDATOR_VERSION,
         packet_id=packet["packet_id"],
         claims=claims,
         abstention=reply["abstention"],

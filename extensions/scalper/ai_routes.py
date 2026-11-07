@@ -71,6 +71,8 @@ class AIRoutes:
     def reserve(self, packet, route, state, now, limit=40):
         from .context_auto import fingerprint
 
+        limit = min(40, limit)
+
         signature = hashlib.sha256(
             canonical(
                 dict(

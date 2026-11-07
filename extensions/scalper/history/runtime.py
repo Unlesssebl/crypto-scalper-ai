@@ -26,7 +26,9 @@ class Observation:
         self.hub = hub
         self.attention = Attention(policy)
         self.facts = Facts(version=2)
-        self.archive = Archive(root or history_dir())
+        total = int(os.getenv("HYPERDATA_HISTORY_MAX_BYTES", str(5 * 1024**3)))
+        reserve = min(256 * 1024**2, total // 20)
+        self.archive = Archive(root or history_dir(), quota_bytes=total - reserve)
         self.last_scout = None
         self.subscription_error = None
         self.closed = False

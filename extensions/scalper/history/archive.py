@@ -1,4 +1,5 @@
 """Bounded off-loop raw writer with explicit failure and verifiable segments."""
+
 import gzip
 import hashlib
 import json
@@ -13,8 +14,9 @@ from pathlib import Path
 
 
 class Archive:
-    def __init__(self, root, *, queue_size=8192, segment_records=10000):
+    def __init__(self, root, *, queue_size=8192, segment_records=10000, quota_bytes=None):
         self.root = Path(root)
+        self.quota_bytes = quota_bytes
         self._space_check = 0
         self.path = Path(root) / (time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:12])
         self.path.mkdir(parents=True, exist_ok=False)
@@ -32,10 +34,14 @@ class Archive:
         self._thread.start()
 
     def check_space(self, now):
-        if now-self._space_check < 5:
+        if now - self._space_check < 5:
             return
         self._space_check = now
-        budget = int(os.getenv("HYPERDATA_HISTORY_MAX_BYTES", str(5*1024**3)))
+        budget = (
+            self.quota_bytes
+            if self.quota_bytes is not None
+            else int(os.getenv("HYPERDATA_HISTORY_MAX_BYTES", str(5 * 1024**3)))
+        )
         runs = []
         total = 0
         for folder in self.root.iterdir():
@@ -49,27 +55,35 @@ class Archive:
                 except FileNotFoundError:
                     pass
             total += size
-            manifest = folder/"manifest.json"
+            manifest = folder / "manifest.json"
             if folder != self.path and manifest.exists() and not any(folder.rglob("*.pin")):
                 runs.append((manifest.stat().st_mtime, folder, size))
         for at, folder, size in sorted(runs):
-            if total <= budget and now-at <= 48*3600:
+            if total <= budget and now - at <= 48 * 3600:
                 continue
             target = folder.resolve()
             if target.parent != self.root.resolve():
                 raise ValueError("archive retention path escaped")
             # Only complete closed runs are eligible; interrupted/pinned evidence stays protected.
-            if json.loads((target/"manifest.json").read_text(encoding="utf-8")).get("complete"):
+            if json.loads((target / "manifest.json").read_text(encoding="utf-8")).get("complete"):
                 shutil.rmtree(target)
                 total -= size
-        if total > budget or shutil.disk_usage(self.root).free < 512*1024**2:
+        if total > budget or shutil.disk_usage(self.root).free < 512 * 1024**2:
             self.error = "storage_budget_exhausted"
 
     def record(self, kind, payload, now, *, epoch="", monotonic_ns=None):
         self.check_space(time.time())
         self.sequence += 1
-        envelope = dict(schema_version=1, run=self.path.name, sequence=self.sequence,
-                        received_at=now, monotonic_ns=monotonic_ns, epoch=epoch, kind=kind, payload=payload)
+        envelope = dict(
+            schema_version=1,
+            run=self.path.name,
+            sequence=self.sequence,
+            received_at=now,
+            monotonic_ns=monotonic_ns,
+            epoch=epoch,
+            kind=kind,
+            payload=payload,
+        )
         if self.closed or self.error:
             self.dropped += 1
             return None
@@ -108,15 +122,18 @@ class Archive:
                 os.fsync(destination.fileno())
             compressed.rename(target)
             name.unlink()
-            self.segments.append(dict(file=target.name, records=count,
-                                      sha256=hashlib.sha256(target.read_bytes()).hexdigest()))
+            self.segments.append(
+                dict(file=target.name, records=count, sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+            )
             self.last_flush_at = time.time()
             count = 0
 
         try:
             db = sqlite3.connect(self.path / "index.sqlite")
-            db.execute("CREATE TABLE events(sequence INTEGER PRIMARY KEY, at REAL NOT NULL, "
-                       "kind TEXT NOT NULL, payload TEXT NOT NULL)")
+            db.execute(
+                "CREATE TABLE events(sequence INTEGER PRIMARY KEY, at REAL NOT NULL, "
+                "kind TEXT NOT NULL, payload TEXT NOT NULL)"
+            )
             db.execute("CREATE INDEX events_kind_at ON events(kind, at)")
             while not self._stop.is_set() or not self.queue.empty():
                 try:
@@ -131,9 +148,15 @@ class Archive:
                         opened_at = time.monotonic()
                     handle.write(line)
                     if index is not None:
-                        db.execute("INSERT INTO events VALUES(?,?,?,?)",
-                                   (index["sequence"], index["received_at"], index["kind"],
-                                    json.dumps(index["payload"], allow_nan=False)))
+                        db.execute(
+                            "INSERT INTO events VALUES(?,?,?,?)",
+                            (
+                                index["sequence"],
+                                index["received_at"],
+                                index["kind"],
+                                json.dumps(index["payload"], allow_nan=False),
+                            ),
+                        )
                     count += 1
                     self.written += 1
                 if handle is not None and (count >= self.segment_records or time.monotonic() - opened_at >= 3600):
@@ -155,10 +178,17 @@ class Archive:
                 db.close()
 
     def report(self):
-        return dict(run=self.path.name, accepted=self.sequence - self.dropped, written=self.written,
-                    dropped=self.dropped, backlog=self.queue.qsize(), error=self.error,
-                    last_flush_at=self.last_flush_at, closed=self.closed,
-                    complete=self.closed and not self.error and self.written == self.sequence)
+        return dict(
+            run=self.path.name,
+            accepted=self.sequence - self.dropped,
+            written=self.written,
+            dropped=self.dropped,
+            backlog=self.queue.qsize(),
+            error=self.error,
+            last_flush_at=self.last_flush_at,
+            closed=self.closed,
+            complete=self.closed and not self.error and self.written == self.sequence,
+        )
 
     def close(self):
         if self.closed:
@@ -182,8 +212,11 @@ def read_archive(path, *, allow_incomplete=False):
     """Strict replay rejects incomplete runs, tampered segments and missing records."""
     path = Path(path)
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    if (manifest.get("schema_version") != 1 or not manifest.get("complete")
-            and not (allow_incomplete and manifest.get("recovered"))):
+    if (
+        manifest.get("schema_version") != 1
+        or not manifest.get("complete")
+        and not (allow_incomplete and manifest.get("recovered"))
+    ):
         raise ValueError("Archive is incomplete; research replay refused")
     sequence = 0
     for segment in manifest["segments"]:

@@ -3,7 +3,7 @@
 import json
 import time
 
-from .context_auto import decide, fingerprint
+from .context_auto import decide, enrich, fingerprint
 from .fact_packet import PACKET_VERSION, RULESET, checksum, packet_ready
 from .fact_review import FactReviewer, validate_review
 
@@ -28,12 +28,34 @@ async def run_meta(service):
         if priority is not None:
             state["_reason"] = reason
             changed[packet["episode_id"]] = state
-        packets.append(packet)
+        history = memory["samples"][-2:]
+        if prior:
+            prior_state = json.loads(prior[0])
+            if prior_state.get("at") is not None and 0 < now - prior_state["at"] <= 900:
+                history = [prior_state, *history]
+        packets.append(enrich(packet, history, reason))
     if len(changed) < 2:
         return None
     facts = []
     for packet in sorted(packets, key=lambda p: p["symbol"]):
-        eligible = [f for f in packet["facts"] if f["quality"] == "ok" and f["role"] != "history"][:24]
+        priority_ids = (
+            "frame.1m.ofi",
+            "frame.1m.trade_count",
+            "frame.1m.observed_price_change_bps",
+            "frame.1m.flow_price_conflict",
+            "frame.5m.ofi",
+            "frame.5m.trade_count",
+            "tape.observed_trade_imbalance",
+            "tape.observed_trade_count_60s",
+            "activity.relative_score",
+            "book.midpoint",
+            "book.spread_bps",
+        )
+        eligible = sorted(
+            (f for f in packet["facts"] if f["quality"] == "ok" and f["role"] != "history"),
+            key=lambda f: priority_ids.index(f["id"]) if f["id"] in priority_ids else 100,
+        )[:16]
+        eligible += [f for f in packet["facts"] if f["role"] == "history"][-9:]
         for fact in eligible:
             item = dict(fact, id=packet["symbol"] + ":" + fact["id"])
             if item["unit"] in ("price", "base_units"):
@@ -44,6 +66,7 @@ async def run_meta(service):
         ruleset=RULESET,
         episode_id="market.meta.v1",
         symbol="MARKET",
+        scope="market_meta",
         captured_at=now,
         facts=facts,
         coverage=dict(observation_healthy=True, book_status="observing"),
@@ -63,6 +86,8 @@ async def run_meta(service):
     job, reason = routes.reserve(packet, "meta", state, now, service.policy.hourly_limit)
     if reason:
         return None
+    for source_packet in packets:
+        service.consistency.save_packet(source_packet)
     key = service.consistency.begin(
         packet,
         now,

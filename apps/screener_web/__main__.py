@@ -288,7 +288,10 @@ async def run(args: argparse.Namespace) -> None:
                 from extensions.scalper.history.archive import Archive
                 from extensions.scalper.history.runtime import history_dir
 
-                service.attention.archive = Archive(history_dir().parent / "attention-decisions")
+                total = int(os.getenv("HYPERDATA_HISTORY_MAX_BYTES", str(5 * 1024**3)))
+                service.attention.archive = Archive(
+                    history_dir().parent / "attention-decisions", quota_bytes=min(256 * 1024**2, total // 20)
+                )
                 service.attention.archive.record("policy", asdict(service.attention.engine.policy), time.time())
                 service.attention.archive.record("attention_state", service.attention.state(), time.time())
                 if notify:

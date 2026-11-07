@@ -332,6 +332,7 @@ async def test_meta_requires_two_material_episodes_and_is_not_repeated(monkeypat
     result = await service.meta_context_once()
     assert result["status"] == "ok" and result["review"]["route"] == "meta"
     assert result["packet"]["symbol"] == "MARKET"
+    assert any(f["role"] == "history" for f in result["packet"]["facts"])
     assert all("review" not in f["source"] for f in result["packet"]["facts"])
     assert await service.meta_context_once() is None and len(calls) == 1
     assert journal.db.execute("SELECT COUNT(*) FROM ai_requests WHERE purpose='context_meta'").fetchone()[0] == 1
@@ -452,3 +453,79 @@ async def test_delisted_markets_are_excluded_without_a_volume_floor(monkeypatch)
     monkeypatch.setattr(engine, "_post", AsyncMock(return_value=response))
     await engine.refresh()
     assert set(engine.assets) == {"SMALL"}
+
+
+def test_control_assignments_do_not_churn_without_a_publisher():
+    from extensions.scalper.history.pulse_runtime import PulseObservation
+
+    observer = PulseObservation.__new__(PulseObservation)
+    observer.plan, observer.control_since = None, 100
+    assert observer.assignments(100) == observer.assignments(200)
+
+
+@pytest.mark.asyncio
+async def test_failed_history_pauses_native_collection():
+    from extensions.scalper.history.pulse_runtime import PulseObservation
+
+    observer = PulseObservation.__new__(PulseObservation)
+    observer.archive = SimpleNamespace(error="storage_budget_exhausted")
+    observer.plan = None
+    observer.hub = SimpleNamespace(
+        orderbook=SimpleNamespace(set_symbols=AsyncMock()),
+        orderflow=SimpleNamespace(set_attention_symbols=AsyncMock()),
+    )
+    with pytest.raises(RuntimeError, match="history_unavailable_collection_paused"):
+        await observer.cycle()
+    observer.hub.orderbook.set_symbols.assert_awaited_once_with([])
+    observer.hub.orderflow.set_attention_symbols.assert_awaited_once_with([])
+
+
+def test_archive_uses_assigned_budget_and_preserves_active_run(tmp_path):
+    from extensions.scalper.history.archive import Archive
+
+    archive = Archive(tmp_path, quota_bytes=1)
+    try:
+        (archive.path / "protected-evidence").write_bytes(b"over budget")
+        archive.check_space(time.time())
+        assert archive.error == "storage_budget_exhausted"
+        assert archive.path.exists()
+    finally:
+        archive.close()
+
+
+def test_meta_cross_instrument_interpretation_is_only_a_hypothesis():
+    from extensions.scalper.fact_packet import checksum
+    from extensions.scalper.fact_review import META_VALIDATOR_VERSION, validate_review
+
+    now = time.time()
+    a = attention(now)
+    packet = build_packet(a, a["active"][0], now)
+    base = next(f for f in packet["facts"] if f["id"] == "book.midpoint")
+    packet.update(
+        symbol="MARKET",
+        scope="market_meta",
+        input_packets=["one", "two"],
+        facts=[dict(base, id="ONE:book.midpoint"), dict(base, id="TWO:book.midpoint")],
+    )
+    packet.pop("packet_id")
+    packet["packet_id"] = checksum(packet)
+    raw = json.dumps(
+        dict(
+            packet_id=packet["packet_id"],
+            observations=[],
+            contradictions=[],
+            missing_data=[],
+            abstention=False,
+            interpretations=[
+                dict(
+                    id="link",
+                    kind="context_link",
+                    evidence=["ONE:book.midpoint", "TWO:book.midpoint"],
+                    text="Возможна связь наблюдаемых изменений.",
+                )
+            ],
+        )
+    )
+    result = validate_review(raw, packet, now)
+    assert result["validator_version"] == META_VALIDATOR_VERSION
+    assert result["claims"][0]["status"] == "hypothesis"

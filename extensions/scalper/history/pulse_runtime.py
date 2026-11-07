@@ -17,6 +17,7 @@ class PulseObservation(Observation):
         super().__init__(hub, root)
         self.plan = None
         self.applied = {}
+        self.control_since = time.time()
         self.cursor_path = (root or history_dir()) / "pulse-consumer.json"
         self.cursor = None
         if self.cursor_path.exists():
@@ -42,7 +43,7 @@ class PulseObservation(Observation):
     def assignments(self, now):
         symbols = desired_symbols(self.plan, int(now * 1000))
         detail = {r["symbol"]: r for r in (self.plan or {}).get("active", [])}
-        since = (self.plan or {}).get("controls_since", now)
+        since = (self.plan or {}).get("controls_since", self.control_since)
         return {
             s: detail.get(
                 s, dict(symbol=s, state="control", assigned_at=since, since=since, score=0, reason="diagnostic_control")
@@ -52,6 +53,10 @@ class PulseObservation(Observation):
 
     async def cycle(self):
         now = time.time()
+        if self.archive.error or ((self.plan or {}).get("decision_archive") or {}).get("error"):
+            await self.hub.orderbook.set_symbols([])
+            await self.hub.orderflow.set_attention_symbols([])
+            raise RuntimeError("history_unavailable_collection_paused")
         if now - self.last_control >= 2:
             self.plan = (await self.get("/attention")).get("plan")
             self.last_control = now

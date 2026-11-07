@@ -559,7 +559,9 @@ class Screener:
         if not getattr(self.hub, "attention", {}).get("context_only"):
             return {"enabled": False}
         self.refresh_context_packets(now)
+        meta = self.consistency.latest_episode("market.meta.v1") if self.consistency else None
         return dict(
+            meta=dict(review=meta, packet=self.consistency.packet(meta["packet_id"])) if meta else None,
             enabled=True,
             configured=bool(self.gemini.key),
             automatic=dict(
@@ -631,9 +633,7 @@ class Screener:
             route_job = None
             if not client.key or self.hub.demo:
                 status = "unconfigured" if not client.key else "skipped"
-                review = self.consistency.finish(
-                    key, status, now, reason="no_api_key" if not self.gemini.key else "demo"
-                )
+                review = self.consistency.finish(key, status, now, reason="no_api_key" if not client.key else "demo")
                 return dict(status=status, packet=packet, review=review)
             if self.ai_routes:
                 route_job, reason = self.ai_routes.reserve(packet, route, auto_state, now, self.policy.hourly_limit)
@@ -713,7 +713,7 @@ class Screener:
                 "disabled"
                 if not self.context_auto_enabled
                 else "no_api_key"
-                if not self.gemini.key
+                if not (self.ai_routes.free.key if self.ai_routes and route == "free" else self.gemini.key)
                 else None
                 if self.ai_routes
                 else self.journal.request_block(packet["symbol"], now, self.policy)
