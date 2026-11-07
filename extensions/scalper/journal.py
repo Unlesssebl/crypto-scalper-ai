@@ -202,6 +202,14 @@ class Journal:
                                     (dump({"status": "skipped", "reason": "interrupted"}), row["id"]))
         return [row["id"] for row in candidates]
 
+    def close_legacy_notifications(self):
+        """Retire persisted legacy card edits that have no worker in unified mode."""
+        with self.db:
+            self.db.execute(
+                "UPDATE pulse_card_edits SET status='expired',updated_at=? WHERE status IN ('pending','queued')",
+                (time.time(),),
+            )
+
     def record_candidate(self, key, snapshot, event, decision, now):
         with self.db:
             inserted = self.db.execute(

@@ -131,9 +131,8 @@ def test_unified_without_attention_blocks_automatic_and_manual_legacy_ai(journal
     service.detect(("BTC", "1m"), snap, vote(snap), now, "ready", "neutral")
 
     assert service.jobs.empty()
-    assert journal.latest("BTC", "1m")[0]["ai"]["status"] == "skipped"
-    assert journal.latest("BTC", "1m")[0]["ai"]["reason"] == "context_only"
-    assert journal.ai_reason(journal.latest("BTC", "1m")[0]["id"]) == "context_only"
+    assert journal.latest("BTC", "1m") == []
+    assert service.candidate_seen == {}
     assert calls == []
 
 

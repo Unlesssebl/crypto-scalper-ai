@@ -460,11 +460,23 @@ class Screener:
         if error:
             raise RuntimeModeError(error)
 
+    def recover_pending(self):
+        """Close persisted legacy work without re-queueing it in unified mode."""
+        if self.journal is None:
+            return []
+        interrupted = self.journal.recover()
+        if self.legacy_ai_enabled:
+            for key in interrupted:
+                self.queue_hypothesis(key)
+        else:
+            self.journal.close_legacy_notifications()
+        return interrupted
+
     def scan(self, now):
         if self.pulse is not None and hasattr(self.pulse, "desired_plan"):
             self.pulse.desired_plan = self.attention.plan
             self.attention.activity = {r["symbol"]: r for r in getattr(self.pulse, "overview", {}).get("items", [])}
-        if self.notify:
+        if self.notify and self.legacy_ai_enabled:
             for event_id in self.journal.pending_pulse_edits():
                 if self.notifications.full():
                     break
@@ -501,9 +513,10 @@ class Screener:
             if not self.hub.demo:
                 shadow_findings.extend(self.shadow.evaluate(key, snapshot, native))
                 other = rows.get((key[0], "5m" if key[1] == "1m" else "1m"))
-                self.detect(
-                    key, snapshot, native, now, row["analysis_gate"], row["context_5m"], {**row, "other": other}
-                )
+                if self.legacy_ai_enabled:
+                    self.detect(
+                        key, snapshot, native, now, row["analysis_gate"], row["context_5m"], {**row, "other": other}
+                    )
                 natr = fresh(snapshot["metrics"], "natr")
                 if (
                     now - control_slot <= 10
@@ -844,6 +857,8 @@ class Screener:
             await asyncio.sleep(10)
 
     def detect(self, key, snapshot, native, now, gate, relation, row=None):
+        if not self.legacy_ai_enabled:
+            return
         direction = native["direction"]
         anomalies = active_anomalies(snapshot)
         previous, was_strong, previous_anomalies = self.states.get(key, (None, False, frozenset()))

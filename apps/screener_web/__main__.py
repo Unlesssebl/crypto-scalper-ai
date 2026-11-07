@@ -265,6 +265,18 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
     return app
 
 
+def service_workers(service: Screener):
+    """Background workers required by the selected runtime mode.
+
+    Unified mode keeps scanning, attention/context and card delivery, but it
+    must not start the legacy directional-AI queue or its delivery loop.
+    """
+    workers = [service.run]
+    if service.legacy_ai_enabled:
+        workers.extend([service.analyze, service.deliver])
+    return tuple(workers)
+
+
 async def run(args: argparse.Namespace) -> None:
     journal = None
     recorder = Recorder(args.record) if args.record else None
@@ -315,9 +327,9 @@ async def run(args: argparse.Namespace) -> None:
             await runner.setup()
             site = web.TCPSite(runner, "127.0.0.1", args.port)
             await site.start()
-            for interrupted in journal.recover():
-                service.queue_hypothesis(interrupted)
-            tasks.extend(asyncio.create_task(worker()) for worker in (service.run, service.analyze, service.deliver))
+            for interrupted in service.recover_pending():
+                LOG.info("Closed interrupted legacy candidate %s", interrupted)
+            tasks.extend(asyncio.create_task(worker()) for worker in service_workers(service))
             tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
             if not hub.demo:
                 tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))
