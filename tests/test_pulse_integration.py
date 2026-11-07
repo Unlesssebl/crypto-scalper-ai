@@ -182,6 +182,57 @@ def test_restart_preserves_notification_flags(tmp_path, monkeypatch):
     assert len(commands) == 1 and "--notify" in commands[0]
 
 
+def test_duplicate_worker_does_not_clobber_live_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from scripts import project
+
+    state = tmp_path / "project.json"
+    state.write_text(json.dumps({"token": "owner", "pid": 1}))
+    monkeypatch.setattr(project, "STATE", state)
+    monkeypatch.setattr(project, "fetch", lambda *a, **k: {"http_status": 200, "data": {"root": str(project.ROOT)}})
+
+    args = SimpleNamespace(api_port=8420, web_port=8421, no_build=True, demo=True)
+    with pytest.raises(RuntimeError, match="8422"):
+        project.worker(args, [])
+
+    assert json.loads(state.read_text(encoding="utf-8"))["token"] == "owner"
+
+
+def test_stop_waits_for_owner_state_removal_not_a_status_timeout(tmp_path, monkeypatch):
+    import os
+
+    from scripts import project
+
+    state = tmp_path / "project.json"
+    state.write_text(json.dumps({"token": "owner", "pid": os.getpid()}))
+    monkeypatch.setattr(project, "STATE", state)
+    monkeypatch.setattr(project, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(project, "control", lambda *a, **k: None)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        state.unlink()
+
+    monkeypatch.setattr(project.time, "sleep", sleep)
+    project.request_stop()
+
+    assert sleeps == [0.5]
+    assert not state.exists()
+
+
+def test_stop_clears_state_of_a_dead_supervisor(tmp_path, monkeypatch):
+    from scripts import project
+
+    state = tmp_path / "project.json"
+    state.write_text(json.dumps({"token": "owner", "pid": 999999}))
+    monkeypatch.setattr(project, "STATE", state)
+    monkeypatch.setattr(project, "pid_alive", lambda pid: False)
+    project.request_stop()
+    assert not state.exists()
+
+
 def test_failed_stack_start_cleans_up_partial_stack_and_management_state(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

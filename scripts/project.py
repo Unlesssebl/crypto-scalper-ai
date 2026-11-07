@@ -24,12 +24,12 @@ STATE = RUNTIME / "project.json"
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "deploy/market-pulse/compose.yml")]
 
 
-def fetch(url, token=None):
+def fetch(url, token=None, timeout=3):
     request = urllib.request.Request(
         url, data=b"" if token else None, headers={"Authorization": "Bearer " + token} if token else {}
     )
     try:
-        response = urllib.request.urlopen(request, timeout=3)
+        response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
         response = exc
     with response:
@@ -41,12 +41,34 @@ def control(path="/status", token=None):
         return None
     try:
         state = json.loads(STATE.read_text(encoding="utf-8"))
-        result = fetch(state["url"] + path, token)
+        # /status probes three services, each allowed its own timeout. Give the
+        # whole request more than one probe so a busy supervisor never looks
+        # like a stopped one (that used to start a duplicate worker).
+        result = fetch(state["url"] + path, token, 15)
     except (OSError, ValueError):
         return None
     if result["data"].get("root") != str(ROOT):
         raise RuntimeError("management port belongs to a different project")
     return result["data"]
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, check=False
+        )
+        return str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def compose(*args):
@@ -79,12 +101,18 @@ def stop_application(process):
 
 
 def request_stop():
-    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else None
-    if not state or not control():
+    if not STATE.exists():
         return
-    control("/stop", state["token"])
+    try:
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not pid_alive(state.get("pid")):
+        STATE.unlink(missing_ok=True)
+        return
+    control("/stop", state.get("token"))
     for _ in range(120):
-        if control() is None:
+        if not STATE.exists():
             return
         time.sleep(0.5)
     raise RuntimeError("project shutdown timed out; inspect .runtime/project.log")
@@ -100,7 +128,34 @@ def remove_owned_state(token):
         pass
 
 
+def service_ports_free(api_port, web_port):
+    for port, path in ((api_port, "/v1/live"), (web_port, "/healthz")):
+        try:
+            fetch(f"http://127.0.0.1:{port}{path}", None, 3)
+        except OSError:
+            continue
+        except ValueError as exc:
+            raise RuntimeError(
+                f"port {port} answered with a non-project payload; stop the old process first"
+            ) from exc
+        raise RuntimeError(f"port {port} is already used by an unmanaged process; stop the old launcher first")
+
+
+def management_port_free():
+    try:
+        fetch("http://127.0.0.1:8422/status", None, 3)
+    except OSError:
+        return
+    except ValueError as exc:
+        raise RuntimeError("management port 8422 is used by another process") from exc
+    raise RuntimeError("project management port 8422 is already in use; stop the old launcher first")
+
+
 def worker(args, forwarded):
+    # Refuse a duplicate start before touching STATE: an overwritten state file
+    # orphans the live supervisor (its stop token becomes unreachable).
+    management_port_free()
+    service_ports_free(args.api_port, args.web_port)
     shutdown = threading.Event()
     token = secrets.token_urlsafe(32)
     state = {"root": str(ROOT), "phase": "starting", "pid": os.getpid()}
@@ -178,12 +233,6 @@ def worker(args, forwarded):
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: shutdown.set())
     try:
-        for port, path in ((args.api_port, "/v1/live"), (args.web_port, "/healthz")):
-            try:
-                fetch(f"http://127.0.0.1:{port}{path}")
-            except OSError:
-                continue
-            raise RuntimeError(f"port {port} is already used by an unmanaged process; stop the old launcher first")
         if not args.demo:
             env_path = ROOT / "deploy/market-pulse/.env"
             if not env_path.exists():
@@ -295,6 +344,19 @@ def main():
     if running:
         print(json.dumps(running, indent=2))
         return
+    if STATE.exists():
+        # A live pid without a working /status means the supervisor is busy or
+        # half-started. Never start a second worker over it: the duplicate
+        # would bind the management port and clobber the owner's state.
+        try:
+            saved = json.loads(STATE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        if pid_alive(saved.get("pid")):
+            raise RuntimeError(
+                "project supervisor is alive but /status is unavailable; retry --status or --stop"
+            )
+        STATE.unlink(missing_ok=True)
     if "--tui" in forwarded:
         worker(args, forwarded)
         return
