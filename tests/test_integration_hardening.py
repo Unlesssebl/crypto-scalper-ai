@@ -9,8 +9,10 @@ import aiohttp
 import pytest
 
 from extensions.scalper.history.pulse_runtime import PulseObservation
+from extensions.scalper.history.runtime import configure
 from extensions.scalper.remote import RemoteHub
-from hyperdata_terminal.runtime_mode import compatibility_error
+from extensions.scalper.service import Screener
+from hyperdata_terminal.runtime_mode import UNIFIED_ENV, RuntimeModeError, compatibility_error
 
 
 def _attention_error(status):
@@ -143,3 +145,82 @@ async def test_recovered_executions_never_become_live_triggers(monkeypatch, tmp_
 
     assert [item["event_seq"] for item in accepted] == [12]
     assert observation.cursor == 12
+
+
+def _analyst():
+    return SimpleNamespace(key="", provider="test", model="test/model")
+
+
+@pytest.mark.asyncio
+async def test_transient_api_outage_waits_instead_of_restarting_the_screener():
+    hub = RemoteHub("http://unused")
+
+    async def down(path, **params):
+        raise aiohttp.ClientConnectionError("native api refused the connection")
+
+    hub._get = down
+    with pytest.raises(aiohttp.ClientConnectionError):
+        await hub.refresh_snapshot()
+
+    service = Screener(hub, None, _analyst(), False)
+    # Availability is not incompatibility: startup must keep waiting.
+    assert service.validate_runtime() is False
+    assert service.runtime_diagnostic() is None
+
+
+@pytest.mark.asyncio
+async def test_confirmed_legacy_attention_still_blocks_startup():
+    hub = RemoteHub("http://unused")
+
+    async def legacy(path, **params):
+        return {"enabled": True, "runtime_mode": "legacy"}
+
+    hub._get = legacy
+    with pytest.raises(RuntimeModeError):
+        await hub.refresh_snapshot()
+
+    service = Screener(hub, None, _analyst(), False)
+    with pytest.raises(RuntimeModeError, match="unified"):
+        service.validate_runtime()
+    assert service.runtime_diagnostic() and "unified" in service.runtime_diagnostic()
+
+
+def test_standalone_live_hub_keeps_native_collectors(monkeypatch):
+    monkeypatch.delenv(UNIFIED_ENV, raising=False)
+    hub = SimpleNamespace(
+        demo=False,
+        orderbook=SimpleNamespace(symbols=["BTC"], books={"BTC": {}}, snapshots={"BTC": object()}),
+        orderflow=SimpleNamespace(selective=False, pulse_external=False, include_binance=True, symbols=["BTC"]),
+    )
+
+    assert configure(hub) is None
+    assert hub.orderflow.pulse_external is False
+    assert hub.orderflow.include_binance is True
+    assert hub.orderflow.symbols == ["BTC"]
+    assert hub.orderbook.symbols == ["BTC"]
+
+
+@pytest.mark.asyncio
+async def test_unified_flag_creates_the_external_tape_owner(monkeypatch, tmp_path):
+    async def waiting(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(PulseObservation, "run", waiting)
+    monkeypatch.setenv(UNIFIED_ENV, "1")
+    monkeypatch.setenv("HYPERDATA_HISTORY_DIR", str(tmp_path / "history"))
+    hub = SimpleNamespace(
+        demo=False,
+        orderbook=SimpleNamespace(symbols=["BTC"], books={"BTC": {}}, snapshots={"BTC": object()}, raw_callback=None),
+        orderflow=SimpleNamespace(selective=False, pulse_external=False, include_binance=True, symbols=["BTC"]),
+    )
+
+    observation = configure(hub)
+    try:
+        assert isinstance(observation, PulseObservation)
+        assert hub.orderflow.pulse_external is True
+        assert hub.orderflow.include_binance is False
+        assert hub.orderflow.symbols == []
+        assert hub.orderbook.symbols == []
+        assert hub.orderbook.raw_callback == observation.raw
+    finally:
+        await observation.close()

@@ -119,14 +119,19 @@ class OrderBookEngine:
 
     # ── Public API ───────────────────────────────────────────────
 
-    async def set_symbols(self, symbols: list[str]) -> None:
-        """Replace selective subscriptions without reconnecting surviving symbols."""
+    async def set_symbols(self, symbols: list[str], *, reset: list[str] | tuple[str, ...] = ()) -> None:
+        """Replace selective subscriptions without reconnecting surviving symbols.
+
+        ``reset`` drops the cached L2 state of symbols that were reassigned to a
+        new observation episode even though their subscription is unchanged;
+        otherwise the pre-episode snapshot could be served until the next frame.
+        """
         wanted = list(dict.fromkeys(symbols))
         old = set(self.symbols)
         self.symbols = wanted
         if not wanted:
             self.last_message_at = 0
-        for symbol in old - set(wanted):
+        for symbol in set(old - set(wanted)) | set(reset):
             self.books.pop(symbol, None)
             self.snapshots.pop(symbol, None)
         for symbol in wanted:

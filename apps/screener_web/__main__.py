@@ -294,8 +294,10 @@ async def run(args: argparse.Namespace) -> None:
                 )
             )
             service = Screener(hub, journal, gemini, notify, recorder=recorder, pulse=pulse)
-            if not hub.demo:
-                service.validate_runtime()
+            if not hub.demo and not service.validate_runtime():
+                LOG.warning(
+                    "Native API is not reachable yet; waiting for unified attention instead of restarting"
+                )
             if pulse is not None:
                 tasks.append(asyncio.create_task(pulse.run(), name="market-pulse-context"))
             if service.ai_routes:
@@ -320,7 +322,8 @@ async def run(args: argparse.Namespace) -> None:
             for interrupted in service.recover_pending():
                 LOG.info("Closed interrupted candidate %s", interrupted)
             tasks.append(asyncio.create_task(service.run(), name="screener-run"))
-            tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
+            # Legacy directional quality statistics are not part of the unified
+            # runtime; the old reports remain available as a frozen archive.
             if not hub.demo:
                 tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
@@ -453,6 +456,7 @@ def main() -> None:
     )
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     parser.add_argument("--record", type=Path, help="append every scan to this JSONL file")
+    parser.add_argument("--demo", action="store_true", help="synthetic data; disables AI, Telegram and Market Pulse")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")

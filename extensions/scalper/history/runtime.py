@@ -76,8 +76,15 @@ class Observation:
 
 
 def configure(hub):
-    """Create the single native attention owner for a live hub."""
-    if hub.demo:
+    """Create the native attention owner only for the unified Crypto Scalper run.
+
+    Standalone HyperData commands (``hyperdata cvd``, ``hyperdata api``, ...)
+    must keep their own exchange collectors: Market Pulse may not exist there.
+    ``scripts/serve.py`` marks its children with ``HYPERDATA_UNIFIED_RUNTIME``.
+    """
+    from hyperdata_terminal.runtime_mode import unified_enabled
+
+    if hub.demo or not unified_enabled():
         return None
     from .pulse_runtime import PulseObservation
 

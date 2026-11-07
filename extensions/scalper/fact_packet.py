@@ -67,7 +67,13 @@ def build_packet(attention, assignment, now, frames=()):
     )
     episode = checksum(dict(run=run, symbol=symbol, assigned_at=assignment["assigned_at"]))
     facts = []
-    healthy = not attention.get("archive", {}).get("error") and not attention.get("subscription_error")
+    healthy = (
+        not attention.get("archive", {}).get("error")
+        and not attention.get("subscription_error")
+        # /attention unavailable means the execution cursor is not advancing;
+        # fresh L2 must not make a frozen tape look like zero activity.
+        and not attention.get("plan_error")
+    )
     book_at = card.get("received_at")
 
     def add(
@@ -121,7 +127,7 @@ def build_packet(attention, assignment, now, frames=()):
     )
     add(
         "tape.observed_turnover_60s",
-        None if card.get("trade_window_truncated") else card.get("observed_turnover_60s_usd"),
+        None if not healthy or card.get("trade_window_truncated") else card.get("observed_turnover_60s_usd"),
         "usd",
         source="hyperliquid_observed_trades",
         evidence=card.get("trade_evidence", []),
@@ -133,7 +139,7 @@ def build_packet(attention, assignment, now, frames=()):
         for field, unit in (("observed_trade_imbalance", "ratio"), ("observed_trade_count_60s", "trades")):
             add(
                 "tape." + field,
-                None if card.get("trade_window_truncated") else card.get(field),
+                None if not healthy or card.get("trade_window_truncated") else card.get(field),
                 unit,
                 source="hyperliquid_observed_trades",
                 role="flow",

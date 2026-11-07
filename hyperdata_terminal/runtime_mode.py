@@ -7,7 +7,16 @@ report so a stale or downgraded native API fails explicitly.
 
 from __future__ import annotations
 
+import os
+
 UNIFIED = "unified"
+# Set by the unified launcher (scripts/serve.py). Standalone HyperData commands
+# keep their own exchange collectors and never depend on Market Pulse.
+UNIFIED_ENV = "HYPERDATA_UNIFIED_RUNTIME"
+
+
+def unified_enabled() -> bool:
+    return os.getenv(UNIFIED_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RuntimeModeError(RuntimeError):

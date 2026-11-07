@@ -18,6 +18,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from hyperdata_terminal.runtime_mode import UNIFIED_ENV
+
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / ".runtime"
 LOG = logging.getLogger("serve")
@@ -28,7 +30,8 @@ STOP_FILES: dict[int, Path] = {}
 
 def managed_start(command, **kwargs):
     marker = RUNTIME / ("stop-" + uuid.uuid4().hex)
-    process = subprocess.Popen(command, env={**os.environ, "HYPERDATA_STOP_FILE": str(marker)}, **kwargs)
+    env = {**os.environ, **(kwargs.pop("env", None) or {}), "HYPERDATA_STOP_FILE": str(marker)}
+    process = subprocess.Popen(command, env=env, **kwargs)
     STOP_FILES[process.pid] = marker
     return process
 
@@ -70,7 +73,9 @@ def start_native(port: int, demo: bool) -> subprocess.Popen:
         command.append("--demo")
     LOG.info("Starting native API: %s (log: %s)", " ".join(command), log_path)
     with log_path.open("ab") as log:
-        return managed_start(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        return managed_start(
+            command, cwd=ROOT, env={UNIFIED_ENV: "1"}, stdout=log, stderr=subprocess.STDOUT
+        )
 
 
 def start_screener(api_port: int, web_port: int, forwarded: list[str]) -> subprocess.Popen:
@@ -81,7 +86,7 @@ def start_screener(api_port: int, web_port: int, forwarded: list[str]) -> subpro
         *forwarded,
     ]
     LOG.info("Starting screener: %s", " ".join(command))
-    return managed_start(command, cwd=ROOT)
+    return managed_start(command, cwd=ROOT, env={UNIFIED_ENV: "1"})
 
 
 def stop(process: subprocess.Popen | None, name: str) -> None:

@@ -224,6 +224,18 @@ async def test_book_subscription_removed_state_not_reused():
     assert engine.get_snapshot("SMALL") is None
 
 
+@pytest.mark.asyncio
+async def test_reassignment_drops_the_previous_l2_snapshot_without_a_new_frame():
+    engine = OrderBookEngine([])
+    await engine.set_symbols(["SMALL"])
+    engine._update_book("SMALL", book()["data"])
+    assert engine.get_snapshot("SMALL") is not None
+    # The subscription is unchanged, but the observation episode is new.
+    await engine.set_symbols(["SMALL"], reset=["SMALL"])
+    assert engine.get_snapshot("SMALL") is None
+    assert engine.books["SMALL"]["updated_at"] == 0.0
+
+
 def test_demo_never_records_live_history(tmp_path, monkeypatch):
     monkeypatch.setenv("HYPERDATA_HISTORY_DIR", str(tmp_path / "not-created"))
     assert configure(SimpleNamespace(demo=True)) is None

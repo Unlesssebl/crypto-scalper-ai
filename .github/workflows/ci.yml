@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, crypto-scalper]
+    branches: [main, dev, crypto-scalper]
   pull_request:
-    branches: [main, crypto-scalper]
+    branches: [main, dev, crypto-scalper]
 
 jobs:
   test:

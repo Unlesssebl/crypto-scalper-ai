@@ -214,5 +214,6 @@ async def test_reassignment_invalidates_rolling_windows(monkeypatch, tmp_path):
 
     assert observer.applied["ETH"]["assigned_at"] == reassigned_at
     assert hub.orderflow.resets == ["ETH"]
+    assert hub.orderbook.set_symbols.await_args.kwargs["reset"] == ["ETH"]
     assert observer.report()["plan_status"] == "valid"
     await observer.close()

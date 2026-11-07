@@ -7,7 +7,7 @@ import os
 import time
 from collections import OrderedDict
 
-from hyperdata_terminal.runtime_mode import UNIFIED, compatibility_error, require_compatible
+from hyperdata_terminal.runtime_mode import UNIFIED, RuntimeModeError, compatibility_error
 
 from .activity import btc_context, finding_strength, market_risk_context, refresh_candles, wide_spread
 from .analysis import snapshot_key
@@ -21,7 +21,6 @@ from .market import WINDOWS, capture
 from .opportunity import OpportunityPolicy
 from .phase import PhaseTracker
 from .profile import DAY, calculate_profiles, fresh, sample_window, situation_facts
-from .quality import calculate_quality
 from .shadow import ShadowDetector
 from .unified_attention import UnifiedAttention as Attention
 
@@ -106,11 +105,23 @@ class Screener:
                     self.telegram_ux = TelegramUX(self)
 
     def runtime_diagnostic(self):
+        # An unreachable native API is a transient availability problem, not a
+        # confirmed incompatible mode. Do not label it as a runtime error.
+        if not getattr(self.hub, "attention_known", True):
+            return None
         return compatibility_error(getattr(self.hub, "attention", {}))
 
-    def validate_runtime(self):
-        """Fail startup explicitly when native attention is not unified."""
-        require_compatible(getattr(self.hub, "attention", {}))
+    def validate_runtime(self) -> bool:
+        """Raise only for a confirmed incompatibility; wait on transient outages."""
+        error = getattr(self.hub, "runtime_error", None)
+        if error:
+            raise RuntimeModeError(error)
+        if not getattr(self.hub, "attention_known", True):
+            return False
+        compat = compatibility_error(getattr(self.hub, "attention", {}))
+        if compat:
+            raise RuntimeModeError(compat)
+        return True
 
     def recover_pending(self):
         """Close persisted interrupted work without re-queueing it."""
@@ -515,11 +526,3 @@ class Screener:
             except Exception:
                 LOG.exception("Instrument profile refresh failed")
             await asyncio.sleep(300 if self.profiles else 30)
-
-    async def refresh_quality(self, path):
-        while True:
-            try:
-                self.quality_report = await asyncio.to_thread(calculate_quality, path, time.time(), WINDOWS)
-            except Exception:
-                LOG.exception("AI quality report refresh failed")
-            await asyncio.sleep(60)

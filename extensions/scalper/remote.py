@@ -20,7 +20,7 @@ from hyperdata_terminal.data_layer.alerts import AlertManager
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookLevel, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import CVDSnapshot, Trade
-from hyperdata_terminal.runtime_mode import UNIFIED
+from hyperdata_terminal.runtime_mode import RuntimeModeError, compatibility_error
 
 LOG = logging.getLogger(__name__)
 
@@ -91,6 +91,11 @@ class RemoteHub:
         self.demo = demo
         self.ready = False
         self.last_error: str | None = None
+        # True once the native API answered the attention contract question.
+        # A transient connection failure leaves it False, so startup must wait
+        # instead of treating "missing" as a mode incompatibility.
+        self.attention_known = False
+        self.runtime_error: str | None = None
         self._session: aiohttp.ClientSession | None = None
         self._books: dict[str, OrderBookSnapshot] = {}
         self._context: dict[str, dict] = {}
@@ -134,16 +139,20 @@ class RemoteHub:
         try:
             try:
                 self.attention = await self._get("/v1/attention")
+                self.attention_known = True
             except aiohttp.ClientResponseError as exc:
                 if exc.status != 404:
                     raise
+                # An explicit 404 is a definitive answer: the API is reachable
+                # but does not expose the unified attention contract.
                 self.attention = {"enabled": False}
+                self.attention_known = True
             # Demo has no live attention; every live hub must expose it.
             if not self.demo:
-                if self.attention.get("runtime_mode") != UNIFIED:
-                    raise RuntimeError("native attention is not in unified mode")
-                if not self.attention.get("enabled"):
-                    raise RuntimeError("native attention is disabled in unified mode")
+                error = compatibility_error(self.attention)
+                if error:
+                    self.runtime_error = error
+                    raise RuntimeModeError(error)
             selective = self.attention.get("enabled", False)
             market = await self._get("/v1/market", limit=1000)
             overview = market.get("assets", [])
@@ -190,6 +199,7 @@ class RemoteHub:
         self._apply(payload, assets)
         self.ready = True
         self.last_error = None
+        self.runtime_error = None
         await self._refresh_health()
 
     async def _refresh_health(self, interval: float = 10.0) -> None:

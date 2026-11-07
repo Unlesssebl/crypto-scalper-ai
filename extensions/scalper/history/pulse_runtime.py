@@ -152,7 +152,7 @@ class PulseObservation(Observation):
         self._invalidate_flow(reassigned, now, "assignment_changed")
         if wanted != applied:
             self._record("attention_plan", dict(plan=self.plan, applied=wanted), now)
-            await self.hub.orderbook.set_symbols(list(wanted))
+            await self.hub.orderbook.set_symbols(list(wanted), reset=reassigned)
             await self.hub.orderflow.set_attention_symbols(list(wanted))
             self.applied = wanted
 

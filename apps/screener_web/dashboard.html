@@ -57,7 +57,6 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <section aria-label="Фильтры" class="toolbar">
 <label>Окно<select id="window"><option>1m</option><option>5m</option></select></label>
 <label>Инструмент<input id="search" type="search" placeholder="Например, BTC"></label>
-<label id="legacy-consensus-filter">Последний Consensus<select id="filter"><option value="">Все</option></select></label>
 <button id="metrics" type="button" aria-pressed="false">Все метрики</button>
 <button id="refresh" type="button">Обновить</button>
 </section>
@@ -72,13 +71,15 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <button type="submit">Сохранить политику</button>
 </form>
 <p id="ai-policy-status" role="status"></p>
-<p id="ai-selection">Статистика отбора ещё рассчитывается.</p>
+<p id="ai-selection">Статистика legacy-отбора остановлена: направленный конвейер удалён из runtime.</p>
 <p id="ai-reasons"></p>
 <table aria-label="Результаты отбора AI"><thead><tr><th>Группа</th><th>Горизонт</th><th>Верно / неверно</th><th>Без движения / направления</th><th>Ждём / нет данных</th><th>Средний |ход| / ≥ NATR</th></tr></thead><tbody id="ai-outcomes"></tbody></table>
 <p>Отклонённые события тоже проверяются через 1/5/15 минут. Направление оценивается от цены обнаружения; сравнение AI, Rule Engine и Consensus — на одних событиях с успешным ответом AI, от цены снимка анализа, без комиссий и исполнения.</p>
 </details>
 <details class="panel quality-report">
-<summary>Архив: совпадение направления от исходного снимка за 24 часа</summary>
+<summary>Архив: legacy-оценки направлений (расчёт остановлен)</summary>
+<p>Статистика ниже относится к удалённому направленному конвейеру. Текущий runtime её не обновляет;
+данные сохранены только как исторический архив.</p>
 <p>Верно — цена пошла в сторону оценки AI. Ошибки запросов и оценки без направления считаются отдельно.</p>
 <p id="quality-attempts" role="status">Фоновый расчёт ещё не готов.</p>
 <table aria-label="Проверка направления AI">
@@ -121,8 +122,6 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const categories = ["CONSENSUS_LONG","CONSENSUS_SHORT","DIVERGENCE","HYPERDATA_ONLY","AI_ONLY","NEUTRAL","INSUFFICIENT_DATA"];
-for (const category of categories) $("filter").add(new Option(category, category));
 const number = new Intl.NumberFormat("ru-RU", {maximumSignificantDigits: 6});
 const stamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU") : "—";
 const value = x => typeof x === "number" ? number.format(x) : (x ?? "—");
@@ -134,13 +133,13 @@ const allColumns = [
   ["volume_24h","24h, USD"],["range_ratio","Диапазон к ATR"],
   ["volume","Объём окна"],["cvd","CVD"],["ofi","OFI"],["open_interest","OI, USD"],
   ["funding_rate","Funding"],["spread","Спред"],["native","HyperData сейчас"],
-  ["facts","Что происходит"],["summary","Характеристика AI"],["category","Consensus"],["quality","Данные"],
+  ["facts","Что происходит"],["summary","Характеристика AI"],["quality","Данные"],
 ];
-const extraColumns = new Set(["btcCorrelation", "volume_24h", "range_ratio", "volume", "cvd", "open_interest", "funding_rate", "spread", "quality", "category"]);
+const extraColumns = new Set(["btcCorrelation", "volume_24h", "range_ratio", "volume", "cvd", "open_interest", "funding_rate", "spread", "quality"]);
 let columns;
 const tableRow = document.createElement("tr");
 function renderHead() {
-  columns = allColumns.filter(([key]) => (!contextMode || !["summary", "category"].includes(key)) &&
+  columns = allColumns.filter(([key]) => (!contextMode || key !== "summary") &&
     ($("metrics").ariaPressed === "true" || !extraColumns.has(key)));
   if (!columns.some(([key]) => key === sort)) { sort = "strengthRank"; ascending = false; }
   tableRow.replaceChildren();
@@ -190,7 +189,7 @@ function display(row) {
     strengthRank:row.strength?.rank ?? 0, movementPhase:row.movement_phase?.label,
     movement:row.movement_phase, btcCorrelation:row.btc_context?.correlation,
     anomalies: anomalies.map(name => ({tape_burst:"Лента", range_burst:"Диапазон"})[name]).join(" · ") || null,
-    ai:assessment?.ai.direction, category:assessment?.consensus.category,
+    ai:assessment?.ai.direction,
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
     facts:(row.facts ?? []).join(" · "),
     summary:assessment?.ai.summary ?? attempt, captured:assessment?.captured_at,
@@ -224,8 +223,8 @@ function renderMarketContext(context) {
 }
 
 function render() {
-  const query = $("search").value.trim().toUpperCase(), filter = $("filter").value;
-  const rows = data.map(display).filter(row => row.symbol.toUpperCase().includes(query) && (!filter || row.category === filter));
+  const query = $("search").value.trim().toUpperCase();
+  const rows = data.map(display).filter(row => row.symbol.toUpperCase().includes(query));
   rows.sort((a,b) => {
     const x = a[sort], y = b[sort];
     if (x == null || y == null) {
@@ -246,9 +245,7 @@ function render() {
     ["Инструменты", market.length],
     ["Order Flow доступен", market.filter(row => row.native !== "NOT_AVAILABLE").length],
     ["Оценка AI в истории", market.filter(row => row.ai).length],
-    ["Согласия / расхождения", market.filter(row => row.category?.startsWith("CONSENSUS")).length
-      + " / " + market.filter(row => row.category === "DIVERGENCE").length],
-  ].filter(([label]) => !contextMode || !["Оценка AI в истории", "Согласия / расхождения"].includes(label))) {
+  ].filter(([label]) => !contextMode || label !== "Оценка AI в истории")) {
     const card = node("div", null, $("overview"));
     card.className = "stat";
     node("small", label, card);
@@ -467,7 +464,8 @@ function renderQuality(report) {
     `у ${comparison.missed_moves} не было строгой находки по тому же инструменту в пределах ±60 с.`;
   $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
   if (!result) {
-    $("quality-attempts").textContent = "Фоновый расчёт ещё не готов.";
+    $("quality-attempts").textContent =
+      "Архивный расчёт остановлен: legacy-конвейер направленных оценок удалён из runtime.";
     return;
   }
   const a = result.attempts;
@@ -744,8 +742,6 @@ function renderAttention(attention) {
   const nextMode = Boolean(attention?.context_only);
   if (contextMode !== nextMode) {
     contextMode = nextMode;
-    $("filter").value = "";
-    $("legacy-consensus-filter").hidden = contextMode;
     renderHead();
   }
   $("attention").hidden = !attention?.enabled;
@@ -891,7 +887,7 @@ $("metrics").onclick = () => {
   render();
 };
 $("refresh").onclick = () => { refresh(); loadDetail(); };
-$("search").oninput = $("filter").onchange = render;
+$("search").oninput = render;
 refresh();
 setInterval(refresh, 5000);
 </script>

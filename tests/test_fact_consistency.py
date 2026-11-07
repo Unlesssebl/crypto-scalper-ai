@@ -122,6 +122,19 @@ def test_archive_gap_marks_packet_unavailable(attention):
     assert validate_review(reply(p), p, 101)["claims"][0]["status"] == "unverifiable"
 
 
+def test_attention_outage_cannot_certify_fresh_book_or_zero_tape(attention):
+    # /attention is unavailable while the valid lease is kept: the execution
+    # cursor stops advancing, but L2 may still look fresh. Neither the packet
+    # nor a zero tape turnover may be presented as observed facts.
+    attention["plan_error"] = "RuntimeError: pulse unavailable"
+    p = packet(attention)
+    by_id = {fact["id"]: fact for fact in p["facts"]}
+    assert p["coverage"]["observation_healthy"] is False
+    assert not packet_ready(p, 101)
+    assert by_id["book.midpoint"]["quality"] == "unknown"
+    assert by_id["tape.observed_turnover_60s"]["value"] is None
+
+
 def test_compatible_comparison_checked_but_units_and_roles_cannot_be_conflated(attention):
     p = packet(attention)
     r = reply(p)
