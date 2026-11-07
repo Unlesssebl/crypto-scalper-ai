@@ -227,8 +227,11 @@ def worker(args, forwarded):
                     backup_process is None or backup_process.poll() is not None
                 ):
                     with (RUNTIME / "backups.log").open("ab") as log:
+                        backup_flags = []
+                        if "--journal" in forwarded:
+                            backup_flags = ["--sqlite-file", forwarded[forwarded.index("--journal") + 1]]
                         backup_process = subprocess.Popen(
-                            [sys.executable, str(ROOT / "scripts/pulse_ops.py"), "backup"],
+                            [sys.executable, str(ROOT / "scripts/pulse_ops.py"), "backup", *backup_flags],
                             cwd=ROOT,
                             stdout=log,
                             stderr=subprocess.STDOUT,

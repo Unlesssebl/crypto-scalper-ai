@@ -516,6 +516,27 @@ async def test_restart_releases_forgotten_channels_without_repairing_old_gap():
     assert len([g for g in history if g.state == "outside_attention"]) == 1
 
 
+def test_live_sqlite_backup_restores_durable_episode_state(tmp_path):
+    import sqlite3
+
+    from scripts.pulse_ops import sqlite_snapshot, verify_sqlite
+
+    source = tmp_path / 'live.sqlite'
+    target = tmp_path / 'market-pulse-test.dump'
+    with sqlite3.connect(source) as live:
+        live.execute('PRAGMA journal_mode=WAL')
+        live.execute('CREATE TABLE episode_cards(message_id INTEGER)')
+        live.execute('INSERT INTO episode_cards VALUES(1232)')
+        live.commit()
+        metadata = sqlite_snapshot(source, target.with_suffix('.sqlite'))
+        assert verify_sqlite(target, metadata) == {'integrity': 'ok', 'tables': 1}
+        with sqlite3.connect(target.with_suffix('.sqlite')) as restored:
+            assert restored.execute('SELECT message_id FROM episode_cards').fetchone()[0] == 1232
+    target.with_suffix('.sqlite').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='checksum'):
+        verify_sqlite(target, metadata)
+
+
 def test_meta_cross_instrument_interpretation_is_only_a_hypothesis():
     from extensions.scalper.fact_packet import checksum
     from extensions.scalper.fact_review import META_VALIDATOR_VERSION, validate_review
