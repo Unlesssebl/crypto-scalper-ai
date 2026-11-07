@@ -22,6 +22,8 @@ def validate_plan(payload, now_ms):
             raise ValueError("invalid attention " + field)
     if not set(payload["detail"]) <= set(payload["selected"]):
         raise ValueError("detail must belong to selected")
+    if payload["controls"]:
+        raise ValueError("fixed control subscriptions are disabled; use adaptive detail assignments")
     start, end = payload.get("generated_at_ms"), payload.get("expires_at_ms")
     if (
         type(start) is not int
@@ -53,9 +55,8 @@ def validate_plan(payload, now_ms):
     return payload
 
 
-def desired_symbols(plan, now_ms, fallback=("BTC", "XRP")):
-    if not plan:
-        return tuple(fallback)
-    controls = plan.get("controls", list(fallback))
-    detail = plan.get("detail", []) if plan.get("expires_at_ms", 0) > now_ms else []
-    return tuple(dict.fromkeys([*controls, *detail]))
+def desired_symbols(plan, now_ms):
+    # Ignore retired controls even in a saved older plan. No lease means no detail feeds.
+    if not plan or plan.get("expires_at_ms", 0) <= now_ms:
+        return ()
+    return tuple(dict.fromkeys(plan.get("detail", [])))

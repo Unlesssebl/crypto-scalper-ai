@@ -147,7 +147,11 @@ class RemoteHub:
             )
             if selected is None and selective:
                 selected = {r["symbol"] for r in self.attention.get("active", [])}
-            assets = [a for a in overview if selected is None or a["symbol"] in selected][:20]
+            # The screener's relative plan already enforces the overview capacity.
+            # No additional pinned instruments or volume-based truncation.
+            assets = [a for a in overview if selected is None or a["symbol"] in selected]
+            if selected is None:
+                assets = assets[:20]
             self.scout_prices = {
                 a["symbol"]: (a.get("mark_price"), observed)
                 for a in overview

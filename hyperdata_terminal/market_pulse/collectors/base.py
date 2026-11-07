@@ -332,6 +332,8 @@ class StreamCollector(ABC):
         send an ack at all.  Returning the raw frames lets the caller report the
         connection first and only then normalize them.
         """
+        if self.dynamic and not self.config.markets:
+            return []  # Idle adaptive sockets have no trade subscription to acknowledge.
         deadline = time.monotonic() + self.config.ack_timeout_ms / 1_000
         early: list[str] = []
         while time.monotonic() < deadline:

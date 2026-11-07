@@ -136,12 +136,27 @@ def finding_strength(snapshot, native, *, tape_ratio=BURST_RATIO, price_floor=MI
     return {"rank": rank, "icon": icon, "label": label, "reasons": reasons}
 
 
+def observation_assets(hub):
+    """Apply the existing adaptive plan; never allocate a second universe."""
+    assets = hub.get_all_assets()
+    selector = getattr(hub, "attention_selector", None)
+    plan = getattr(selector, "plan", {})
+    if plan.get("schema_version") == "attention.v1" and plan.get("generated_at_ms"):
+        selected = set(plan.get("selected", []))
+        return [a for a in assets if a.symbol in selected]
+    if getattr(hub, "attention", {}).get("context_only"):
+        return []
+    active = {r["symbol"] for r in getattr(hub, "attention", {}).get("active", [])}
+    return [a for i, a in enumerate(assets) if i < 20 or a.symbol in active]
+
+
 async def refresh_candles(hub, windows, cache):
     due = {}
     while True:
-        keys = [(asset.symbol, window) for asset in hub.get_all_assets()[:20] for window in windows]
-        if ("BTC", "5m") not in keys and "5m" in windows:
-            keys.insert(0, ("BTC", "5m"))
+        assets = observation_assets(hub)
+        active_symbols = {r["symbol"] for r in getattr(hub, "attention", {}).get("active", [])}
+        assets.sort(key=lambda a: a.symbol not in active_symbols)
+        keys = [(asset.symbol, window) for asset in assets for window in windows]
         active = set(keys)
         for key in due.keys() - active:
             del due[key]

@@ -22,7 +22,7 @@ USABLE = {"observed_no_detected_gap", "reconciled"}
 
 
 class PulseContext:
-    def __init__(self, url: str, markets=("BTC", "XRP"), *, journal=None):
+    def __init__(self, url: str, markets=(), *, journal=None):
         self.url = url.rstrip("/")
         self.markets = tuple(markets)
         self.windows = []
@@ -106,7 +106,7 @@ class PulseContext:
                 response.raise_for_status()
                 self.attention = await response.json()
             from hyperdata_terminal.market_pulse.control import desired_symbols
-            self.markets = desired_symbols(self.attention.get("plan"), int(now * 1000), self.markets)
+            self.markets = desired_symbols(self.attention.get("plan"), int(now * 1000))
 
     async def refresh_overview(self, session, now):
         try:
@@ -170,6 +170,8 @@ class PulseContext:
         result = {**self.summary(now), "symbol": symbol, "activity": "threshold_not_calibrated",
                   "flow": "unavailable", "venues": [],
                   "limits": "Closed UTC minute; not the native rolling window. No rarity or entry claim."}
+        if not self.url:
+            return result
         if symbol not in self.markets:
             result["status"] = "not_covered"
             return result

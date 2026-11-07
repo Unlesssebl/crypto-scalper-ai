@@ -147,7 +147,7 @@ async def test_control_still_publishes_when_shadow_disabled(monkeypatch):
         pulse = PulseContext(url)
         pulse.desired_plan = dict(schema_version="attention.v1", generated_at_ms=int(now*1000),
                                  expires_at_ms=int(now*1000)+300_000, selected=["ETH"], detail=["ETH"],
-                                 controls=["BTC", "XRP"])
+                                 controls=[])
         assert pulse.shadow is None
         await pulse.refresh(session, now)
         assert len(saved) == 1 and pulse.publisher_status == "published"

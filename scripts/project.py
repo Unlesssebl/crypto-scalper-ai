@@ -16,7 +16,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / ".runtime"
@@ -193,14 +193,13 @@ def worker(args, forwarded):
                     + secrets.token_hex(24)
                     + "\nPULSE_INGEST_TOKEN="
                     + secrets.token_hex(32)
-                    + "\nPULSE_MARKETS=BTC,XRP\n"
+                    + "\nPULSE_MARKETS=\n"
                 )
             pulse_started = True
             compose("up", "-d", *([] if args.no_build else ["--build"]))
         env = os.environ.copy()
         env["PULSE_UNIFIED"] = "0" if args.without_pulse else "1"
-        pulse_config = dotenv_values(ROOT / "deploy/market-pulse/.env")
-        env["PULSE_MARKETS"] = os.getenv("PULSE_MARKETS") or pulse_config.get("PULSE_MARKETS") or "BTC,XRP"
+        env["PULSE_MARKETS"] = ""
         env["PULSE_API_URL"] = "" if args.without_pulse else "http://127.0.0.1:8431"
         command = [
             sys.executable,

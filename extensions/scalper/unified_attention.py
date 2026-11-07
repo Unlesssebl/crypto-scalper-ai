@@ -2,7 +2,6 @@
 
 import json
 import math
-import time
 from collections import deque
 
 from .relative_attention import Attention, AttentionPolicy
@@ -16,8 +15,7 @@ class UnifiedAttention:
         )
         self.activity, self.selected = {}, {}
         self.last_at = 0
-        self.controls_since = time.time()
-        self.plan = dict(schema_version="attention.v1", selected=[], detail=[], controls=["BTC", "XRP"])
+        self.plan = dict(schema_version="attention.v1", selected=[], detail=[], controls=[])
         self.archive = None
         if journal:
             saved = journal.db.execute(
@@ -35,7 +33,6 @@ class UnifiedAttention:
                 name,
                 {s: deque(v, maxlen=self.engine.policy.baseline_size) for s, v in state.get(name, {}).items()},
             )
-        self.controls_since = state.get("controls_since", self.controls_since)
 
     def state(self):
         return {
@@ -43,7 +40,6 @@ class UnifiedAttention:
             **{
                 n: {s: list(v) for s, v in getattr(self.engine, n).items()} for n in ("baselines", "movement_baselines")
             },
-            "controls_since": self.controls_since,
         }
 
     def choose(self, assets, now):
@@ -75,7 +71,7 @@ class UnifiedAttention:
                 elif candle.get("zero_reference") and candle.get("trade_count", 0) > 0:
                     row["candle_ratio"] = self.engine.policy.probe_ratio
             observations[symbol] = row
-        dynamic = {s: r for s, r in observations.items() if s not in ("BTC", "XRP")}
+        dynamic = observations
         changes = self.engine.update(dynamic, now)
         if self.archive:
             self.archive.record("scout", dynamic, now)
@@ -91,8 +87,7 @@ class UnifiedAttention:
             expires_at_ms=int((now + 60) * 1000),
             selected=chosen,
             detail=detail,
-            controls=["BTC", "XRP"],
-            controls_since=self.controls_since,
+            controls=[],
             universe_size=len(observations),
             warming=sum(r["state"] == "warming" for r in self.engine.scouts.values()),
             slots=self.slots,

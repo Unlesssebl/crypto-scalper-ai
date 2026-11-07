@@ -65,9 +65,11 @@ def raw_root() -> Path:
 
 
 def markets() -> tuple[str, ...]:
-    raw = os.getenv("PULSE_MARKETS", "BTC,XRP")
+    if os.getenv("PULSE_DYNAMIC_ATTENTION", "0") == "1":
+        return ()
+    raw = os.getenv("PULSE_MARKETS", "")
     values = tuple(item.strip().upper() for item in raw.split(",") if item.strip())
-    return values or ("BTC", "XRP")
+    return values
 
 
 def ingest_url() -> str:
@@ -203,7 +205,8 @@ async def run_collector(
     refresh_okx: bool = True,
 ) -> None:
     stop = stop_event(stop)
-    selected = markets_override or markets()
+    dynamic = os.getenv("PULSE_DYNAMIC_ATTENTION", "0") == "1"
+    selected = () if dynamic else markets_override or markets()
     config = CollectorConfig(
         venue=venue,
         markets=selected,
@@ -220,14 +223,15 @@ async def run_collector(
     )
     client = HttpIngestClient(ingest_url(), token=ingest_token())
     specs = [spec for spec in default_instruments(selected) if spec.venue == venue]
-    if venue == "okx" and refresh_okx:
+    if venue == "okx" and refresh_okx and selected:
         try:
             specs = await OkxInstrumentCatalog().fetch_many(selected)
             LOG.info("refreshed OKX instrument specs: %s", [spec.spec_version for spec in specs])
         except Exception:
             LOG.exception("OKX instrument refresh failed; using checked defaults")
     try:
-        await client.register_instruments(specs)
+        if specs:
+            await client.register_instruments(specs)
     except Exception:
         LOG.exception("Could not register instrument specs before collection")
     collector: StreamCollector
@@ -239,7 +243,7 @@ async def run_collector(
         raise ValueError(f"unsupported venue {venue!r}")
     try:
         controller = None
-        if os.getenv("PULSE_DYNAMIC_ATTENTION", "0") == "1":
+        if dynamic:
             collector.dynamic = True
             controller = asyncio.create_task(follow_attention(collector, client, stop))
         worker = asyncio.create_task(collector.run(stop))

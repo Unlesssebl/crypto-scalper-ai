@@ -191,7 +191,7 @@ async def test_adapter_records_all_covered_markets_without_screener_slots(tmp_pa
     app.router.add_get("/coverage", coverage)
     journal = Journal(tmp_path / "journal.sqlite")
     async with TestServer(app) as server, aiohttp.ClientSession() as session:
-        pulse = PulseContext(str(server.make_url("")), journal=journal)
+        pulse = PulseContext(str(server.make_url("")), markets=("BTC", "XRP"), journal=journal)
         await pulse.refresh(session, now)
         facts = pulse.facts("BTC", now)
         assert facts["venues"][0]["shadow"]["metrics"]["execution_count"]["samples"] == 0

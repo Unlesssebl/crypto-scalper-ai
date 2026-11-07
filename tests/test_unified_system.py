@@ -371,8 +371,7 @@ async def test_one_plan_updates_native_l2_and_flow_cursor_skips_duplicates(tmp_p
     observation.plan = dict(
         expires_at_ms=int((now + 60) * 1000),
         detail=["SMALL"],
-        controls=["BTC", "XRP"],
-        controls_since=now - 10,
+        controls=[],
         active=[dict(symbol="SMALL", state="focus", reason="relative", assigned_at=now - 10, since=now - 10, score=8)],
     )
     row = dict(
@@ -402,7 +401,7 @@ async def test_one_plan_updates_native_l2_and_flow_cursor_skips_duplicates(tmp_p
 
     observation.get = get
     await observation.cycle()
-    assert set(engine.symbols) == {"SMALL", "BTC", "XRP"}
+    assert set(engine.symbols) == {"SMALL"}
     assert set(hub.orderbook.set_symbols.await_args.args[0]) == set(engine.symbols)
     await observation.cycle()
     await observation.cycle()
@@ -455,12 +454,12 @@ async def test_delisted_markets_are_excluded_without_a_volume_floor(monkeypatch)
     assert set(engine.assets) == {"SMALL"}
 
 
-def test_control_assignments_do_not_churn_without_a_publisher():
+def test_no_assignments_without_a_publisher():
     from extensions.scalper.history.pulse_runtime import PulseObservation
 
     observer = PulseObservation.__new__(PulseObservation)
-    observer.plan, observer.control_since = None, 100
-    assert observer.assignments(100) == observer.assignments(200)
+    observer.plan = None
+    assert observer.assignments(100) == observer.assignments(200) == {}
 
 
 @pytest.mark.asyncio

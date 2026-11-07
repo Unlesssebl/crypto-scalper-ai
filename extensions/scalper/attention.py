@@ -18,7 +18,7 @@ class PulseAttention:
         self.journal, self.slots, self.detail_slots, self.hold = journal, slots, detail_slots, hold_seconds
         self.selected = {}
         self.anchors = {}
-        self.plan = {"schema_version": VERSION, "selected": [], "detail": [], "controls": ["BTC", "XRP"]}
+        self.plan = {"schema_version": VERSION, "selected": [], "detail": [], "controls": []}
         self.last_at = 0
         self.activity = {}
         self.detail_state = {}
@@ -104,7 +104,7 @@ class PulseAttention:
         ranking = sorted(valid, key=lambda s: (-valid[s]["score"], s))
         retained = self.allocate(ranking, self.selected, self.slots, valid, now)
         # Detail leases have their own hold; ordering cannot rotate the expensive feeds every poll.
-        detail_rank = [s for s in ranking if s in retained and s not in ("BTC", "XRP")]
+        detail_rank = [s for s in ranking if s in retained]
         self.detail_state = self.allocate(detail_rank, self.detail_state, self.detail_slots, valid, now)
         detail = list(self.detail_state)
         self.selected = retained
@@ -114,7 +114,7 @@ class PulseAttention:
             "expires_at_ms": int((now + self.hold) * 1000),
             "selected": list(retained),
             "detail": detail,
-            "controls": ["BTC", "XRP"],
+            "controls": [],
             "universe_size": len(valid),
             "slots": self.slots,
             "detail_slots": self.detail_slots,

@@ -33,7 +33,8 @@ services:
       PULSE_INGEST_PORT: "8430"
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
       PULSE_RAW_DIR: /raw
-      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+      PULSE_MARKETS: ""
+      PULSE_DYNAMIC_ATTENTION: "1"
     ports:
       - "127.0.0.1:8430:8430"
     volumes:
@@ -75,14 +76,14 @@ services:
         "--venue",
         "hyperliquid",
         "--markets",
-        "${PULSE_MARKETS:-BTC,XRP}",
+        "",
       ]
     environment:
       PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
       PULSE_RAW_DIR: /raw
-      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+      PULSE_MARKETS: ""
     volumes:
       - pulse-raw-hl:/raw/hyperliquid
     depends_on:
@@ -97,14 +98,14 @@ services:
         "--venue",
         "okx",
         "--markets",
-        "${PULSE_MARKETS:-BTC,XRP}",
+        "",
       ]
     environment:
       PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
       PULSE_RAW_DIR: /raw
-      PULSE_MARKETS: ${PULSE_MARKETS:-BTC,XRP}
+      PULSE_MARKETS: ""
     volumes:
       - pulse-raw-okx:/raw/okx
     depends_on:

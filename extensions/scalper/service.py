@@ -453,7 +453,9 @@ class Screener:
         assets = self.hub.get_all_assets()
         self.market_context = market_risk_context(getattr(self.hub, "context", None))
         rows = {}
-        for asset in assets[:20]:
+        from .activity import observation_assets
+
+        for asset in observation_assets(self.hub):
             for window in WINDOWS:
                 key = (asset.symbol, window)
                 snapshot, native = capture(self.hub, asset, window, now, self.candles.get(key))

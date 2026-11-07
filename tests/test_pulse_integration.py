@@ -20,7 +20,7 @@ START = (int(NOW * 1000) - 5_000) // 60_000 * 60_000 - 60_000
 
 
 def source():
-    pulse = PulseContext("http://source")
+    pulse = PulseContext("http://source", markets=("BTC",))
     pulse.status, pulse.updated_at = "connected", NOW
     for venue, market, channel in (("hyperliquid", "BTC", "trades"),
                                     ("okx", "BTC-USDT-SWAP", "trades-all")):
@@ -75,7 +75,7 @@ async def test_read_only_adapter_consumes_actual_api_and_survives_outage():
     store = InMemoryMarketPulseStore()
     server = TestServer(create_app(store))
     await server.start_server()
-    pulse = PulseContext(str(server.make_url("")))
+    pulse = PulseContext(str(server.make_url("")), markets=("BTC",))
     async with aiohttp.ClientSession() as session:
         await pulse.refresh(session, NOW)
         assert pulse.status == "connected"

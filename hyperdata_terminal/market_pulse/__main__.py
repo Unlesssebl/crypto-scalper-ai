@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     collector = sub.add_parser("collector", help="run one exchange collector")
     collector.add_argument("--venue", choices=("hyperliquid", "okx"), required=True)
-    collector.add_argument("--markets", default="BTC,XRP", help="comma-separated V1 markets")
+    collector.add_argument("--markets", default="", help="explicit standalone markets; ignored in adaptive mode")
     collector.add_argument(
         "--no-refresh-okx",
         action="store_true",

@@ -17,7 +17,6 @@ class PulseObservation(Observation):
         super().__init__(hub, root)
         self.plan = None
         self.applied = {}
-        self.control_since = time.time()
         self.cursor_path = (root or history_dir()) / "pulse-consumer.json"
         self.cursor = None
         if self.cursor_path.exists():
@@ -43,13 +42,7 @@ class PulseObservation(Observation):
     def assignments(self, now):
         symbols = desired_symbols(self.plan, int(now * 1000))
         detail = {r["symbol"]: r for r in (self.plan or {}).get("active", [])}
-        since = (self.plan or {}).get("controls_since", self.control_since)
-        return {
-            s: detail.get(
-                s, dict(symbol=s, state="control", assigned_at=since, since=since, score=0, reason="diagnostic_control")
-            )
-            for s in symbols
-        }
+        return {s: detail[s] for s in symbols if s in detail}
 
     async def cycle(self):
         now = time.time()

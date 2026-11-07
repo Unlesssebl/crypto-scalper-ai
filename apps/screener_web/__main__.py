@@ -275,7 +275,7 @@ async def run(args: argparse.Namespace) -> None:
                 if hub.demo
                 else PulseContext(
                     os.getenv("PULSE_API_URL", "http://127.0.0.1:8431"),
-                    tuple(m.strip().upper() for m in os.getenv("PULSE_MARKETS", "BTC,XRP").split(",") if m.strip()),
+                    (),
                     journal=journal if os.getenv("PULSE_SHADOW", "1") == "1" else None,
                 )
             )

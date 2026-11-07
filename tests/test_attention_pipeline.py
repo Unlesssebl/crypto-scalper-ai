@@ -58,7 +58,7 @@ def test_attention_restart_retains_slot_and_malformed_market_is_excluded(tmp_pat
 
 def plan(now):
     return {"schema_version": "attention.v1", "generated_at_ms": now, "expires_at_ms": now + 300_000,
-            "selected": ["ETH", "SOL"], "detail": ["ETH"], "controls": ["BTC", "XRP"]}
+            "selected": ["ETH", "SOL"], "detail": ["ETH"], "controls": []}
 
 
 @pytest.mark.parametrize("change", [{"detail": ["OTHER"]}, {"detail": ["ETH", "ETH"]},
@@ -69,9 +69,11 @@ def test_invalid_attention_plan_is_rejected(change):
         validate_plan({**plan(1000), **change}, 1000)
 
 
-def test_expired_attention_releases_dynamic_but_keeps_controls():
-    assert desired_symbols(plan(1000), 2000) == ("BTC", "XRP", "ETH")
-    assert desired_symbols(plan(1000), 400_000) == ("BTC", "XRP")
+def test_expired_attention_releases_every_subscription_without_fixed_fallback():
+    assert desired_symbols(plan(1000), 2000) == ("ETH",)
+    assert desired_symbols(plan(1000), 400_000) == ()
+    assert desired_symbols(None, 2000) == ()
+    assert desired_symbols({**plan(1000), "controls": ["BTC", "XRP"]}, 2000) == ("ETH",)
     assert market_for_venue("okx", "ETH") == "ETH-USDT-SWAP"
     assert hyperliquid_spec("kPEPE").native_market_id == "kPEPE"
 
@@ -91,7 +93,7 @@ async def test_control_auth_persistence_monotonicity_and_missing_coverage():
     async with TestClient(TestServer(create_app(store))) as client:
         assert (await (await client.get('/attention')).json())["plan"]["detail"] == ["ETH"]
         health = await client.get('/health')
-        assert health.status == 503 and len((await health.json())["missing_channels"]) == 6
+        assert health.status == 503 and len((await health.json())["missing_channels"]) == 2
 
 
 async def test_subscriptions_change_in_place_and_new_channel_waits_for_own_ack(tmp_path):
