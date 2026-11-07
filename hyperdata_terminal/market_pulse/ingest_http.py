@@ -93,6 +93,12 @@ async def collector_status(request):
     if not isinstance(payload, dict) or not isinstance(payload.get("markets"), dict):
         raise web.HTTPBadRequest(text="invalid collector status")
     payload["updated_at_ms"] = now_ms()
+    # The saved author plan, rather than a collector's local memory, owns leases.
+    plan = await request.app["store"].get_control("attention")
+    if plan:
+        from .control import desired_symbols
+        await request.app["gap_control"].release_outside_attention(
+            request.match_info["venue"], desired_symbols(plan, payload["updated_at_ms"]), payload["updated_at_ms"])
     await request.app["store"].set_control("collector:" + request.match_info["venue"], payload, now_ms())
     return web.json_response({"status": "ok"})
 

@@ -493,6 +493,29 @@ def test_archive_uses_assigned_budget_and_preserves_active_run(tmp_path):
         archive.close()
 
 
+@pytest.mark.asyncio
+async def test_restart_releases_forgotten_channels_without_repairing_old_gap():
+    from hyperdata_terminal.market_pulse.gaps import GapTracker
+    from hyperdata_terminal.market_pulse.ingest import GapControlService
+    from hyperdata_terminal.market_pulse.storage import InMemoryMarketPulseStore
+
+    store = InMemoryMarketPulseStore()
+    gaps = GapTracker(store)
+    for symbol in ("OLD-USDT-SWAP", "BTC-USDT-SWAP"):
+        await gaps.on_connected("okx", symbol, "trades-all", "before-restart", 1000)
+        await gaps.on_disconnected("okx", symbol, "trades-all", "before-restart", 2000, reason="connection_lost")
+    original = [g.gap_id for g in await store.list_gaps() if g.state == "gap_detected"]
+    control = GapControlService(store, gaps)
+    await control.release_outside_attention("okx", ["BTC"], 3000)
+    await control.release_outside_attention("okx", ["BTC"], 4000)
+    coverage = {c.native_market_id: c for c in await store.list_coverage()}
+    assert coverage["OLD-USDT-SWAP"].state == "outside_attention"
+    assert coverage["BTC-USDT-SWAP"].state == "gap_detected"
+    history = await store.list_gaps()
+    assert {g.gap_id for g in history if g.state == "gap_detected"} == set(original)
+    assert len([g for g in history if g.state == "outside_attention"]) == 1
+
+
 def test_meta_cross_instrument_interpretation_is_only_a_hypothesis():
     from extensions.scalper.fact_packet import checksum
     from extensions.scalper.fact_review import META_VALIDATOR_VERSION, validate_review

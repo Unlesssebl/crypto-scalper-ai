@@ -181,6 +181,17 @@ class GapControlService:
         self.store = store
         self.gaps = gaps
 
+    async def release_outside_attention(self, venue, symbols, now_ms):
+        """Reconcile durable channels forgotten by a restarted collector, preserving gaps."""
+        from .collectors.specs import market_for_venue
+
+        wanted = {market_for_venue(venue, symbol) for symbol in symbols}
+        channel = "trades" if venue == "hyperliquid" else "trades-all"
+        for row in await self.store.list_coverage():
+            if (row.venue == venue and row.channel == channel and row.native_market_id not in wanted
+                    and row.state != QualityState.OUTSIDE_ATTENTION.value):
+                await self.gaps.on_released(venue, row.native_market_id, channel, row.source_epoch, now_ms)
+
     async def apply(self, payload: Mapping[str, Any], *, now_ms: int) -> dict[str, Any]:
         action = payload.get("action")
         if action not in self.ACTIONS:
