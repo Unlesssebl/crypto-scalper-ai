@@ -129,7 +129,7 @@ def test_unknown_and_stale_data_cannot_push(service):
 
 def test_timeframe_is_not_episode_age():
     p = packet(time.time())
-    assert scale(p, summarize(p)) == "ранняя"
+    assert scale(p, summarize(p)) == "не определён"
     for key, stamp, val in (
         ("first_trade_price", p["captured_at"] - 260, 9),
         ("last_trade_price", p["captured_at"], 10),
@@ -138,7 +138,7 @@ def test_timeframe_is_not_episode_age():
         p["facts"].append(dict(id="frame.5m." + key, source_time=stamp, quality="ok", value=val))
     assert scale(p, summarize(p)) == "5m"
     p["facts"][-2]["source_time"] = p["captured_at"] - 250
-    assert scale(p, summarize(p)) == "ранняя"
+    assert scale(p, summarize(p)) == "не определён"
 
 
 @pytest.mark.asyncio

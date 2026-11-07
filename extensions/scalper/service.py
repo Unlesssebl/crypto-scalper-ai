@@ -553,7 +553,7 @@ class Screener:
             return
         packets = {}
         for assignment in attention.get("active", []):
-            packet = build_packet(attention, assignment, now, frames=[r["snapshot"] for r in self.rows.values()])
+            packet = self.build_context_packet(attention, assignment, now)
             packets[packet["symbol"]] = packet
             self.context_cache[packet["packet_id"]] = packet
             if self.consistency:
@@ -561,6 +561,12 @@ class Screener:
         self.context_packets = packets
         while len(self.context_cache) > 64:
             self.context_cache.popitem(last=False)
+
+    def build_context_packet(self, attention, assignment, now):
+        from .analytics_context import extend_packet
+
+        packet = build_packet(attention, assignment, now, frames=[r["snapshot"] for r in self.rows.values()])
+        return extend_packet(packet, self)
 
     def context_state(self, now):
         if not getattr(self.hub, "attention", {}).get("context_only"):
@@ -579,6 +585,7 @@ class Screener:
             ),
             routes=self.ai_routes.summary(now) if self.ai_routes else None,
             telegram_ux=self.telegram_ux.status() if self.telegram_ux else dict(enabled=False),
+            notification_quality=self.telegram_ux.quality.report(now) if self.telegram_ux else None,
             delivery=self.outbox.summary() if self.outbox else None,
             packets=[
                 dict(
@@ -614,9 +621,7 @@ class Screener:
                 or not packet_ready(packet, now)
             ):
                 return {"status": "skipped", "reason": "stale_or_unknown_packet"}
-            current = build_packet(
-                self.hub.attention, active[packet["symbol"]], now, frames=[r["snapshot"] for r in self.rows.values()]
-            )
+            current = self.build_context_packet(self.hub.attention, active[packet["symbol"]], now)
             if current["episode_id"] != packet["episode_id"] or not packet_ready(current, now):
                 return {"status": "skipped", "reason": "episode_changed_or_unavailable"}
             prior = self.consistency.latest(packet["packet_id"])

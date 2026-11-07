@@ -9,10 +9,10 @@ from pathlib import Path
 
 from extensions.scalper.context_auto import summarize
 from extensions.scalper.fact_packet import packet_ready, verify_packet
-from extensions.scalper.telegram_ux import operational, scenarios
+from extensions.scalper.telegram_ux import analytical_details, operational, scenarios
 
 
-def preview(journal, output):
+def preview(journal, output, context_version=None):
     cards, lengths, symbols, shown = [], [], set(), set()
     with closing(sqlite3.connect(journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         for payload, reason in db.execute(
@@ -20,6 +20,8 @@ def preview(journal, output):
             "LEFT JOIN fact_reviews r ON r.packet_id=p.id WHERE p.symbol<>'MARKET' ORDER BY p.at DESC LIMIT 1000"
         ):
             packet = verify_packet(json.loads(payload))
+            if context_version and packet.get("context_version") != context_version:
+                continue
             if not packet_ready(packet, packet["captured_at"]):
                 continue
             state = summarize(packet)
@@ -28,7 +30,7 @@ def preview(journal, output):
             symbols.add(packet["symbol"])
             if len(cards) < 9 and packet["symbol"] not in shown:
                 shown.add(packet["symbol"])
-                extra = "<br>".join(html.escape(s) for s in scenarios(state))
+                extra = "<br>".join(html.escape(s) for s in analytical_details(packet, state) + scenarios(state))
                 cards.append(
                     "<article>" + rich + "<details><summary>Сценарии наблюдения</summary>"
                     "<p>" + extra + "</p></details></article>"
@@ -56,6 +58,7 @@ def preview(journal, output):
         telegram_calls=0,
         terminal_commands=0,
         limitation="Rendering replay, not signal-selection or trading-effectiveness proof",
+        context_version=context_version,
     )
     output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
@@ -65,5 +68,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--context-version")
     args = parser.parse_args()
-    print(json.dumps(preview(args.journal, args.output)))
+    print(json.dumps(preview(args.journal, args.output, args.context_version)))

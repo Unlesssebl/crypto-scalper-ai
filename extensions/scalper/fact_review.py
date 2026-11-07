@@ -30,6 +30,10 @@ missing_data: id фактов с unknown/stale. Отсутствие наблю�
 Одинаковые исходные данные не являются независимыми подтверждениями. При недостатке пригодных
 данных abstention=true. Итоговые статусы твоих утверждений определяет валидатор, не ты."""
 PROMPT += """
+context.phase и context.strength — классификации кода, не доказательство будущего движения.
+scenarios — условные конструкции кода с наблюдаемыми опорными ценами, не прогноз и не рекомендация.
+Профили 7/30д относятся только к фактически наблюдавшейся выборке; сезонная редкость не доказана.
+Интервалы rolling, closed_utc_1m, 4x15m различаются; не суммируй их объёмы и не смешивай USDC с USDT.
 Строгое правило abstention: если observations, interpretations или contradictions не пусты,
 abstention ОБЯЗАТЕЛЬНО false. Если abstention=true, ВСЕ эти три массива ОБЯЗАТЕЛЬНО пусты;
 тогда можно заполнить только missing_data. Не путай отсутствие торговой рекомендации с воздержанием:
@@ -301,7 +305,9 @@ class FactReviewer:
         analyst = self.analyst
         if not analyst.key:
             return dict(status="unconfigured")
-        url, request, headers = analyst.request(canonical(packet), schema(packet))
+        from .analytics_context import compact_model_packet
+
+        url, request, headers = analyst.request(canonical(compact_model_packet(packet)), schema(packet))
         if analyst.provider == "openrouter":
             request["messages"][0]["content"] = PROMPT
             request["max_tokens"] = 2200

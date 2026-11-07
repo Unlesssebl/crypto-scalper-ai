@@ -568,7 +568,8 @@ def test_instrument_profiles_count_regular_windows_and_filter_missing_metrics(ma
     path = tmp_path / "profiles.sqlite"
     journal = Journal(path)
     try:
-        samples = [(asset.symbol, "1m", slot - i * 60, i + 1, None, 2.0, 0.0, None) for i in range(20)]
+        # Reference intervals precede the current rolling window.
+        samples = [(asset.symbol, "1m", slot - (i + 1) * 60, i + 1, None, 2.0, 0.0, None) for i in range(20)]
         journal.record_instrument_samples(samples + samples)
         profile = calculate_profiles(path, now, [asset.symbol])[(asset.symbol, "1m")]
         period = profile["periods"][7]

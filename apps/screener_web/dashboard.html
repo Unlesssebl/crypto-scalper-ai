@@ -665,6 +665,16 @@ function renderConsistency(context) {
     if (context.routes.free_error) node("p", "Бесплатный маршрут: " + context.routes.free_error, root);
   }
   const selections = node("details", null, root);
+  if (context.notification_quality) {
+    const q = node("details", null, root);
+    node("summary", "Наблюдения после отбора событий · без оценки прибыли", q);
+    for (const o of context.notification_quality.outcomes ?? []) {
+      node("p", (o.decision === "queued" ? "Отобранные" : "Отклонённые") +
+        " · через " + o.horizon / 60 + " мин: наблюдалось " + o.observed +
+        ", нет данных " + o.missing + ", ожидается " + o.pending +
+        ", непрерывных траекторий " + o.continuous, q);
+    }
+  }
   if (context.telegram_ux?.enabled) {
     const ux = context.telegram_ux;
     node("p", "Telegram: новый интерфейс · аналитический канал " +

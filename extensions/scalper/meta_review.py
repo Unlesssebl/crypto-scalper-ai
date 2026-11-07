@@ -39,6 +39,20 @@ async def run_meta(service):
     facts = []
     for packet in sorted(packets, key=lambda p: p["symbol"]):
         priority_ids = (
+            "formation.scale",
+            "formation.strength",
+            "context.phase.1m.phase",
+            "context.phase.5m.phase",
+            "context.strength.1m",
+            "context.1m.natr",
+            "context.1m.wide_spread",
+            "context.1m.activity_ratio",
+            "activity.closed_1m.trade_count_ratio",
+            "btc.relative_last_return_pp",
+            "btc.correlation",
+            "venue.relation",
+            "profile.1m.7d.trades.current_ratio",
+            "profile.1m.30d.trades.current_ratio",
             "frame.1m.ofi",
             "frame.1m.trade_count",
             "frame.1m.observed_price_change_bps",
@@ -54,8 +68,8 @@ async def run_meta(service):
         eligible = sorted(
             (f for f in packet["facts"] if f["quality"] == "ok" and f["role"] != "history"),
             key=lambda f: priority_ids.index(f["id"]) if f["id"] in priority_ids else 100,
-        )[:16]
-        eligible += [f for f in packet["facts"] if f["role"] == "history"][-9:]
+        )[:26]
+        eligible += [f for f in packet["facts"] if f["role"] == "history"][-6:]
         for fact in eligible:
             item = dict(fact, id=packet["symbol"] + ":" + fact["id"])
             if item["unit"] in ("price", "base_units"):

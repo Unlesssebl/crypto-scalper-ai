@@ -8,12 +8,16 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
+from .analytics_context import admission, analytical_state, fact_value
 from .context_auto import decide, summarize
 from .fact_packet import packet_ready
+from .notification_quality import NotificationQuality
+from .phase import PHASES
 from .tiger import TigerBridge
 
 MSK = timezone(timedelta(hours=3))
 TITLES = {
+    "formation_confirmed": "Движение подтвердилось",
     "density_context": "Удерживается значимая зона",
     "flow_price_conflict": "Поток расходится с реакцией цены",
     "early_context": "Ускорение подтверждается движением цены",
@@ -35,6 +39,8 @@ def value(packet, key):
 def scale(packet, state):
     """A five-minute flow is context only when the observed endpoints span most of it."""
     facts = {f["id"]: f for f in packet["facts"]}
+    if packet.get("context_version"):
+        return fact_value(packet, "formation.scale") or "не определён"
     for window, minimum in (("5m", 240), ("1m", 45)):
         first = facts.get(f"frame.{window}.first_trade_price", {})
         last = facts.get(f"frame.{window}.last_trade_price", {})
@@ -51,7 +57,7 @@ def scale(packet, state):
             and flow * state["flow"] > 0
         ):
             return window
-    return "ранняя"
+    return "не определён"
 
 
 def activity(service, symbol, now):
@@ -64,6 +70,19 @@ def activity(service, symbol, now):
 
 
 def scenarios(state):
+    plan = state.get("scenario") or {}
+    if plan.get("kind") in {"observed_zone", "observed_impulse"}:
+        anchor = number(plan["anchor"], 8)
+        main = "выше" if plan["main_relation"] == "above" else "ниже"
+        cancel = "ниже" if plan["cancel_relation"] == "below" else "выше"
+        source = "наблюдаемой зоны" if plan["kind"] == "observed_zone" else "наблюдаемого начала импульса"
+        return [
+            f"Основной: цена остаётся {main} {anchor} — цены {source}. "
+            "Подтверждение: два последовательных пригодных наблюдения при сохранении потока/видимой зоны.",
+            f"Альтернативный: два наблюдения {cancel} {anchor} ослабляют основной сценарий. "
+            "Исчезновение зоны из видимости или разрыв данных прекращают её подтверждение, "
+            "но не доказывают исполнение или отмену заявок.",
+        ]
     zone = state.get("zone")
     if zone:
         side = "спроса" if zone["side"] == "bid" else "предложения"
@@ -92,10 +111,14 @@ def scenarios(state):
 def operational(packet, state, reason, kind, ratio=None, pulse=None):
     symbol = html.escape(packet["symbol"])
     frame = scale(packet, state)
+    phase = PHASES.get(state.get("phase"), "Фаза не определена")
     title = TITLES.get(reason, "Изменение наблюдаемой ситуации")
     if kind == "strengthening":
         title = "Появился новый значимый уровень" if reason == "new_level" else "Ситуация заметно усилилась"
-    parts = [f"<b>{symbol} · {title}</b>", f"{'Усиление' if kind == 'strengthening' else 'Ситуация'} · масштаб {frame}"]
+    parts = [
+        f"<b>{symbol} · {title}</b>",
+        f"{'Усиление' if kind == 'strengthening' else 'Ситуация'} · масштаб {frame} · фаза 1м: {phase}",
+    ]
     metrics = []
     if state.get("midpoint") is not None:
         metrics.append("Цена " + number(state["midpoint"], 8))
@@ -117,8 +140,8 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
             f"{side} {number(zone['price'], 8)} · {number(zone['relative_size'])}× "
             f"медианы уровней · видна {zone['observed_age_seconds']:.0f}с"
         )
-    if pulse and pulse.get("status") == "ready":
-        flow = pulse.get("flow")
+    if state.get("context_version") or (pulse and pulse.get("status") == "ready"):
+        flow = state.get("cross_venue") if state.get("context_version") else pulse.get("flow")
         if flow in {"aligned_buy", "aligned_sell"}:
             parts.append("HL и OKX: совпадает сторона потока · закрытая 1м")
         elif flow == "opposed":
@@ -128,12 +151,82 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
 
 
+def analytical_details(packet, state):
+    if not state.get("context_version"):
+        return []
+    lines = [
+        "<b>Контекст и своевременность</b>",
+        "Фаза 1м: " + PHASES.get(state.get("phase"), "не определена"),
+        "Фаза 5м: " + PHASES.get(state.get("phase5"), "не определена"),
+    ]
+    level = state.get("formation_strength")
+    if level is not None:
+        lines.append(
+            "Сила контекста: "
+            + {0: "не определена", 1: "фоновая", 2: "заметная", 3: "сильная", 4: "очень сильная"}.get(
+                level, "не определена"
+            )
+        )
+    for key, label, unit in (
+        ("context.phase.1m.distance_natr", "Пройдено от наблюдаемого начала", " ATR"),
+        ("context.phase.1m.retracement_natr", "Откат от наблюдаемого максимума", " ATR"),
+        ("context.1m.natr", "Обычная волатильность 1м", "%"),
+        ("context.1m.range_ratio", "Расширение диапазона", "× ATR"),
+        ("context.1m.activity_ratio", "Темп сделок в rolling-окне", "× базы"),
+        ("btc.relative_last_return_pp", "Отличие от BTC за закрытые 5м", " п.п."),
+        ("btc.correlation", "Корреляция с BTC на 36 окнах 5м", ""),
+        ("senior.15m.return_4", "Изменение за 4 закрытые свечи 15м", "%"),
+        ("context.1m.funding_rate", "Funding", " доля/час"),
+        ("context.1m.open_interest", "Открытый интерес", " USD"),
+    ):
+        v = value(packet, key)
+        if v is not None:
+            lines.append(label + ": " + number(v) + unit)
+    if state.get("wide_spread") is not None:
+        lines.append(
+            "Спред: " + ("высок относительно волатильности" if state["wide_spread"] else "ниже порога 0,25 NATR")
+        )
+    for days in (7, 30):
+        prefix = f"profile.1m.{days}d.trades"
+        ratio, samples = value(packet, prefix + ".current_ratio"), value(packet, prefix + ".samples")
+        if ratio is not None and samples is not None:
+            lines.append(f"Выборка {days}д: текущие сделки {number(ratio)}× медианы, {int(samples)} наблюдений")
+    zone = state.get("zone") or {}
+    if zone.get("distance_bps") is not None:
+        lines.append("Зона: расстояние " + number(zone["distance_bps"] / 100) + "% от середины спреда")
+    if zone.get("size_change") is not None:
+        lines.append("Изменение размера зоны: " + number(zone["size_change"], 8) + " базовых единиц")
+    if zone.get("size_to_observed_turnover") is not None:
+        lines.append("Размер зоны / наблюдаемый оборот ≤60с: " + number(zone["size_to_observed_turnover"]) + "×")
+    relation = state.get("cross_venue")
+    if relation in {"aligned_buy", "aligned_sell", "opposed", "neutral_or_mixed"}:
+        lines.append(
+            "HL/OKX, одна закрытая минута: "
+            + {
+                "aligned_buy": "покупки на обеих",
+                "aligned_sell": "продажи на обеих",
+                "opposed": "стороны расходятся",
+                "neutral_or_mixed": "единой стороны нет",
+            }[relation]
+        )
+    for venue in ("hyperliquid", "okx"):
+        count, ofi = value(packet, f"venue.{venue}.execution_count"), value(packet, f"venue.{venue}.ofi")
+        if count is not None and ofi is not None:
+            lines.append(f"{venue.upper()}: {int(count)} исполнений, покупки {(ofi + 1) * 50:.0f}% объёма")
+    missing = sum(f["quality"] != "ok" for f in packet["facts"] if f.get("calculation_version") == "scalper-context-v2")
+    if missing:
+        lines.append("Часть контекста недоступна или устарела; отсутствующие значения не заменены нулями.")
+    lines.append("Профили описывают наблюдавшуюся выборку, не доказанную сезонную редкость.")
+    return lines
+
+
 class TelegramUX:
     def __init__(self, service):
         self.service = service
         self.db = service.journal.db
         self.tiger = TigerBridge()
         self.watch_at = 0
+        self.quality = NotificationQuality(self.db)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS telegram_episodes(
                 episode TEXT PRIMARY KEY,symbol TEXT,baseline TEXT,generation INTEGER DEFAULT 0,last_at REAL);
@@ -191,6 +284,7 @@ class TelegramUX:
 
     def observe(self, now):
         service = self.service
+        self.quality.sample(service.context_packets, now)
         for packet in service.context_packets.values():
             if not packet_ready(packet, now):
                 continue
@@ -214,11 +308,18 @@ class TelegramUX:
             ).fetchone()
             if priority is None:
                 continue
+            blocked = admission(state, reason)
+            if blocked:
+                self.quality.record(packet, state, "blocked", blocked)
+                continue
             # A quiet large level alone is not a reason to interrupt the trader.
-            active = (state["ratio"] is not None and state["ratio"] >= 2) or (
-                state.get("flow") is not None and abs(state["flow"]) >= 0.6 and (state.get("count") or 0) >= 20
+            active = (
+                (state["ratio"] is not None and state["ratio"] >= 2)
+                or (state.get("rolling_activity") is not None and state["rolling_activity"] >= 2)
+                or (state.get("flow") is not None and abs(state["flow"]) >= 0.6 and (state.get("count") or 0) >= 20)
             )
             if not active:
+                self.quality.record(packet, state, "blocked", "activity_unconfirmed")
                 continue
             if previous is None:
                 # Losing and reacquiring attention does not make the same situation new.
@@ -242,11 +343,18 @@ class TelegramUX:
                     and baseline.get("ratio") is not None
                     and state["ratio"] >= max(3, baseline["ratio"] * 1.75)
                 )
-                expanded = state["scale"] == "5m" and baseline.get("scale") != "5m"
+                expanded = (
+                    state["scale"] == "5m"
+                    and baseline.get("scale") != "5m"
+                    and (not state.get("context_version") or state.get("phase5") == "confirmed")
+                )
+                confirmed = reason == "formation_confirmed" and baseline.get("phase") != "confirmed"
                 stronger_zone = bool(
                     zone and old and zone["id"] == old["id"] and zone["relative_size"] >= old["relative_size"] * 1.75
                 )
-                if now - previous["last_at"] < 120 or not (new_zone or stronger or expanded or stronger_zone):
+                if now - previous["last_at"] < 120 or not (
+                    new_zone or stronger or expanded or stronger_zone or confirmed
+                ):
                     continue
                 kind, reason = "strengthening", "new_level" if new_zone else "strengthened"
                 generation += 1
@@ -276,6 +384,7 @@ class TelegramUX:
                         reply_markup=self.markup(card, packet, now + 120),
                     )
                     self.audit(packet, reason, "queued", state)
+                    self.quality.record(packet, state, "queued", reason, card=card)
                 self.db.execute(
                     "INSERT OR REPLACE INTO telegram_episodes VALUES(?,?,?,?,?)",
                     (packet["episode_id"], packet["symbol"], json.dumps(state), generation, now),
@@ -309,6 +418,12 @@ class TelegramUX:
                 stage = {"focus": "в фокусе", "probe": "проверяем", "cooling": "затухает"}.get(
                     row["state"], "наблюдение"
                 )
+                if ready:
+                    phase = analytical_state(packet)
+                    if phase.get("phase") in PHASES:
+                        stage = PHASES[phase["phase"]]
+                    if phase.get("wide_spread"):
+                        stage += " · широкий спред"
                 lines.append(
                     f"<b>{html.escape(symbol)}</b> · {stage if ready else 'прогрев/нет свежих данных'} · {why}"
                 )
@@ -370,6 +485,7 @@ class TelegramUX:
                 if measurement is not None:
                     lines.append(label + ": " + number(measurement, 8 if key == "book.midpoint" else 2))
             lines.append("Масштаб: " + scale(packet, current))
+            lines.extend(analytical_details(packet, current))
             lines.extend(["", "<b>Сценарии наблюдения · гипотезы</b>", *[html.escape(s) for s in scenarios(current)]])
         hypotheses = [
             c for c in result.get("claims", []) if c["section"] == "interpretation" and c["status"] == "hypothesis"
@@ -425,6 +541,12 @@ class TelegramUX:
             "AND status='sent' AND expires_at BETWEEN ? AND ?",
             (now - 86400, now + 120),
         ).fetchone()[0]
+        observations = self.quality.report(now)["outcomes"][0]
+        followup = (
+            (f"\nПосле отбора, 1м: наблюдалось {observations['observed']}, нет данных {observations['missing']}.")
+            if observations["observed"] or observations["missing"]
+            else ""
+        )
         return (
             "<b>Скринер · последние 24 часа</b>\n"
             f"Отобрано событий: {events[0]} · эпизодов: {events[1]}\n"
@@ -434,6 +556,7 @@ class TelegramUX:
                 if self.analytics_chat()
                 else "Аналитика: канал пока не подключён; разборы сохраняются в проекте."
             )
+            + followup
             + "\nЭто статистика наблюдения и доставки, не торговых результатов."
         )
 
@@ -495,6 +618,9 @@ class TelegramUX:
                         "",
                         "<b>История наблюдений</b>",
                     ]
+                    details = analytical_details(packet, state)
+                    if details:
+                        lines[2:2] = [*details, ""]
                     if state.get("ratio") is not None:
                         lines.insert(
                             2, "Норма сделок: медиана 14 предыдущих полных минут; статистическая редкость не оценена."

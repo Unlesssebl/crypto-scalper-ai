@@ -1,4 +1,5 @@
 """Instrument profiles from regularly sampled, quality-checked market windows."""
+
 import math
 import sqlite3
 from collections import defaultdict
@@ -48,6 +49,11 @@ def calculate_profiles(path, now, symbols):
             groups[row[0], row[1]].append(row[2:])
     profiles = {}
     for key, rows in groups.items():
+        seconds = {"1m": 60, "5m": 300}.get(key[1], 300)
+        # Exclude any historical rolling sample overlapping the current interval.
+        rows = [row for row in rows if row[0] <= now - seconds]
+        if not rows:
+            continue
         periods = {}
         for days in PROFILE_DAYS:
             recent = [row for row in rows if row[0] >= now - days * DAY]
@@ -61,7 +67,12 @@ def calculate_profiles(path, now, symbols):
                         "p90": values[math.ceil(0.9 * len(values)) - 1] if len(values) >= MIN_SAMPLES else None,
                     }
             periods[days] = {"windows": len(recent), "metrics": metrics}
-        profiles[key] = {"updated_at": max(row[0] for row in rows), "periods": periods}
+        profiles[key] = {
+            "updated_at": max(row[0] for row in rows),
+            "calculated_at": now,
+            "baseline_policy": "strictly_prior_rolling_intervals.v2",
+            "periods": periods,
+        }
     return profiles
 
 

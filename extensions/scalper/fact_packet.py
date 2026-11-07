@@ -42,6 +42,17 @@ def verify_packet(packet):
         stamp = fact["observed_at"]
         if stamp is not None and (type(stamp) not in (int, float) or not math.isfinite(stamp)):
             raise ValueError("Invalid fact timestamp")
+    if packet.get("context_version"):
+        if packet["context_version"] != "scalper-context-v2":
+            raise ValueError("Unsupported analytical context")
+        plan = packet.get("scenarios") or {}
+        by_id = {f["id"]: f for f in packet["facts"]}
+        if any(ref not in by_id for ref in plan.get("references", [])):
+            raise ValueError("Scenario references an absent fact")
+        if plan.get("kind") in {"observed_zone", "observed_impulse"}:
+            anchor = by_id.get(plan.get("anchor_ref"), {})
+            if anchor.get("quality") != "ok" or plan.get("anchor") != anchor.get("value"):
+                raise ValueError("Scenario anchor differs from its fact")
     return packet
 
 
