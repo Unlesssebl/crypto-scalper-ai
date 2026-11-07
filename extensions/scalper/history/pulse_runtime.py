@@ -8,6 +8,7 @@ import time
 import aiohttp
 
 from hyperdata_terminal.market_pulse.control import desired_symbols
+from hyperdata_terminal.runtime_mode import UNIFIED
 
 from .runtime import Observation, history_dir
 
@@ -132,6 +133,7 @@ class PulseObservation(Observation):
         return dict(
             enabled=True,
             context_only=True,
+            runtime_mode=UNIFIED,
             policy_version=4,
             plan=self.plan,
             active=active,

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from extensions.scalper.relative_attention import Attention, AttentionPolicy
+from hyperdata_terminal.runtime_mode import LEGACY
 
 from .archive import Archive
 from .facts import Facts
@@ -120,6 +121,7 @@ class Observation:
             "subscription_error": self.subscription_error,
             "last_scout_at": self.last_scout,
             "context_only": True,
+            "runtime_mode": LEGACY,
         }
 
     async def close(self):

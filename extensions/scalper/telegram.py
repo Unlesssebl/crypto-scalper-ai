@@ -517,7 +517,9 @@ async def listen_reports(session, service):
                 if not service.telegram_ux.operator_allowed(update.get("message", {}).get("from", {}).get("id")):
                     manual = None
             if manual is not None:
-                if getattr(service.hub, "attention", {}).get("context_only"):
+                if not getattr(service, "legacy_ai_enabled", True) or getattr(
+                    service.hub, "attention", {}
+                ).get("context_only"):
                     response = await service.review_context(manual[0])
                     if getattr(service, "telegram_ux", None):
                         published = service.telegram_ux.publish_analysis(response) if response.get("packet") else False
@@ -533,7 +535,9 @@ async def listen_reports(session, service):
                 else:
                     await alerts.send_telegram(service.request_analysis(*manual, time.time()))
             if command is not None:
-                if getattr(service.hub, "attention", {}).get("context_only"):
+                if not getattr(service, "legacy_ai_enabled", True) or getattr(
+                    service.hub, "attention", {}
+                ).get("context_only"):
                     if getattr(service, "telegram_ux", None):
                         await alerts.send_telegram(service.telegram_ux.report(time.time()))
                         continue

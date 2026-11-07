@@ -97,6 +97,8 @@ async def screener(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "mode": hub.status.mode,
+            "runtime_mode": service.runtime_mode,
+            "runtime_error": service.runtime_diagnostic(),
             "market": hub.status.market_data,
             "gemini": "configured" if service.gemini.key else "disabled",
             "ai_provider": service.gemini.provider,
@@ -202,17 +204,21 @@ async def review_context(request: web.Request) -> web.Response:
 
 async def healthz(request: web.Request) -> web.Response:
     hub: RemoteHub = request.app["hub"]
+    service = request.app.get("service")
     ready = bool(hub.ready)
     healthy = ready and hub.last_error is None and hub.status.market_data in ("connected", "synthetic")
     attention = getattr(hub, "attention", {})
     observation_error = attention.get("subscription_error") or attention.get("archive", {}).get("error")
-    healthy = healthy and not observation_error
+    runtime_error = service.runtime_diagnostic() if service is not None else None
+    healthy = healthy and not observation_error and not runtime_error
     return web.json_response(
         {
             "ready": ready,
             "healthy": healthy,
             "last_error": hub.last_error,
             "mode": hub.status.mode,
+            "runtime_mode": getattr(service, "runtime_mode", None),
+            "runtime_error": runtime_error,
             "market": hub.status.market_data,
             "warnings": hub.warnings,
             "observation_error": observation_error,
@@ -280,6 +286,7 @@ async def run(args: argparse.Namespace) -> None:
                 )
             )
             service = Screener(hub, journal, gemini, notify, recorder=recorder, pulse=pulse)
+            service.validate_runtime()
             if pulse is not None:
                 tasks.append(asyncio.create_task(pulse.run(), name="market-pulse-context"))
             if service.ai_routes:

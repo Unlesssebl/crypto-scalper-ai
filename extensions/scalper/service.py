@@ -12,6 +12,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
+from hyperdata_terminal.runtime_mode import (
+    LEGACY,
+    RuntimeModeError,
+    compatibility_error,
+    runtime_mode,
+)
 from hyperdata_terminal.utils.helpers import format_price, format_usd
 
 from .activity import (
@@ -387,6 +393,11 @@ class Screener:
         self.hub, self.journal, self.gemini, self.notify = hub, journal, gemini, notify
         self.recorder = recorder
         self.pulse = pulse
+        # The mode is decided by the process environment, never by the
+        # currently reachable native API. A degraded native feed must not
+        # reopen the legacy directional path.
+        self.runtime_mode = runtime_mode()
+        self.legacy_ai_enabled = self.runtime_mode == LEGACY
         self.attention = Attention(
             journal if hasattr(journal, "db") else None,
             slots=int(os.getenv("SCALPER_ATTENTION_SLOTS", "20")),
@@ -439,6 +450,15 @@ class Screener:
                 from .telegram_ux import TelegramUX
 
                 self.telegram_ux = TelegramUX(self)
+
+    def runtime_diagnostic(self):
+        return compatibility_error(self.runtime_mode, getattr(self.hub, "attention", {}))
+
+    def validate_runtime(self):
+        """Fail startup explicitly instead of silently running legacy AI."""
+        error = self.runtime_diagnostic()
+        if error:
+            raise RuntimeModeError(error)
 
     def scan(self, now):
         if self.pulse is not None and hasattr(self.pulse, "desired_plan"):
@@ -852,7 +872,7 @@ class Screener:
             decision = self.journal.request_block(key[0], now, self.policy) or "queued"
         if gate != "ready":
             decision = gate
-        if getattr(self.hub, "attention", {}).get("context_only"):
+        if not getattr(self, "legacy_ai_enabled", True) or getattr(self.hub, "attention", {}).get("context_only"):
             decision = "context_only"
         if decision == "queued":
             if any(pending[0] == key[0] for pending in self.pending):
@@ -990,7 +1010,7 @@ class Screener:
     def request_analysis(self, symbol, window, now):
         """Manual requests bypass significance, but never data quality or budget."""
         attention = getattr(self.hub, "attention", {})
-        if attention.get("context_only"):
+        if not getattr(self, "legacy_ai_enabled", True) or attention.get("context_only"):
             card = next(
                 (r["facts"] for r in attention.get("active", []) if r["symbol"].casefold() == symbol.casefold()), None
             )
@@ -1058,7 +1078,9 @@ class Screener:
             candidate_id = event["candidate_id"]
             try:
                 now = time.time()
-                if getattr(self.hub, "attention", {}).get("context_only"):
+                if not getattr(self, "legacy_ai_enabled", True) or getattr(
+                    self.hub, "attention", {}
+                ).get("context_only"):
                     self.skip_ai(candidate_id, "context_only", now)
                     continue
                 row = self.rows.get(candidate)
@@ -1195,6 +1217,8 @@ class Screener:
         return bool(event.get("anomalies")) or (reversal and price_agrees)
 
     def enqueue_facts(self, key, snapshot, native, event, row, now):
+        if not getattr(self, "legacy_ai_enabled", True):
+            return
         if (
             (event["strength"]["rank"] < max(3, alert_min_rank()) and event.get("opportunity_kind") != "early")
             or self.notifications.full()
