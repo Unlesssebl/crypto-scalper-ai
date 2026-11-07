@@ -369,9 +369,13 @@ async def test_one_plan_updates_native_l2_and_flow_cursor_skips_duplicates(tmp_p
     observation = PulseObservation(hub, tmp_path)
     now = time.time()
     observation.plan = dict(
+        schema_version="attention.v1",
+        generated_at_ms=int(now * 1000),
         expires_at_ms=int((now + 60) * 1000),
+        selected=["SMALL"],
         detail=["SMALL"],
         controls=[],
+        policy_version=4,
         active=[dict(symbol="SMALL", state="focus", reason="relative", assigned_at=now - 10, since=now - 10, score=8)],
     )
     row = dict(

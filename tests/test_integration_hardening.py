@@ -92,8 +92,13 @@ async def test_recovered_executions_never_become_live_triggers(monkeypatch, tmp_
     observation = PulseObservation(hub, tmp_path)
     now = time.time()
     observation.plan = dict(
+        schema_version="attention.v1",
+        generated_at_ms=int(now * 1000),
         expires_at_ms=int((now + 60) * 1000),
+        selected=["SMALL"],
         detail=["SMALL"],
+        controls=[],
+        policy_version=4,
         active=[dict(symbol="SMALL", state="focus", assigned_at=now - 10)],
     )
 

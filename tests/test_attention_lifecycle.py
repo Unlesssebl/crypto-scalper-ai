@@ -54,6 +54,22 @@ async def idle_events(path, **params):
 
 
 @pytest.mark.asyncio
+async def test_malformed_plan_is_rejected_without_crashing(monkeypatch, tmp_path):
+    observer, _hub = await make_observer(monkeypatch, tmp_path)
+
+    async def malformed(path, **params):
+        return {"plan": {"schema_version": "attention.v1", "detail": "not-a-list", "active": []}}
+
+    observer.get = malformed
+    observer.last_control = 0
+    assert await observer._refresh_plan(time.time()) is False
+
+    assert observer.plan is None
+    assert observer.plan_error and "invalid attention" in observer.plan_error
+    await observer.close()
+
+
+@pytest.mark.asyncio
 async def test_attention_outage_keeps_the_last_still_valid_plan(monkeypatch, tmp_path):
     observer, hub = await make_observer(monkeypatch, tmp_path)
     now = time.time()

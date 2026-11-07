@@ -7,7 +7,7 @@ import time
 
 import aiohttp
 
-from hyperdata_terminal.market_pulse.control import desired_symbols
+from hyperdata_terminal.market_pulse.control import desired_symbols, validate_plan
 from hyperdata_terminal.runtime_mode import UNIFIED
 
 from .runtime import Observation, history_dir
@@ -64,6 +64,10 @@ class PulseObservation(Observation):
             plan = body.get("plan") if isinstance(body, dict) else None
             if plan is not None and not isinstance(plan, dict):
                 raise ValueError("attention plan is not an object")
+            if plan is not None:
+                # The screener owns plan authoring but still validates the
+                # published contract before applying it to native sockets.
+                validate_plan(plan, int(now * 1000))
         except Exception as exc:
             message = f"{type(exc).__name__}: {str(exc)[:120]}"
             if self.plan_error is None and self.lease_active(now):
