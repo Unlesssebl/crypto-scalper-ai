@@ -1,10 +1,13 @@
 """
-Alert system — sends notifications for significant market events.
-Supports Telegram and Discord webhooks.
+Notification transport — delivers messages to Telegram and Discord webhooks.
+
+Automatic event alerts (liquidations, smart money, HLP Z-score) are not sent:
+the screener owns those decisions and posts through the same transport.
 
 Usage:
     alerts = AlertManager()
-    alerts.attach(hub)  # Automatically monitors for alert conditions
+    await alerts.start()
+    await alerts.send_telegram("...")
 
 Environment variables:
     TELEGRAM_BOT_TOKEN - Telegram bot token
@@ -17,7 +20,6 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
 
 import aiohttp
 from dotenv import load_dotenv
@@ -27,45 +29,17 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class AlertConfig:
-    """Thresholds for triggering alerts."""
-
-    min_liquidation_usd: float = 500_000  # Alert on liqs > $500K
-    min_whale_position_usd: float = 5_000_000  # Alert on whale positions > $5M
-    extreme_funding_annual: float = 1.0  # Alert on >100% annualized funding
-    liquidation_cascade_count: int = 50  # Alert if >50 liqs in 5 minutes
-    liquidation_cascade_volume_usd: float = 500_000  # Alert if >$500K volume in 5 minutes
-    liquidation_cascade_window: int = 300  # 5 minutes
-    smart_money_max_rank: int = 5  # Alert on top N smart money wallets
-    hlp_zscore_threshold: float = 2.0  # Alert on HLP Z-score extremes
-    cooldown_seconds: float = 300.0  # 5 min cooldown between similar alerts (was 60s — too noisy)
-
-
 class AlertManager:
-    INTEL_INTERVAL = 4 * 3600  # 4 hours
-
-    def __init__(self, config: AlertConfig | None = None):
-        self.config = config or AlertConfig()
+    def __init__(self):
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         self.discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
         self._session: aiohttp.ClientSession | None = None
-        self._last_alert_times: dict[str, float] = {}
-        self._recent_liq_count = 0
-        self._recent_liq_volume = 0.0
-        self._recent_liq_long_count = 0
-        self._recent_liq_long_volume = 0.0
-        self._recent_liq_short_count = 0
-        self._recent_liq_short_volume = 0.0
-        self._recent_liq_top_event = None  # largest single liq in the window
-        self._recent_liq_reset = time.time()
         self.enabled = bool(self.telegram_token and self.telegram_chat_id) or bool(self.discord_webhook)
         self.alerts_sent = 0
 
-        # Market intelligence summaries
+        # Hub reference for on-demand market intelligence reports.
         self._hub = None
-        self._intel_task: asyncio.Task | None = None
 
         if not self.enabled:
             logger.info("AlertManager: No TELEGRAM_BOT_TOKEN/CHAT_ID or DISCORD_WEBHOOK_URL set. Alerts disabled.")
@@ -73,125 +47,16 @@ class AlertManager:
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
-        if self._hub:
-            self._intel_task = asyncio.create_task(self._intel_loop())
 
     async def stop(self) -> None:
-        if self._intel_task:
-            self._intel_task.cancel()
-            try:
-                await self._intel_task
-            except asyncio.CancelledError:
-                pass
-        self._intel_task = None
         if self._session and not self._session.closed:
             await self._session.close()
 
     def attach(self, hub) -> None:
-        """Attach to hub event bus."""
+        """Attach the hub used by on-demand market intelligence reports."""
         self._hub = hub
-        hub.on_liquidation(self._check_liquidation)
-        hub.on_signal(self._check_smart_money)
-        # Start loops if we're already running (attach called after start)
-        if self._session and not self._intel_task:
-            self._intel_task = asyncio.create_task(self._intel_loop())
-
-    # Per-key cooldown overrides (seconds)
-    _COOLDOWN_OVERRIDES = {
-        "cascade_alert": 600,  # 10 minutes between cascade alerts
-    }
-
-    def _should_alert(self, key: str) -> bool:
-        """Check cooldown for a specific alert type."""
-        now = time.time()
-        last = self._last_alert_times.get(key, 0)
-        cooldown = self._COOLDOWN_OVERRIDES.get(key, self.config.cooldown_seconds)
-        if now - last < cooldown:
-            return False
-        self._last_alert_times[key] = now
-        return True
-
-    def _reset_cascade_window(self) -> None:
-        """Reset all cascade tracking counters."""
-        self._recent_liq_count = 0
-        self._recent_liq_volume = 0.0
-        self._recent_liq_long_count = 0
-        self._recent_liq_long_volume = 0.0
-        self._recent_liq_short_count = 0
-        self._recent_liq_short_volume = 0.0
-        self._recent_liq_top_event = None
-        self._recent_liq_reset = time.time()
-
-    def _check_liquidation(self, event) -> None:
-        """Check if a liquidation event warrants an alert."""
-        # Track cascade window — reset if window expired
-        now = time.time()
-        if now - self._recent_liq_reset > self.config.liquidation_cascade_window:
-            self._reset_cascade_window()
-
-        # Accumulate cascade stats
-        self._recent_liq_count += 1
-        self._recent_liq_volume += event.size_usd
-
-        if event.side == "long":
-            self._recent_liq_long_count += 1
-            self._recent_liq_long_volume += event.size_usd
-        else:
-            self._recent_liq_short_count += 1
-            self._recent_liq_short_volume += event.size_usd
-
-        # Track top liquidation in the window
-        if self._recent_liq_top_event is None or event.size_usd > self._recent_liq_top_event.size_usd:
-            self._recent_liq_top_event = event
-
-        # Large single liquidation — DISABLED (too noisy, use trade alerts instead)
-        # if event.size_usd >= self.config.min_liquidation_usd:
-        #     if self._should_alert(f"large_liq_{event.symbol}"):
-        #         ...
-        pass
-
-        # Liquidation cascade — trigger on count OR volume threshold
-        cascade_triggered = (
-            self._recent_liq_count >= self.config.liquidation_cascade_count
-            or self._recent_liq_volume >= self.config.liquidation_cascade_volume_usd
-        )
-        # Liquidation cascade — DISABLED (too noisy, use trade alerts instead)
-        # if cascade_triggered:
-        #     ...
-        if cascade_triggered:
-            self._reset_cascade_window()  # still reset the window, just don't send
-
-    def _check_smart_money(self, signal) -> None:
-        """Check if a smart money signal warrants an alert (top-5 ranked, follow type)."""
-        if signal.wallet_rank > self.config.smart_money_max_rank or signal.wallet_rank <= 0:
-            return
-        if signal.signal_type != "follow":
-            return
-        if not self._should_alert(f"smart_money_{signal.address[:10]}"):
-            return
-
-        # Smart money alerts — DISABLED (use trade alerts instead)
-        pass
-
-    async def _check_hlp_zscore(self, hlp_stats: dict) -> None:
-        """Check if HLP Z-score is at an extreme (>2.0 or <-2.0)."""
-        zscore = hlp_stats.get("delta_zscore", 0)
-        if abs(zscore) <= self.config.hlp_zscore_threshold:
-            return
-        if not self._should_alert("hlp_zscore"):
-            return
-
-        # HLP Z-score alerts — DISABLED (too noisy)
-        pass
 
     # ── Market Intelligence ─────────────────────────────────────────
-
-    async def _intel_loop(self) -> None:
-        """Market intelligence summary — DISABLED (use daily trade summary instead)."""
-        while True:
-            await asyncio.sleep(self.INTEL_INTERVAL)
-            # Disabled — trade alerts handle notifications now
-            pass
 
     async def send_intel_now(self) -> bool:
         """Send an immediate market intelligence report (for testing)."""
