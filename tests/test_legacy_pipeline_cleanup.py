@@ -104,6 +104,16 @@ def test_unified_detection_creates_no_legacy_candidate_or_job(journal, monkeypat
     assert calls == []
 
 
+def test_unified_queue_hypothesis_is_inert(journal, monkeypatch):
+    monkeypatch.setenv("PULSE_UNIFIED", "1")
+    service = make_service(journal, [])
+
+    service.notify = True
+    service.queue_hypothesis("old")
+
+    assert service.notifications.empty()
+
+
 def test_unified_recovery_retires_old_pending_work_without_replaying_it(journal, monkeypatch):
     monkeypatch.setenv("PULSE_UNIFIED", "1")
     now = time.time()

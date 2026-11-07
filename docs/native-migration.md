@@ -173,8 +173,9 @@ API. Это осознанный компромисс: горячее перер
 3. Проверить 24-часовой soak: нет `429`, нет необработанных исключений,
    рост RSS ≤ 50 МБ.
 
-Legacy-режим (`ScalperHub`, `ScalperAPI`, `apps/scalper_web`, `--legacy`)
-удалён — отдельного шага для этого больше не нужно.
+Старый legacy web-стек (`ScalperHub`, `ScalperAPI`, `apps/scalper_web`, `--legacy`)
+удалён. Явный legacy-режим совместимости (`--without-pulse` / `PULSE_UNIFIED=0`)
+остаётся для проверки старых сценариев.
 
 ## Откат
 

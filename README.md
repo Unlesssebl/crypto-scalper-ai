@@ -219,11 +219,18 @@ The hub owns every data component and its lifecycle; dashboards, API, MCP server
 
 ## Crypto Scalper AI (this fork)
 
-`.\start.ps1` starts the native API (`8420`) and the external screener (`8421`). The screener runs the independent AI analysis over `/v1/snapshot`, serves `/scalper`, and can deliver findings to Telegram (`--notify`).
+`.\start.ps1` starts the unified runtime: native API (`8420`), screener (`8421`),
+Market Pulse (`8431`) and PostgreSQL. The screener owns the attention plan, uses
+selective context AI, and delivers Telegram cards through one persistent
+`CardOutbox`. `--without-pulse` is the explicit legacy compatibility mode; only
+then does the launcher start the old directional AI pipeline.
+
+Manual unified run (both processes need `PULSE_UNIFIED=1`; omit it for the explicit
+legacy mode):
 
 ```bash
-uv run hyperdata api --port 8420
-uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --tui --notify
+PULSE_UNIFIED=1 PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata api --port 8420
+PULSE_UNIFIED=1 PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --tui --notify
 ```
 
 Record scans and compare two runs for signal regressions:
@@ -235,12 +242,13 @@ uv run hyperdata-parity baseline.jsonl candidate.jsonl --report parity-report.js
 
 Details: [docs/crypto-scalper.md](docs/crypto-scalper.md), [docs/native-migration.md](docs/native-migration.md), [docs/operations.md](docs/operations.md).
 
-### Market Pulse (P0–P2)
+### Market Pulse
 
-A separate durable BTC/XRP trade path now exists alongside the live screener:
-two isolated collectors, raw archives, PostgreSQL-backed idempotent ingest,
-UTC-minute windows with late-data revisions, gap/recovery states, and a
-read-only API for future screener integration. See
+In the unified runtime, Market Pulse owns the durable execution tape
+(Hyperliquid + OKX): isolated collectors, raw archives, PostgreSQL-backed
+idempotent ingest, UTC-minute windows with late-data revisions, gap/recovery
+states, and the attention-plan API. The native hub consumes that tape; the
+screener authors the plan. It is not a separate parallel trading path. See
 [docs/market-pulse.md](docs/market-pulse.md) and the deployment bundle in
 `deploy/market-pulse/`.
 

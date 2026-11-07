@@ -1250,7 +1250,7 @@ class Screener:
             self.notifications.put_nowait(("facts", key))
 
     def queue_hypothesis(self, key):
-        if not self.notify:
+        if not self.legacy_ai_enabled or not self.notify:
             return
         fact = self.journal.fact_message(key)
         if (

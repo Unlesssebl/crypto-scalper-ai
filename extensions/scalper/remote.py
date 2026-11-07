@@ -20,6 +20,7 @@ from hyperdata_terminal.data_layer.alerts import AlertManager
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookLevel, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import CVDSnapshot, Trade
+from hyperdata_terminal.runtime_mode import UNIFIED, runtime_mode
 
 LOG = logging.getLogger(__name__)
 
@@ -137,6 +138,13 @@ class RemoteHub:
                 if exc.status != 404:
                     raise
                 self.attention = {"enabled": False}
+            if runtime_mode() == UNIFIED:
+                # A legacy or disabled native attention report means the two
+                # processes disagree; never fall back to a Top-20 legacy scan.
+                if self.attention.get("runtime_mode") != UNIFIED:
+                    raise RuntimeError("native attention is not in unified mode")
+                if not self.attention.get("enabled"):
+                    raise RuntimeError("native attention is disabled in unified mode")
             selective = self.attention.get("enabled", False)
             market = await self._get("/v1/market", limit=1000)
             overview = market.get("assets", [])

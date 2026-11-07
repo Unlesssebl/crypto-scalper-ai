@@ -155,6 +155,7 @@ async def test_unified_worker_discards_queued_legacy_event(journal, monkeypatch)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert calls == []
+    assert service.notifications.empty()
     assert journal.ai_reason("legacy") == "context_only"
 
 

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, crypto-scalper]
   pull_request:
-    branches: [main]
+    branches: [main, crypto-scalper]
 
 jobs:
   test:
@@ -50,7 +50,7 @@ jobs:
         run: pip check
 
       - name: Lint
-        run: ruff check hyperdata_terminal/ tests/ run_api.py run_dashboard.py
+        run: ruff check hyperdata_terminal/ extensions/ apps/ tests/ run_api.py run_dashboard.py
 
       - name: Dependency vulnerability audit
         # Blocking: a known CVE in a pinned runtime dep fails CI. Dependabot
