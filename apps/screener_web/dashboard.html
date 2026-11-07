@@ -665,6 +665,12 @@ function renderConsistency(context) {
     if (context.routes.free_error) node("p", "Бесплатный маршрут: " + context.routes.free_error, root);
   }
   const selections = node("details", null, root);
+  if (context.telegram_ux?.enabled) {
+    const ux = context.telegram_ux;
+    node("p", "Telegram: новый интерфейс · аналитический канал " +
+      (ux.analytics_configured ? "настроен" : "не настроен; публикации ожидают назначения") +
+      " · TigerTrade: " + ux.tiger_exchange + ", группа " + (ux.tiger_group ?? "не настроена"), root);
+  }
   node("summary", "Причины отбора и пропуска за 24 часа", selections);
   for (const decision of automatic.decisions ?? []) node("p", selectionReason(decision.reason) +
     " · " + decision.status + " · ситуаций " + decision.episodes + " · проверок " + decision.checks, selections);

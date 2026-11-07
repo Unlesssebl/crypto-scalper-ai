@@ -2,6 +2,8 @@
 
 import asyncio
 import hashlib
+import json
+import os
 import time
 
 
@@ -14,27 +16,60 @@ class CardOutbox:
             next_at REAL NOT NULL,expires_at REAL NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS telegram_pause(id INTEGER PRIMARY KEY CHECK(id=1),until_at REAL NOT NULL);
         """)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(episode_cards)")}
+        for name, definition in (
+            ("chat_id", "TEXT"),
+            ("destination", "TEXT"),
+            ("reply_markup", "TEXT"),
+            ("silent", "INTEGER DEFAULT 0"),
+        ):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE episode_cards ADD COLUMN {name} {definition}")
         with self.db:
             self.db.execute(
                 "UPDATE episode_cards SET status=CASE WHEN message_id IS NULL THEN 'unknown' "
                 "ELSE 'pending' END WHERE status='sending'"
             )
 
-    def enqueue(self, episode, text, html, expires_at):
-        digest = hashlib.sha256((text + html).encode()).hexdigest()
+    def enqueue(
+        self, episode, text, html, expires_at, *, chat_id=None, destination=None, reply_markup=None, silent=False
+    ):
+        markup = json.dumps(reply_markup, ensure_ascii=False, sort_keys=True) if reply_markup is not None else None
+        digest = hashlib.sha256((text + html + str(chat_id) + str(markup) + str(silent)).encode()).hexdigest()
+        status = "blocked_destination" if destination == "analytics" and not chat_id else "pending"
         with self.db:
+            old = self.db.execute(
+                "SELECT chat_id,message_id FROM episode_cards WHERE episode_id=?", (episode,)
+            ).fetchone()
+            if old and old["message_id"] is not None and old["chat_id"] != chat_id:
+                raise ValueError("A delivered message cannot move between chats")
             self.db.execute(
                 """INSERT INTO episode_cards(episode_id,text,html,hash,status,next_at,expires_at)
-                VALUES(?,?,?,?,'pending',0,?) ON CONFLICT(episode_id) DO UPDATE SET
+                VALUES(?,?,?,?,?,0,?) ON CONFLICT(episode_id) DO UPDATE SET
                 text=excluded.text,html=excluded.html,hash=excluded.hash,expires_at=excluded.expires_at,
                 status=CASE WHEN episode_cards.status='unknown' AND episode_cards.message_id IS NULL
-                       THEN 'unknown' ELSE 'pending' END,
+                       THEN 'unknown' ELSE excluded.status END,
                 attempts=0 WHERE episode_cards.hash<>excluded.hash""",
-                (episode, text, html, digest, expires_at),
+                (episode, text, html, digest, status, expires_at),
+            )
+            self.db.execute(
+                "UPDATE episode_cards SET chat_id=?,destination=?,reply_markup=?,silent=? WHERE episode_id=?",
+                (chat_id, destination, markup, int(silent), episode),
             )
 
     async def once(self, now=None):
         now = time.time() if now is None else now
+        analytics = os.getenv("SCALPER_ANALYTICS_CHAT_ID", "").strip()
+        with self.db:
+            self.db.execute(
+                "UPDATE episode_cards SET status='expired' WHERE status='blocked_destination' AND expires_at<?", (now,)
+            )
+            if analytics and analytics != str(self.alerts.telegram_chat_id):
+                self.db.execute(
+                    "UPDATE episode_cards SET chat_id=?,status='pending' "
+                    "WHERE status='blocked_destination' AND expires_at>=?",
+                    (analytics, now),
+                )
         pause = self.db.execute("SELECT until_at FROM telegram_pause WHERE id=1").fetchone()
         if pause and pause[0] > now:
             return
@@ -48,6 +83,11 @@ class CardOutbox:
         if not row:
             return
         card = dict(row)
+        options = {}
+        if card["chat_id"] is not None:
+            options["chat_id"] = card["chat_id"]
+        if card["reply_markup"] is not None:
+            options["reply_markup"] = json.loads(card["reply_markup"])
         with self.db:
             self.db.execute(
                 "UPDATE episode_cards SET status='sending',attempts=attempts+1 WHERE episode_id=?",
@@ -55,7 +95,13 @@ class CardOutbox:
             )
         try:
             if card["message_id"] is None:
-                result = await self.alerts.send_telegram(card["text"], rich_html=card["html"], return_message=True)
+                result = await self.alerts.send_telegram(
+                    card["text"],
+                    rich_html=card["html"],
+                    return_message=True,
+                    **options,
+                    **({"silent": True} if card["silent"] else {}),
+                )
                 if result:
                     with self.db:
                         self.db.execute(
@@ -64,7 +110,7 @@ class CardOutbox:
                         )
             else:
                 result = await self.alerts.edit_telegram(
-                    card["message_id"], card["text"], rich_html=card["html"] if card["rich"] else None
+                    card["message_id"], card["text"], rich_html=card["html"] if card["rich"] else None, **options
                 )
             detail = dict(getattr(self.alerts, "last_telegram_result", {}))
         except Exception as exc:

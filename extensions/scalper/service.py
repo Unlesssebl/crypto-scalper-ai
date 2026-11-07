@@ -424,6 +424,7 @@ class Screener:
         self.context_auto_error = None
         self.outbox = None
         self.ai_routes = None
+        self.telegram_ux = None
         if os.getenv("PULSE_UNIFIED", "0") == "1" and self.consistency:
             from dataclasses import replace
 
@@ -434,6 +435,10 @@ class Screener:
 
             self.outbox = CardOutbox(journal, hub.alerts)
             self.policy = replace(self.policy, hourly_limit=40, experiments=False)
+            if os.getenv("SCALPER_TELEGRAM_UX", "0") == "1":
+                from .telegram_ux import TelegramUX
+
+                self.telegram_ux = TelegramUX(self)
 
     def scan(self, now):
         if self.pulse is not None and hasattr(self.pulse, "desired_plan"):
@@ -538,6 +543,8 @@ class Screener:
         if self.context_memory:
             for packet in self.context_packets.values():
                 self.context_memory.observe(packet)
+        if self.telegram_ux and self.notify:
+            self.telegram_ux.observe(now)
 
     def refresh_context_packets(self, now):
         attention = getattr(self.hub, "attention", {})
@@ -571,6 +578,7 @@ class Screener:
                 **(self.context_memory.report(now) if self.context_memory else {}),
             ),
             routes=self.ai_routes.summary(now) if self.ai_routes else None,
+            telegram_ux=self.telegram_ux.status() if self.telegram_ux else dict(enabled=False),
             delivery=self.outbox.summary() if self.outbox else None,
             packets=[
                 dict(
@@ -737,7 +745,7 @@ class Screener:
             selected = enrich(packet, memory["samples"], reason)
             self.context_cache[selected["packet_id"]] = selected
             self.context_memory.record(selected, reason, "queued", state)
-            if self.outbox and self.notify:
+            if self.outbox and self.notify and not self.telegram_ux:
                 self.queue_context_card(dict(status="pending", packet=selected))
             result = await self.review_context(
                 symbol,
@@ -777,6 +785,8 @@ class Screener:
         return outcomes
 
     def queue_context_card(self, result):
+        if self.telegram_ux:
+            return self.telegram_ux.publish_analysis(result)
         from .telegram import context_review_text
 
         packet = result["packet"]

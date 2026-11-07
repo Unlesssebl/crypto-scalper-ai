@@ -492,7 +492,7 @@ async def listen_reports(session, service):
             {
                 "offset": offset,
                 "timeout": 25,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
             timeout=32,
         )
@@ -501,15 +501,35 @@ async def listen_reports(session, service):
             continue
         for update in updates:
             offset = update["update_id"] + 1
+            if update.get("callback_query") and getattr(service, "telegram_ux", None):
+                query = update["callback_query"]
+                reply = await service.telegram_ux.callback(query, session)
+                await telegram_call(
+                    session,
+                    token,
+                    "answerCallbackQuery",
+                    {"callback_query_id": query["id"], "text": reply[:200], "show_alert": True},
+                )
             command = report_command(update, chat_id, bot["username"], time.time())
             service.journal.save_telegram_offset(bot["id"], offset)
             manual = analyze_command(update, chat_id, bot["username"], time.time())
+            if manual and getattr(service, "telegram_ux", None):
+                if not service.telegram_ux.operator_allowed(update.get("message", {}).get("from", {}).get("id")):
+                    manual = None
             if manual is not None:
                 if getattr(service.hub, "attention", {}).get("context_only"):
                     response = await service.review_context(manual[0])
-                    await alerts.send_telegram(
-                        context_review_text(response), rich_html=context_review_text(response, rich=True)
-                    )
+                    if getattr(service, "telegram_ux", None):
+                        published = service.telegram_ux.publish_analysis(response) if response.get("packet") else False
+                        await alerts.send_telegram(
+                            "Разбор направлен в аналитический канал."
+                            if published and service.telegram_ux.analytics_chat()
+                            else "Разбор не опубликован: канал не настроен или свежий проверенный ответ недоступен."
+                        )
+                    else:
+                        await alerts.send_telegram(
+                            context_review_text(response), rich_html=context_review_text(response, rich=True)
+                        )
                 else:
                     await alerts.send_telegram(service.request_analysis(*manual, time.time()))
             if command is not None:

@@ -411,31 +411,61 @@ class AlertManager:
                 self._telegram_not_before = time.time() + max(1, int(detail.get("retry_after") or 60))
             return result
 
-    async def send_telegram(self, message, *, rich_html=None, copy_text=None, return_message=False):
+    async def send_telegram(
+        self,
+        message,
+        *,
+        rich_html=None,
+        copy_text=None,
+        return_message=False,
+        chat_id=None,
+        reply_markup=None,
+        silent=False,
+    ):
         return await self._telegram_serialized(
             self._send_telegram_unlocked,
             message,
             rich_html=rich_html,
             copy_text=copy_text,
             return_message=return_message,
+            chat_id=chat_id,
+            reply_markup=reply_markup,
+            silent=silent,
         )
 
-    async def edit_telegram(self, message_id, message, *, rich_html=None, copy_text=None):
+    async def edit_telegram(
+        self, message_id, message, *, rich_html=None, copy_text=None, chat_id=None, reply_markup=None
+    ):
         return await self._telegram_serialized(
-            self._edit_telegram_unlocked, message_id, message, rich_html=rich_html, copy_text=copy_text
+            self._edit_telegram_unlocked,
+            message_id,
+            message,
+            rich_html=rich_html,
+            copy_text=copy_text,
+            chat_id=chat_id,
+            reply_markup=reply_markup,
         )
 
     async def _send_telegram_unlocked(
-        self, message: str, *, rich_html: str | None = None, copy_text: str | None = None, return_message: bool = False
+        self,
+        message: str,
+        *,
+        rich_html: str | None = None,
+        copy_text: str | None = None,
+        return_message: bool = False,
+        chat_id=None,
+        reply_markup=None,
+        silent=False,
     ):
         """Send a Telegram alert, with HTML fallback on explicit Rich Message rejection."""
-        if not self.telegram_token or not self.telegram_chat_id:
+        destination = self.telegram_chat_id if chat_id is None else chat_id
+        if not self.telegram_token or not destination:
             self.last_telegram_result = {"state": "unconfigured"}
             return False
         self.last_telegram_result = {"state": "send_pending"}
         if not self._session:
             self._session = aiohttp.ClientSession()
-        plain = {"text": message, "parse_mode": "HTML"}
+        plain = {"text": message, "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}}
         if copy_text:
             plain["link_preview_options"] = {"is_disabled": True}
             plain["reply_markup"] = {
@@ -456,7 +486,12 @@ class AlertManager:
                 url = f"https://api.telegram.org/bot{self.telegram_token}/{method}"
                 async with self._session.post(
                     url,
-                    json={"chat_id": self.telegram_chat_id, **payload},
+                    json={
+                        "chat_id": destination,
+                        **({"disable_notification": True} if silent else {}),
+                        **payload,
+                        **({"reply_markup": reply_markup} if reply_markup is not None else {}),
+                    },
                     timeout=self._SEND_TIMEOUT,
                     allow_redirects=False,
                 ) as response:
@@ -492,14 +527,17 @@ class AlertManager:
             logger.warning("Telegram send failed: %s", type(exc).__name__)
         return False
 
-    async def _edit_telegram_unlocked(self, message_id, message, *, rich_html=None, copy_text=None):
-        if not self.telegram_token or not self.telegram_chat_id:
+    async def _edit_telegram_unlocked(
+        self, message_id, message, *, rich_html=None, copy_text=None, chat_id=None, reply_markup=None
+    ):
+        destination = self.telegram_chat_id if chat_id is None else chat_id
+        if not self.telegram_token or not destination:
             self.last_telegram_result = {"state": "unconfigured"}
             return False
         if not self._session:
             self._session = aiohttp.ClientSession()
         self.last_telegram_result = {"state": "edit_pending"}
-        payload = {"chat_id": self.telegram_chat_id, "message_id": message_id}
+        payload = {"chat_id": destination, "message_id": message_id}
         if rich_html is not None:
             payload["rich_message"] = {"html": rich_html}
         else:
@@ -515,6 +553,8 @@ class AlertManager:
                         ]
                     ]
                 }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             url = f"https://api.telegram.org/bot{self.telegram_token}/editMessageText"
             async with self._session.post(

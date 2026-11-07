@@ -310,10 +310,11 @@ async def run(args: argparse.Namespace) -> None:
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
             if notify:
-                tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))
+                if not service.telegram_ux:
+                    tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
                 digest_seconds = int(os.getenv("HYPERDATA_DIGEST_SECONDS", "0"))
-                if digest_seconds > 0:
+                if digest_seconds > 0 and not service.telegram_ux:
                     tasks.append(
                         asyncio.create_task(
                             run_digest(session, service, digest_seconds),
