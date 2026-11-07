@@ -98,6 +98,13 @@ async def test_healthz_rejects_stale_or_failed_native_feed() -> None:
         hub.status.market_data = "connected"
         hub.last_error = "boom"
         assert (await client.get("/healthz")).status == 503
+        hub.last_error = None
+        hub.attention = {"plan_status": "expired"}
+        assert (await client.get("/healthz")).status == 503
+        hub.attention = {"plan_status": "cached_valid", "plan_error": "TimeoutError: pulse down"}
+        assert (await client.get("/healthz")).status == 503
+        hub.attention = {"plan_status": "valid"}
+        assert (await client.get("/healthz")).status == 200
     finally:
         await client.close()
 

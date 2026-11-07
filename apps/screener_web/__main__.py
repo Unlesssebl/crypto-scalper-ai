@@ -208,7 +208,13 @@ async def healthz(request: web.Request) -> web.Response:
     ready = bool(hub.ready)
     healthy = ready and hub.last_error is None and hub.status.market_data in ("connected", "synthetic")
     attention = getattr(hub, "attention", {})
-    observation_error = attention.get("subscription_error") or attention.get("archive", {}).get("error")
+    plan_status = attention.get("plan_status")
+    observation_error = (
+        attention.get("subscription_error")
+        or attention.get("plan_error")
+        or attention.get("archive", {}).get("error")
+        or (f"attention_plan_{plan_status}" if plan_status in {"expired", "missing", "unavailable"} else None)
+    )
     runtime_error = service.runtime_diagnostic() if service is not None else None
     healthy = healthy and not observation_error and not runtime_error
     return web.json_response(
@@ -221,6 +227,7 @@ async def healthz(request: web.Request) -> web.Response:
             "runtime_error": runtime_error,
             "market": hub.status.market_data,
             "warnings": hub.warnings,
+            "attention_plan_status": plan_status,
             "observation_error": observation_error,
         },
         status=200 if healthy else 503,

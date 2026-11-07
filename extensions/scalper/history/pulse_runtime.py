@@ -24,6 +24,9 @@ class PulseObservation(Observation):
             self.cursor = json.loads(self.cursor_path.read_text(encoding="utf-8"))["cursor"]
         self.session = None
         self.last_control = 0
+        self.plan_error = None
+        self.plan_status = "waiting"
+        self.last_plan_at = None
         self._record("source", dict(fact_version=2, assignment_mode="external_plan.v1"), time.time())
         self.task = asyncio.create_task(self.run(), name="pulse-native-consumer")
 
@@ -45,35 +48,124 @@ class PulseObservation(Observation):
         detail = {r["symbol"]: r for r in (self.plan or {}).get("active", [])}
         return {s: detail[s] for s in symbols if s in detail}
 
-    async def cycle(self):
-        now = time.time()
-        if self.archive.error or ((self.plan or {}).get("decision_archive") or {}).get("error"):
-            await self.hub.orderbook.set_symbols([])
-            await self.hub.orderflow.set_attention_symbols([])
-            raise RuntimeError("history_unavailable_collection_paused")
-        if now - self.last_control >= 2:
-            self.plan = (await self.get("/attention")).get("plan")
-            self.last_control = now
+    def lease_active(self, now):
+        try:
+            return (self.plan or {}).get("expires_at_ms", 0) > int(now * 1000)
+        except (TypeError, ValueError):
+            return False
+
+    async def _refresh_plan(self, now):
+        """Refresh the lease, but never apply a plan past its expiry."""
+        if now - self.last_control < 2:
+            return True
+        self.last_control = now
+        try:
+            body = await self.get("/attention")
+            plan = body.get("plan") if isinstance(body, dict) else None
+            if plan is not None and not isinstance(plan, dict):
+                raise ValueError("attention plan is not an object")
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {str(exc)[:120]}"
+            if self.plan_error is None and self.lease_active(now):
+                # Keep the valid subscriptions but mark the tape gap explicitly.
+                self._invalidate_flow(sorted(getattr(self, "applied", {})), now, "attention_unavailable", message)
+            self.plan_error = message
+            self.plan_status = ("cached_valid" if self.lease_active(now)
+                                else "expired" if self.plan else "unavailable")
+            return False
+        if self.plan_error is not None:
+            self._record("transport", dict(status="attention_recovered", symbols=[], at=now), now)
+        self.plan, self.plan_error, self.last_plan_at = plan, None, now
+        self.plan_status = "valid" if self.lease_active(now) else "expired" if plan else "missing"
+        return True
+
+    def _invalidate_flow(self, symbols, now, status, error=None):
+        """Old rolling windows must not look like continuous observation."""
+        symbols = sorted({s for s in symbols if s})
+        if not symbols:
+            return
+        payload = dict(symbols=symbols, status=status, at=now)
+        if error is not None:
+            payload["error"] = error
+        self._record("transport", payload, now)
+        reset = getattr(self.hub.orderflow, "reset_external", None)
+        if reset is not None:
+            for symbol in symbols:
+                reset(symbol)
+
+    async def _release_all(self, now, reason):
+        applied = dict(getattr(self, "applied", {}))
+        for symbol, row in applied.items():
+            self._record(
+                "assignment",
+                dict(symbol=symbol, previous=row.get("state", "scout"), state="scout", reason=reason, at=now),
+                now,
+            )
+        self.applied = {}
+        self._invalidate_flow(applied, now, reason)
+        await self.hub.orderbook.set_symbols([])
+        await self.hub.orderflow.set_attention_symbols([])
+
+    async def _reconcile(self, now):
+        applied = getattr(self, "applied", {})
         wanted = self.assignments(now)
-        for s, row in list(self.applied.items()):
-            if s not in wanted or wanted[s]["assigned_at"] != row["assigned_at"]:
+        released = [s for s in applied if s not in wanted]
+        reassigned = [
+            s for s in wanted
+            if s in applied and applied[s].get("assigned_at") != wanted[s].get("assigned_at")
+        ]
+        for symbol in released:
+            row = applied[symbol]
+            self._record(
+                "assignment",
+                dict(symbol=symbol, previous=row.get("state", "scout"), state="scout", reason="plan_released", at=now),
+                now,
+            )
+        for symbol in reassigned:
+            row = applied[symbol]
+            self._record(
+                "assignment",
+                dict(symbol=symbol, previous=row.get("state", "scout"), state="scout",
+                     reason="assignment_changed", at=now),
+                now,
+            )
+            new = wanted[symbol]
+            self._record(
+                "assignment",
+                dict(symbol=symbol, previous="scout", state=new.get("state", "scout"),
+                     reason=new.get("reason", "reassigned"), at=now),
+                now,
+            )
+        for symbol, row in wanted.items():
+            if symbol not in applied:
                 self._record(
                     "assignment",
-                    dict(symbol=s, previous=row["state"], state="scout", reason="plan_released", at=now),
+                    dict(symbol=symbol, previous="scout", state=row.get("state", "scout"),
+                         reason=row.get("reason", "assigned"), at=now),
                     now,
                 )
-        for s, row in wanted.items():
-            if s not in self.applied or self.applied[s]["assigned_at"] != row["assigned_at"]:
-                self._record(
-                    "assignment",
-                    dict(symbol=s, previous="scout", state=row["state"], reason=row["reason"], at=now),
-                    now,
-                )
-        if wanted != self.applied:
+        self._invalidate_flow(released, now, "plan_released")
+        self._invalidate_flow(reassigned, now, "assignment_changed")
+        if wanted != applied:
             self._record("attention_plan", dict(plan=self.plan, applied=wanted), now)
             await self.hub.orderbook.set_symbols(list(wanted))
             await self.hub.orderflow.set_attention_symbols(list(wanted))
             self.applied = wanted
+
+    async def cycle(self):
+        now = time.time()
+        if self.archive.error or ((self.plan or {}).get("decision_archive") or {}).get("error"):
+            # A broken archive releases detail feeds even when Pulse is unreachable.
+            await self._release_all(now, "history_unavailable")
+            raise RuntimeError("history_unavailable_collection_paused")
+        refreshed = await self._refresh_plan(now)
+        # Reconcile after every attempt: an expired lease releases L2 even during an API outage.
+        await self._reconcile(now)
+        if self.plan_status in ("valid", "cached_valid") and not self.lease_active(now):
+            self.plan_status = "expired" if self.plan else "missing"
+        if not refreshed or self.plan_status not in ("valid", "cached_valid"):
+            return
+        wanted = self.assignments(now)
         body = await self.get("/events", cursor=self.cursor or 0, venue="hyperliquid", limit=5000)
         head = body["head_cursor"]
         if self.cursor is not None and head < self.cursor:
@@ -136,6 +228,15 @@ class PulseObservation(Observation):
             runtime_mode=UNIFIED,
             policy_version=4,
             plan=self.plan,
+            plan_status=self.plan_status,
+            plan_error=self.plan_error,
+            plan_expires_at_ms=(self.plan or {}).get("expires_at_ms"),
+            last_plan_at=self.last_plan_at,
+            degraded=(
+                bool(self.plan_error)
+                or self.plan_status not in ("valid", "cached_valid")
+                or bool(self.subscription_error)
+            ),
             active=active,
             archive=self.archive.report(),
             subscription_error=self.subscription_error,
