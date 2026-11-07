@@ -290,6 +290,46 @@ async def test_manual_review_shared_budget_dedup_and_new_snapshot_cooldown(servi
 
 
 @pytest.mark.asyncio
+async def test_native_api_failure_blocks_new_reviews(service, monkeypatch):
+    service.gemini.key = "configured"
+    call = AsyncMock()
+    monkeypatch.setattr(FactReviewer, "review", call)
+    service.hub.last_error = "ClientConnectorError: native API refused"
+
+    packet = service.context_packets["SMALL"]
+    result = await service.review_context("SMALL", packet["packet_id"])
+
+    assert result == {"status": "skipped", "reason": "native_unavailable"}
+    call.assert_not_awaited()
+    assert service.journal.db.execute("SELECT count(*) FROM ai_requests").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_context_never_spends_budget_while_native_is_down(service):
+    service.hub.last_error = "ClientConnectorError: native API refused"
+    assert await service.auto_context_once() == []
+
+
+@pytest.mark.asyncio
+async def test_native_api_failure_keeps_previous_results_as_history(service, monkeypatch):
+    service.gemini.key = "configured"
+
+    async def answer(packet):
+        return dict(status="ok", raw=json.dumps(reply(packet)), model="test/model")
+
+    monkeypatch.setattr(FactReviewer, "review", AsyncMock(side_effect=answer))
+    packet = service.context_packets["SMALL"]
+    first = await service.review_context("SMALL", packet["packet_id"])
+    assert first["status"] == "ok"
+
+    service.hub.last_error = "ServerDisconnectedError: native API dropped"
+    second = await service.review_context("SMALL", packet["packet_id"])
+    assert second == {"status": "skipped", "reason": "native_unavailable"}
+    # The completed review remains readable in the journal as history.
+    assert service.consistency.latest(packet["packet_id"])["status"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_invalid_answer_logged_and_charged_once(service, monkeypatch):
     service.gemini.key = "configured"
     call = AsyncMock(return_value=dict(status="ok", raw='{"direction":"BULLISH"}', model="test/model"))

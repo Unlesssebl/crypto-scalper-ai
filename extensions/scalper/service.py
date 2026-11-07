@@ -69,7 +69,6 @@ class Screener:
         saved_policy = journal.load_policy() if journal is not None and hasattr(journal, "load_policy") else None
         self.policy = OpportunityPolicy(**saved_policy) if saved_policy else OpportunityPolicy.from_env()
         self.rows = {}
-        self.quality_report = None
         self.profiles = {}
         self.phases = PhaseTracker()
         self.shadow = ShadowDetector()
@@ -285,6 +284,11 @@ class Screener:
             now = time.time()
             if not getattr(self.hub, "attention", {}).get("context_only") or not self.consistency:
                 return {"status": "unavailable", "reason": "context_mode_required"}
+            if getattr(self.hub, "last_error", None):
+                # The connection may have dropped after the last snapshot was
+                # captured. A packet inside its freshness window is not proof
+                # that the native source is still alive.
+                return {"status": "skipped", "reason": "native_unavailable"}
             if packet_id is None:
                 self.refresh_context_packets(now)
                 packet = next((p for s, p in self.context_packets.items() if s.casefold() == symbol.casefold()), None)
@@ -378,6 +382,9 @@ class Screener:
 
     async def auto_context_once(self):
         if not self.context_memory or self.hub.demo or not getattr(self.hub, "attention", {}).get("context_only"):
+            return []
+        if getattr(self.hub, "last_error", None):
+            # Do not spend budget while the native source is unreachable.
             return []
         now = time.time()
         self.refresh_context_packets(now)

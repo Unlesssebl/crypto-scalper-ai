@@ -99,8 +99,11 @@ async def test_attention_outage_keeps_the_last_still_valid_plan(monkeypatch, tmp
     assert hub.orderflow.resets == ["ETH"]
     assert observer.plan_status == "cached_valid"
     assert observer.plan_error and "pulse unavailable" in observer.plan_error
-    assert observer.report()["active"][0]["symbol"] == "ETH"
-    assert observer.report()["degraded"] is True
+    observer.facts.card = lambda symbol, now: {"status": "observing"}
+    report = observer.report()
+    assert report["active"][0]["symbol"] == "ETH"
+    assert report["active"][0]["ready"] is False
+    assert report["degraded"] is True
     await observer.close()
 
 

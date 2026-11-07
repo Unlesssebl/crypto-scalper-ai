@@ -218,14 +218,17 @@ class PulseObservation(Observation):
         now = time.time() if now is None else now
         if self.task.done() and not self.closed:
             self.subscription_error = "pulse_consumer_stopped"
-        active = [
-            dict(
-                row,
-                facts=self.facts.card(s, now),
-                ready=not self.subscription_error and self.facts.card(s, now)["status"] == "observing",
-            )
-            for s, row in self.applied.items()
-        ]
+        source_ready = (
+            not self.plan_error
+            and not self.subscription_error
+            and self.plan_status in ("valid", "cached_valid")
+        )
+        active = []
+        for s, row in self.applied.items():
+            card = self.facts.card(s, now)
+            # ready must use the same source-health criteria as degraded: a
+            # fresh L2 cannot certify an instrument while /attention is down.
+            active.append(dict(row, facts=card, ready=source_ready and card["status"] == "observing"))
         return dict(
             enabled=True,
             context_only=True,

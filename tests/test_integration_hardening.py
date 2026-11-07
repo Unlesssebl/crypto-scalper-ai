@@ -10,6 +10,7 @@ import pytest
 
 from extensions.scalper.history.pulse_runtime import PulseObservation
 from extensions.scalper.history.runtime import configure
+from extensions.scalper.journal import Journal
 from extensions.scalper.remote import RemoteHub
 from extensions.scalper.service import Screener
 from hyperdata_terminal.runtime_mode import UNIFIED_ENV, RuntimeModeError, compatibility_error
@@ -149,6 +150,45 @@ async def test_recovered_executions_never_become_live_triggers(monkeypatch, tmp_
 
 def _analyst():
     return SimpleNamespace(key="", provider="test", model="test/model")
+
+
+@pytest.mark.asyncio
+async def test_api_loss_after_success_keeps_history_but_blocks_new_reviews(tmp_path):
+    hub = RemoteHub("http://unused")
+    now = time.time()
+
+    async def ok(path, **params):
+        if path == "/v1/attention":
+            return {"enabled": True, "runtime_mode": "unified", "context_only": True, "active": []}
+        if path == "/v1/market":
+            return {"assets": [], "as_of": now}
+        if path == "/v1/snapshot":
+            return {"as_of": now, "market": dict(quality="ok", observed_at=now), "rows": [], "context": {}}
+        assert path == "/v1/health"
+        return {"status": "ok"}
+
+    hub._get = ok
+    await hub.refresh_snapshot()
+    assert hub.ready is True and hub.last_error is None
+
+    async def down(path, **params):
+        raise aiohttp.ClientConnectionError("native api dropped")
+
+    hub._get = down
+    with pytest.raises(aiohttp.ClientConnectionError):
+        await hub.refresh_snapshot()
+    # The cache is allowed to remain for history, but the failure is visible.
+    assert hub.ready is True
+    assert hub.last_error and "dropped" in hub.last_error
+    assert hub.attention["enabled"] is True
+
+    journal = Journal(tmp_path / "journal.sqlite")
+    service = Screener(hub, journal, _analyst(), False)
+    try:
+        assert await service.review_context("SMALL") == {"status": "skipped", "reason": "native_unavailable"}
+        assert await service.auto_context_once() == []
+    finally:
+        journal.close()
 
 
 @pytest.mark.asyncio

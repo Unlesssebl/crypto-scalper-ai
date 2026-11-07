@@ -71,47 +71,7 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <button type="submit">Сохранить политику</button>
 </form>
 <p id="ai-policy-status" role="status"></p>
-<p id="ai-selection">Статистика legacy-отбора остановлена: направленный конвейер удалён из runtime.</p>
-<p id="ai-reasons"></p>
-<table aria-label="Результаты отбора AI"><thead><tr><th>Группа</th><th>Горизонт</th><th>Верно / неверно</th><th>Без движения / направления</th><th>Ждём / нет данных</th><th>Средний |ход| / ≥ NATR</th></tr></thead><tbody id="ai-outcomes"></tbody></table>
-<p>Отклонённые события тоже проверяются через 1/5/15 минут. Направление оценивается от цены обнаружения; сравнение AI, Rule Engine и Consensus — на одних событиях с успешным ответом AI, от цены снимка анализа, без комиссий и исполнения.</p>
-</details>
-<details class="panel quality-report">
-<summary>Архив: legacy-оценки направлений (расчёт остановлен)</summary>
-<p>Статистика ниже относится к удалённому направленному конвейеру. Текущий runtime её не обновляет;
-данные сохранены только как исторический архив.</p>
-<p>Верно — цена пошла в сторону оценки AI. Ошибки запросов и оценки без направления считаются отдельно.</p>
-<p id="quality-attempts" role="status">Фоновый расчёт ещё не готов.</p>
-<table aria-label="Проверка направления AI">
-<thead><tr><th>Горизонт</th><th>Верно</th><th>Неверно</th><th>Без изменения</th><th>Ожидается цена</th><th>Нет наблюдения</th></tr></thead>
-<tbody id="quality-outcomes"></tbody></table>
-<h3>Результаты по триггерам</h3>
-<p>В колонках горизонтов — верные и неверные направления. Задержка считается от события до завершения попытки.</p>
-<table aria-label="Результаты AI по триггерам">
-<thead><tr><th>Триггер</th><th>Событий</th><th>1 мин</th><th>5 мин</th><th>15 мин</th><th>Медиана задержки</th></tr></thead>
-<tbody id="quality-triggers"></tbody></table>
-<h3>Проверка контекста 15m</h3>
-<p id="context-pairs">Сравнение выполняется на части событий.</p>
-<table aria-label="Парное сравнение контекста">
-<thead><tr><th>Горизонт</th><th>HyperData</th><th>AI 1m + 5m</th><th>AI с 15m</th></tr></thead>
-<tbody id="context-outcomes"></tbody></table>
-<h3>Проверка рангов после доставки</h3>
-<p id="finding-decisions">Журнал кандидатов ещё накапливается.</p>
-<p>Заметное движение — отклонение mark не меньше NATR снимка за 5 минут после доставки. Доля считается по завершённым наблюдениям.</p>
-<table aria-label="Движение после уведомления по рангам">
-<thead><tr><th>Версия и ранг</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Доля</th><th>Ждём / без данных</th><th>Медиана доставки</th></tr></thead>
-<tbody id="finding-outcomes"></tbody></table>
-<p id="finding-control">Контрольные окна накапливаются.</p>
-<table aria-label="Движение по задержке доставки">
-<thead><tr><th>Задержка</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / без данных</th></tr></thead>
-<tbody id="finding-delay"></tbody></table>
-<h3>Теневые пороги</h3>
-<p>Движение ≥ NATR за 5 минут после обнаружения. Теневые находки не отправляются.</p>
-<p id="minute-shadow" hidden></p>
-<table aria-label="Теневые пороги">
-<thead><tr><th>Вариант</th><th>Находки</th><th>Движение ≥ NATR</th><th>Меньше NATR</th><th>Ждём / нет данных</th></tr></thead>
-<tbody id="shadow-outcomes"></tbody></table>
-<small id="quality-updated"></small>
+<p>Направленная legacy-статистика остановлена: текущий runtime разбирает только контекст наблюдения.</p>
 </details>
 <section id="detail" class="panel detail" hidden aria-label="Карточка инструмента"></section>
 <div class="panel"><table aria-label="Рыночный скринер">
@@ -448,139 +408,6 @@ async function loadDetail() {
   }
 }
 
-function renderQuality(report) {
-  const window = $("window").value;
-  const result = report?.windows[window];
-  $("quality-outcomes").replaceChildren();
-  $("quality-triggers").replaceChildren();
-  renderContextExperiment(report?.context_experiment?.[window]);
-  renderFindingAudit(report?.finding_audit?.[window]);
-  renderShadow(report?.shadow?.[window]);
-  const comparison = window === "1m" ? report?.minute_shadow : null;
-  $("minute-shadow").hidden = !comparison;
-  if (comparison) $("minute-shadow").textContent =
-    `Строгий порог 1m · находок ${comparison.strict} против ${comparison.baseline}. ` +
-    `Из ${comparison.baseline_moves} базовых событий с движением ≥ 0,5% за 5 минут ` +
-    `у ${comparison.missed_moves} не было строгой находки по тому же инструменту в пределах ±60 с.`;
-  $("quality-updated").textContent = report ? "Расчёт обновлён " + stamp(report.calculated_at) : "";
-  if (!result) {
-    $("quality-attempts").textContent =
-      "Архивный расчёт остановлен: legacy-конвейер направленных оценок удалён из runtime.";
-    return;
-  }
-  const a = result.attempts;
-  $("quality-attempts").textContent = window + " · Направленных оценок " + a.directional
-    + " · Нейтральных " + a.neutral + " · Недостаточно данных " + a.insufficient
-    + " · Ошибок " + a.error + " · Пропущено " + a.skipped + " · В обработке " + a.pending;
-  for (const [minutes, counts] of Object.entries(result.horizons)) {
-    const row = node("tr", null, $("quality-outcomes"));
-    node("th", minutes + " мин", row).scope = "row";
-    for (const key of ["correct", "incorrect", "flat", "pending", "missing"]) {
-      const cell = node("td", value(counts[key]), row);
-      if (key === "correct") cell.className = "bull";
-      if (key === "incorrect") cell.className = "bear";
-    }
-  }
-  for (const [key, label] of Object.entries(report.trigger_labels ?? {})) {
-    const group = result.triggers?.[key];
-    if (!group) continue;
-    const row = node("tr", null, $("quality-triggers"));
-    node("th", label, row).scope = "row";
-    node("td", Object.values(group.attempts).reduce((a, b) => a + b, 0), row);
-    for (const minutes of [1, 5, 15]) {
-      const counts = group.horizons[minutes];
-      node("td", counts.correct + " / " + counts.incorrect, row);
-    }
-    const delay = group.median_delay_seconds;
-    node("td", delay == null ? "—" : value(delay) + " с (n=" + group.delay_samples + ")", row);
-  }
-}
-
-function renderContextExperiment(experiment) {
-  const body = $("context-outcomes");
-  body.replaceChildren();
-  $("context-pairs").textContent = experiment
-    ? "Пары с двумя принятыми ответами: " + experiment.matched + " из " + experiment.attempted
-      + " · Вывод изменился: " + experiment.changed
-      + " · Верно / неверно. Цена отсчитывается после готовности обеих оценок."
-    : "Сравнение выполняется на части событий.";
-  if (!experiment) return;
-  for (const [minutes, arms] of Object.entries(experiment.horizons)) {
-    const row = node("tr", null, body);
-    node("th", minutes + " мин", row).scope = "row";
-    for (const key of ["hyperdata", "baseline", "senior"]) {
-      const a = arms[key];
-      const cell = node("td", a.correct + " / " + a.incorrect, row);
-      node("small", "Без направления " + a.no_direction + " · без движения " + a.flat
-        + " · ждём " + a.pending + " · нет цены " + a.missing, cell);
-    }
-  }
-}
-
-function renderFindingAudit(audit) {
-  const body = $("finding-outcomes");
-  body.replaceChildren();
-  $("finding-delay").replaceChildren();
-  $("finding-control").textContent = "Контрольные окна накапливаются.";
-  if (!audit) {
-    $("finding-decisions").textContent = "Журнал кандидатов ещё накапливается.";
-    return;
-  }
-  const labels = {
-    delivered:"доставлено", queued:"в очереди", analyzing:"анализируется", delivery_pending:"готовится к отправке",
-    tape_unavailable:"нет ленты", book_unavailable:"нет стакана", already_pending:"уже есть событие в очереди",
-    queue_full:"очередь заполнена", cooldown:"пауза анализа", delivery_cooldown:"пауза доставки",
-    delivery_merged:"добавлено в сообщение", delivery_merge_failed:"ошибка обновления сообщения",
-    stale_at_dispatch:"устарели данные", event_expired:"событие устарело", delivery_below_strength:"ниже порога уведомлений", direction_changed:"направление изменилось", anomaly_ended:"всплеск закончился",
-    left_universe:"вне списка", delivery_not_applicable:"без уведомления", delivery_disabled:"Telegram выключен",
-    delivery_queue_full:"очередь уведомлений заполнена", delivery_expired:"уведомление устарело",
-    delivery_failed_or_unconfirmed:"доставка не подтверждена", interrupted:"прервано",
-    duplicate_snapshot:"повтор снимка", delivery_error:"ошибка", error:"ошибка",
-  };
-  const decisions = Object.entries(audit.decisions).map(([key, count]) => (labels[key] ?? key) + " " + count);
-  $("finding-decisions").textContent = "Кандидатов: " + audit.candidates + (decisions.length ? " · " + decisions.join(" · ") : "");
-  const control = audit.control;
-  if (control?.pairs) {
-    $("finding-control").textContent = "Сопоставимые пары: " + control.pairs + " · движение ≥ NATR после сигнала "
-      + control.signal_hits + "/" + control.pairs + " · в обычных окнах " + control.control_hits + "/" + control.pairs;
-  }
-  for (const bucket of ["0–15 с", ">15–45 с", ">45 с"]) {
-    const group = audit.delay_buckets?.[bucket];
-    if (!group) continue;
-    const row = node("tr", null, $("finding-delay"));
-    node("th", bucket, row).scope = "row";
-    node("td", group.hit ?? 0, row);
-    node("td", group.quiet ?? 0, row);
-    node("td", (group.pending ?? 0) + " / " + ((group.missing ?? 0) + (group.no_natr ?? 0)), row);
-  }
-  const ranks = ["Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная"];
-  for (const [version, groups] of Object.entries(audit.versions)) {
-    for (const [rank, group] of Object.entries(groups).reverse()) {
-      const hit = group.hit ?? 0, quiet = group.quiet ?? 0;
-      const row = node("tr", null, body);
-      node("th", version + " · " + (audit.rank_labels?.[version]?.[rank] ?? ranks[rank] ?? rank), row).scope = "row";
-      node("td", hit, row);
-      node("td", quiet, row);
-      node("td", hit + quiet ? Math.round(100 * hit / (hit + quiet)) + "%" : "—", row);
-      node("td", (group.pending ?? 0) + " / " + ((group.missing ?? 0) + (group.no_natr ?? 0)), row);
-      node("td", value(group.median_delay_seconds) + " с", row);
-    }
-  }
-}
-
-function renderShadow(variants) {
-  const body = $("shadow-outcomes");
-  body.replaceChildren();
-  for (const [name, counts] of Object.entries(variants ?? {})) {
-    const row = node("tr", null, body);
-    node("th", name, row).scope = "row";
-    node("td", Object.values(counts).reduce((sum, value) => sum + value, 0), row);
-    node("td", counts.hit ?? 0, row);
-    node("td", counts.quiet ?? 0, row);
-    node("td", (counts.pending ?? 0) + " / " + (counts.missing ?? 0), row);
-  }
-}
-
 let policyLoaded = false;
 const pendingReviews = new Set();
 const claimLabels = {supported:"Подтверждено измерениями", contradicted:"Противоречит измерениям",
@@ -592,6 +419,7 @@ const reviewStatus = status => ({ok:"Ответ проверен", unconfigured:
   network_error:"Ошибка связи", incomplete:"Неполный ответ модели"}[status] ?? "Ошибка провайдера");
 const reviewReason = reason => ({no_api_key:"Нет API-ключа", demo:"Демонстрационный режим",
   stale_or_unknown_packet:"Данные устарели или пакет недоступен", episode_changed_or_unavailable:"Эпизод изменился",
+  native_unavailable:"Нет связи с native API — новые разборы приостановлены",
   context_mode_required:"Нужен режим наблюдения", process_restarted:"Приложение перезапущено"}[reason] ??
   aiReasonLabels[reason] ?? "Подробности сохранены в журнале");
 function factLabel(id) {
@@ -797,30 +625,6 @@ function renderSelection(result) {
   }
   if (policy) $("ai-policy-status").textContent = policy.hourly_limit + " запросов/час · cooldown " +
     policy.cooldown_seconds / 60 + " мин · максимум " + policy.hourly_limit * 24 + " запросов за 24 часа при постоянной нагрузке";
-  const stats = result.quality_report?.selection;
-  if (!stats) return;
-  $("ai-selection").textContent = "За 24 ч: событий " + stats.detected + " · допущено " + stats.admitted +
-    " · запросов (включая контрольные и ошибки) " + stats.requests + " · отфильтровано " +
-    (stats.detected ? Math.round(100 * (stats.detected - stats.admitted) / stats.detected) : 0) + "%";
-  $("ai-reasons").textContent = Object.entries(stats.reasons).map(([reason, count]) => (aiReasonLabels[reason] ?? reason) + ": " + count).join(" · ");
-  const body = $("ai-outcomes");
-  body.replaceChildren();
-  function score(label, minutes, counts, movement) {
-    const row = node("tr", null, body);
-    node("th", label, row).scope = "row";
-    node("td", minutes + " мин", row);
-    node("td", (counts.correct ?? 0) + " / " + (counts.incorrect ?? 0), row);
-    node("td", (counts.flat ?? 0) + " / " + (counts.no_direction ?? 0), row);
-    node("td", (counts.pending ?? 0) + " / " + (counts.missing ?? 0), row);
-    node("td", movement?.samples ? (movement.sum_abs_pct / movement.samples).toFixed(3) + "% · " +
-      movement.natr_hits + "/" + movement.natr_samples : "—", row);
-  }
-  for (const [minutes, groups] of Object.entries(stats.outcomes)) {
-    for (const [group, counts] of Object.entries(groups)) score(group === "admitted" ? "Допущены" : "Отклонены", minutes, counts, stats.movements?.[minutes]?.[group]);
-  }
-  for (const [arm, horizons] of Object.entries(stats.arms ?? {})) {
-    for (const [minutes, counts] of Object.entries(horizons)) score({ai:"AI",rule:"Rule Engine",consensus:"Consensus"}[arm], minutes, counts);
-  }
 }
 $("ai-policy").onsubmit = async event => {
   event.preventDefault();
@@ -840,7 +644,6 @@ async function refresh() {
     const result = await request("/v1/scalper?window=" + $("window").value);
     if (sequence !== generation) return;
     data = result.rows;
-    renderQuality(result.quality_report);
     renderSelection(result);
     renderAttention(result.attention);
     renderConsistency(result.consistency);
@@ -878,7 +681,7 @@ async function refresh() {
     if (sequence === generation) $("status").textContent = "Обновление недоступно · " + error.message;
   }
 }
-$("window").onchange = () => { data = []; renderQuality(null); render(); refresh(); loadDetail(); };
+$("window").onchange = () => { data = []; render(); refresh(); loadDetail(); };
 $("metrics").onclick = () => {
   const button = $("metrics");
   button.ariaPressed = button.ariaPressed === "true" ? "false" : "true";
