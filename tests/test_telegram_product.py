@@ -338,3 +338,24 @@ async def test_expired_analytics_is_not_backfilled_and_same_chat_is_rejected(ser
         service.journal.db.execute("SELECT status FROM episode_cards WHERE destination='analytics'").fetchone()[0]
         == "expired"
     )
+
+
+def test_invalid_tiger_configuration_does_not_stop_the_screener(service, monkeypatch):
+    monkeypatch.setenv("SCALPER_TIGER_SYMBOLS", "[")
+    service.ux = TelegramUX(service)
+    observe(service, time.time())
+    row = operations(service)[0]
+    assert "TigerTrade" not in row["reply_markup"]
+    assert service.ux.status()["tiger_config_error"]
+
+
+def test_manual_report_is_concise_and_empty_meta_is_not_published(service):
+    now = time.time()
+    observe(service, now)
+    text = service.ux.report(now + 1)
+    assert "Отобрано событий: 1" in text and "торговых результатов" in text and len(text) < 500
+    p = packet(now)
+    p["symbol"] = "MARKET"
+    assert not service.ux.publish_analysis(
+        dict(status="ok", packet=p, review=dict(result=dict(abstention=False, expired_at_completion=False, claims=[])))
+    )

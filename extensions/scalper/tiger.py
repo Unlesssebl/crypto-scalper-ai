@@ -16,9 +16,18 @@ class TigerBridge:
         self.group = os.getenv("SCALPER_TIGER_LINK_GROUP", "").upper()
         self.exchange = os.getenv("SCALPER_TIGER_EXCHANGE", "BINANCE-FUT")
         self.market = os.getenv("SCALPER_TIGER_MARKET", "FUTURES")
-        self.aliases = json.loads(os.getenv("SCALPER_TIGER_SYMBOLS", "{}"))
+        self.config_error = None
+        try:
+            self.aliases = json.loads(os.getenv("SCALPER_TIGER_SYMBOLS", "{}"))
+            if not isinstance(self.aliases, dict):
+                raise ValueError("Expected a symbol map")
+        except (ValueError, TypeError):
+            self.aliases = {}
+            self.config_error = "Invalid Tiger symbol map"
 
     def command(self, symbol):
+        if self.config_error:
+            raise ValueError(self.config_error)
         address = urlsplit(self.url)
         if (
             address.scheme != "ws"

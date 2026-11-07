@@ -534,6 +534,9 @@ async def listen_reports(session, service):
                     await alerts.send_telegram(service.request_analysis(*manual, time.time()))
             if command is not None:
                 if getattr(service.hub, "attention", {}).get("context_only"):
+                    if getattr(service, "telegram_ux", None):
+                        await alerts.send_telegram(service.telegram_ux.report(time.time()))
+                        continue
                     report = service.consistency.report(time.time())
                     await alerts.send_telegram(consistency_text(report), rich_html=consistency_text(report, rich=True))
                     continue

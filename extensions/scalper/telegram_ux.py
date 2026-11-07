@@ -78,6 +78,11 @@ def scenarios(state):
             "Альтернативный: цена начинает двигаться по потоку либо поток меняет сторону — "
             "прежнее расхождение теряет основание.",
         ]
+    if state.get("flow") is None or state.get("count") is None:
+        return [
+            "Основной и альтернативный сценарии не определены: пригодного потока пока недостаточно.",
+            "Следующее наблюдение: дождаться прогретого потока и сопоставить его с реакцией цены.",
+        ]
     return [
         "Основной: активность сохраняется и цена продолжает реагировать в сторону потока.",
         "Альтернативный: активность затухает или реакция цены расходится с потоком — сценарий ускорения ослабевает.",
@@ -329,6 +334,11 @@ class TelegramUX:
         if response.get("status") != "ok" or result.get("abstention") or result.get("expired_at_completion", True):
             return False
         meta = packet["symbol"] == "MARKET"
+        hypotheses = [
+            c for c in result.get("claims", []) if c["section"] == "interpretation" and c["status"] == "hypothesis"
+        ]
+        if meta and not hypotheses:
+            return False
         card = "ux:analysis:" + packet["episode_id"]
         if meta:
             card += ":" + packet["packet_id"][:16]
@@ -400,7 +410,31 @@ class TelegramUX:
             analytics_configured=bool(self.analytics_chat()),
             tiger_group=self.tiger.group or None,
             tiger_exchange=self.tiger.exchange,
+            tiger_config_error=self.tiger.config_error,
             callback_errors=self.db.execute("SELECT COUNT(*) FROM telegram_clicks WHERE status='error'").fetchone()[0],
+        )
+
+    def report(self, now):
+        events = self.db.execute(
+            "SELECT COUNT(*),COUNT(DISTINCT episode),SUM(reason IN ('strengthened','new_level')) "
+            "FROM telegram_ux_events WHERE at BETWEEN ? AND ?",
+            (now - 86400, now),
+        ).fetchone()
+        delivered = self.db.execute(
+            "SELECT COUNT(*) FROM episode_cards WHERE destination='operations' AND episode_id<>'ux:watch' "
+            "AND status='sent' AND expires_at BETWEEN ? AND ?",
+            (now - 86400, now + 120),
+        ).fetchone()[0]
+        return (
+            "<b>Скринер · последние 24 часа</b>\n"
+            f"Отобрано событий: {events[0]} · эпизодов: {events[1]}\n"
+            f"Существенных усилений: {events[2] or 0} · доставлено карточек: {delivered}\n"
+            + (
+                "Аналитика: отдельный канал подключён."
+                if self.analytics_chat()
+                else "Аналитика: канал пока не подключён; разборы сохраняются в проекте."
+            )
+            + "\nЭто статистика наблюдения и доставки, не торговых результатов."
         )
 
     def operator_allowed(self, user):
