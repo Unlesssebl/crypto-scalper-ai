@@ -16,9 +16,8 @@ Starts the complete project: native API, screener, Market Pulse and PostgreSQL.
   --stop              stop all project services, retaining data
   --restart           restart all project services
   --status            show combined service status
-  --without-pulse     run only the legacy native API and screener
 
-  --demo              synthetic data; disables AI and Telegram
+  --demo              synthetic data; disables AI, Telegram and Market Pulse
   --api-port N        native API port (default 8420)
   --port N            screener web port (default 8421)
   --tui               also show the Rich Market Overview

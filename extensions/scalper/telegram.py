@@ -9,7 +9,6 @@ import time
 import aiohttp
 
 from .fact_review import LABELS
-from .quality import HORIZONS, TRIGGERS
 
 LOG = logging.getLogger(__name__)
 
@@ -267,135 +266,6 @@ async def run_digest(session, service, interval_seconds):
             LOG.exception("Market digest send failed")
 
 
-def report_text(report, window=None, *, rich=False):
-    if report is None:
-        return "Отчёт ещё рассчитывается. Повторите /report через минуту."
-
-    def paragraph(*items):
-        return "<p>" + "<br>".join(items) + "</p>" if rich else "\n".join(items)
-
-    lines = [
-        paragraph(
-            "<b>Архив: направление от снимка</b> · последние 24 часа",
-            "Совпадение направления с последующей mark-ценой; не проверка согласованности фактов.",
-        )
-    ]
-    for frame in (window,) if window else report["windows"]:
-        data = report["windows"][frame]
-        a = data["attempts"]
-        lines.extend(("<hr/>" if rich else "", paragraph(f"<b>Окно {frame}</b>")))
-        table = []
-        notes = []
-        for minutes in HORIZONS:
-            h = data["horizons"][minutes]
-            correct, incorrect = h["correct"], h["incorrect"]
-            decided = correct + incorrect
-            accuracy = f"{correct / decided:.0%}" if decided else "—"
-            if rich:
-                table.append(
-                    f'<tr><td>{minutes} мин</td><td align="right">{correct}</td>'
-                    f'<td align="right">{incorrect}</td><td align="right"><b>{accuracy}</b></td></tr>'
-                )
-            else:
-                lines.append(f"<b>{minutes} мин</b> · 🟢 верно {correct} · 🔴 неверно {incorrect} · {accuracy}")
-            remaining = [
-                f"без движения {h['flat']}" if h["flat"] else None,
-                f"ждём {h['pending']}" if h["pending"] else None,
-                f"нет цены {h['missing']}" if h["missing"] else None,
-            ]
-            if other := " · ".join(item for item in remaining if item):
-                notes.append(f"<i>{minutes} мин · {other}</i>")
-        if rich:
-            lines.append(
-                "<table striped compact><tr><th>Горизонт</th><th>🟢 Верно</th>"
-                "<th>🔴 Мимо</th><th>Точность</th></tr>" + "".join(table) + "</table>"
-            )
-        if notes:
-            lines.append(paragraph(*notes))
-        lines.append(
-            paragraph(
-                f"<b>Оценки</b> · направленных {a['directional']} · нейтральных {a['neutral']} "
-                f"· без вывода {a['insufficient']}",
-                f"Сбои {a['error']} · пропуски {a['skipped']} · в обработке {a['pending']}",
-            )
-        )
-        if data.get("triggers"):
-            group_lines = ["<b>По триггерам</b> · верно/неверно на 1, 5 и 15 мин"]
-            for name, label in TRIGGERS.items():
-                group = data["triggers"].get(name)
-                if not group:
-                    continue
-                ratios = ", ".join(
-                    f"{group['horizons'][m]['correct']}/{group['horizons'][m]['incorrect']}" for m in HORIZONS
-                )
-                delay = group["median_delay_seconds"]
-                timing = f"{delay:g} с (n={group['delay_samples']})" if delay is not None else "—"
-                group_lines.append(
-                    f"<b>{label}</b> · {sum(group['attempts'].values())} событий · {ratios} · медиана {timing}"
-                )
-            if not rich:
-                lines.append("")
-            lines.append(paragraph(*group_lines))
-        experiment = report.get("context_experiment", {}).get(frame)
-        if experiment and experiment["attempted"]:
-            comparison = [
-                f"<b>Контекст 15m</b> · принятых пар {experiment['matched']}/{experiment['attempted']}"
-                f" · вывод изменился {experiment['changed']}"
-            ]
-            for minutes in HORIZONS:
-                arms = experiment["horizons"][minutes]
-                scores = [
-                    f"{arms[key]['correct']}/{arms[key]['incorrect']}" for key in ("hyperdata", "baseline", "senior")
-                ]
-                comparison.append(
-                    f"<b>{minutes} мин</b> · HyperData {scores[0]} · AI {scores[1]} · AI с 15m {scores[2]}"
-                )
-            comparison.append("<i>Верно/неверно от цены после готовности обеих оценок.</i>")
-            if not rich:
-                lines.append("")
-            lines.append(paragraph(*comparison))
-        audit = report.get("finding_audit", {}).get(frame)
-        if audit and audit["candidates"]:
-            delivered = audit["decisions"].get("delivered", 0)
-            merged = audit["decisions"].get("delivery_merged", 0)
-            finding_lines = [
-                f"<b>Находки</b> · кандидатов {audit['candidates']} · доставлено {delivered} · объединено {merged}"
-            ]
-            labels = ("Нет данных", "Фоновая", "Заметная", "Сильная", "Критичная")
-            for version, ranks in audit["versions"].items():
-                for rank, counts in sorted(ranks.items(), reverse=True):
-                    hits, quiet = counts.get("hit", 0), counts.get("quiet", 0)
-                    pending = counts.get("pending", 0)
-                    missing = counts.get("missing", 0) + counts.get("no_natr", 0)
-                    finding_lines.append(
-                        f"{html.escape(version)} · {audit.get('rank_labels', {}).get(version, labels)[int(rank)]}"
-                        f" · {hits}/{hits + quiet} "
-                        f"движений ≥ NATR · ждём {pending} · без данных {missing}"
-                    )
-            if not rich:
-                lines.append("")
-            control = audit.get("control", {})
-            if control.get("pairs"):
-                finding_lines.append(
-                    f"Пар {control['pairs']} · движение после сигнала {control['signal_hits']}"
-                    f" · в обычных окнах {control['control_hits']}"
-                )
-            else:
-                finding_lines.append("Сопоставимые обычные окна ещё накапливаются.")
-            lines.append(paragraph(*finding_lines))
-        comparison = report.get("minute_shadow") if frame == "1m" else None
-        if comparison and comparison["baseline"]:
-            lines.append(
-                paragraph(
-                    f"<b>Строгий порог 1m</b> · находок {comparison['strict']} против {comparison['baseline']}",
-                    f"Без строгого сигнала в пределах ±60 с · {comparison['missed_moves']} из "
-                    f"{comparison['baseline_moves']} базовых событий с движением ≥ 0,5% за 5 минут.",
-                )
-            )
-    lines.append(
-        paragraph("<i>Точность — верные среди верных и неверных. Проверка по mark без комиссий и исполнения.</i>")
-    )
-    return "\n".join(lines)
 
 
 def report_command(update, chat_id, username, now):
@@ -517,35 +387,21 @@ async def listen_reports(session, service):
                 if not service.telegram_ux.operator_allowed(update.get("message", {}).get("from", {}).get("id")):
                     manual = None
             if manual is not None:
-                if not getattr(service, "legacy_ai_enabled", True) or getattr(
-                    service.hub, "attention", {}
-                ).get("context_only"):
-                    response = await service.review_context(manual[0])
-                    if getattr(service, "telegram_ux", None):
-                        published = service.telegram_ux.publish_analysis(response) if response.get("packet") else False
-                        await alerts.send_telegram(
-                            "Разбор направлен в аналитический канал."
-                            if published and service.telegram_ux.analytics_chat()
-                            else "Разбор не опубликован: канал не настроен или свежий проверенный ответ недоступен."
-                        )
-                    else:
-                        await alerts.send_telegram(
-                            context_review_text(response), rich_html=context_review_text(response, rich=True)
-                        )
+                response = await service.review_context(manual[0])
+                if getattr(service, "telegram_ux", None):
+                    published = service.telegram_ux.publish_analysis(response) if response.get("packet") else False
+                    await alerts.send_telegram(
+                        "Разбор направлен в аналитический канал."
+                        if published and service.telegram_ux.analytics_chat()
+                        else "Разбор не опубликован: канал не настроен или свежий проверенный ответ недоступен."
+                    )
                 else:
-                    await alerts.send_telegram(service.request_analysis(*manual, time.time()))
+                    await alerts.send_telegram(
+                        context_review_text(response), rich_html=context_review_text(response, rich=True)
+                    )
             if command is not None:
-                if not getattr(service, "legacy_ai_enabled", True) or getattr(
-                    service.hub, "attention", {}
-                ).get("context_only"):
-                    if getattr(service, "telegram_ux", None):
-                        await alerts.send_telegram(service.telegram_ux.report(time.time()))
-                        continue
-                    report = service.consistency.report(time.time())
-                    await alerts.send_telegram(consistency_text(report), rich_html=consistency_text(report, rich=True))
+                if getattr(service, "telegram_ux", None):
+                    await alerts.send_telegram(service.telegram_ux.report(time.time()))
                     continue
-                report = service.quality_report
-                await alerts.send_telegram(
-                    report_text(report, *command),
-                    rich_html=report_text(report, *command, rich=True) if report is not None else None,
-                )
+                report = service.consistency.report(time.time())
+                await alerts.send_telegram(consistency_text(report), rich_html=consistency_text(report, rich=True))

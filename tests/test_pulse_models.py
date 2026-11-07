@@ -134,36 +134,6 @@ def test_shadow_restart_idempotency_correction_and_reproducible_inputs(tmp_path)
         assert db.execute("SELECT COUNT(*) FROM pulse_evaluations").fetchone()[0] == 4
 
 
-def test_late_revision_links_existing_card_and_survives_restart(tmp_path):
-    from extensions.scalper.journal import Journal
-    from extensions.scalper.service import alert_market_facts
-
-    path = tmp_path / "journal.sqlite"
-    journal = Journal(path)
-    shadow = ShadowJournal(journal.db)
-    history = [row(i) for i in range(40)]
-    assessment = shadow.evaluate(history, row(40), 1)
-    snapshot = {"symbol": "BTC", "window": "1m", "captured_at": 1,
-                "metrics": {}, "market_pulse": {"status": "ready", "venues": [
-                    {"venue": "hyperliquid", "quality": "observed_no_detected_gap", "shadow": assessment,
-                     "execution_count": 5, "quote_volume": "10", "currency": "USDC", "ofi": 1.0}]}}
-    assert journal.register_fact_message("card", snapshot, {"detected_at": 1}, {})
-    journal.fact_message_sent("card", 123, False)
-    shadow.reconcile([*history, row(40, 999, version=2)], 3)
-    assert journal.pending_pulse_edits() == ["card"]
-    saved = journal.fact_message("card")
-    assert saved["message_id"] == 123
-    assert len(saved["snapshot"]["market_pulse_corrections"]) == 2
-    facts = str(alert_market_facts(saved["snapshot"]))
-    assert "Исходные межбиржевые данные" in facts and "999 исполнений" in facts
-    journal.pulse_edit_status("card", "queued")
-    journal.close()
-    journal = Journal(path)
-    journal.recover()
-    assert journal.pending_pulse_edits() == ["card"]
-    journal.pulse_edit_status("card", "failed")
-    assert journal.pending_pulse_edits() == []  # Failed edit remains visible, no uncontrolled retry loop.
-    journal.close()
 
 
 async def test_adapter_records_all_covered_markets_without_screener_slots(tmp_path):
@@ -224,31 +194,6 @@ def test_late_baseline_revision_recomputes_dependent_assessment(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM pulse_evaluations").fetchone()[0] == 4
 
 
-@pytest.mark.parametrize("success", [True, False])
-async def test_correction_delivery_edits_existing_message_and_records_failure(success):
-    import asyncio
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-
-    from extensions.scalper.service import Screener
-
-    states = []
-    saved = {"id": "existing", "snapshot": {"symbol": "BTC", "window": "1m"},
-             "hyperdata": {}, "event": {}, "ai": None, "message_id": 123, "rich": False}
-    journal = SimpleNamespace(fact_message=lambda key: saved, ai_reason=lambda key: "queued",
-                              fact_updates=lambda key: {}, fact_message_edit=lambda *a: None,
-                              pulse_edit_status=lambda *a: states.append(a))
-    service = Screener(None, journal, None, True)
-    service.edit_alert = AsyncMock(return_value=success)
-    service.notifications.put_nowait(("pulse_edit", "existing"))
-    task = asyncio.create_task(service.deliver())
-    try:
-        await asyncio.wait_for(service.notifications.join(), 2)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    service.edit_alert.assert_awaited_once()
-    assert states == [("existing", "edited" if success else "failed")]
 
 
 def test_hourly_reference_reused_across_minutes_and_restart(tmp_path):

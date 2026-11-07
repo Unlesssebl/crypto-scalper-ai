@@ -171,7 +171,7 @@ function missingComment(ai) {
 }
 
 function display(row) {
-  const {snapshot, hyperdata, latest, accepted, queued, anomalies = []} = row, {metrics} = snapshot;
+  const {snapshot, hyperdata, latest, accepted, anomalies = []} = row, {metrics} = snapshot;
   const notes = [];
   if (snapshot.window === "1m") {
     const gate = {tape_unavailable:"Лента ещё недоступна", book_unavailable:"Нет свежего стакана",
@@ -185,8 +185,7 @@ function display(row) {
     key, ["ok", "synthetic"].includes(item.quality) ? item.value : null,
   ]));
   const assessment = accepted ?? (latest?.ai?.status === "ok" ? latest : null);
-  const attempt = queued ? (latest && !latest.ai && latest.delivery === "pending" ? "AI анализирует снимок" : "Ожидает AI")
-    : latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
+  const attempt = latest?.ai?.status !== "ok" ? missingComment(latest?.ai) : "";
   return {...current, symbol:snapshot.symbol, native:hyperdata.direction, notes, strength:row.strength,
     strengthRank:row.strength?.rank ?? 0, movementPhase:row.movement_phase?.label,
     movement:row.movement_phase, btcCorrelation:row.btc_context?.correlation,
@@ -195,7 +194,7 @@ function display(row) {
     quality:metrics.ofi.quality + " / " + metrics.price.quality,
     facts:(row.facts ?? []).join(" · "),
     summary:assessment?.ai.summary ?? attempt, captured:assessment?.captured_at,
-    comparedNative:assessment?.hyperdata.direction, attempt, queued};
+    comparedNative:assessment?.hyperdata.direction, attempt};
 }
 
 function node(tag, text, parent) {
@@ -247,10 +246,9 @@ function render() {
     ["Инструменты", market.length],
     ["Order Flow доступен", market.filter(row => row.native !== "NOT_AVAILABLE").length],
     ["Оценка AI в истории", market.filter(row => row.ai).length],
-    ["В очереди и анализе", market.filter(row => row.queued).length],
     ["Согласия / расхождения", market.filter(row => row.category?.startsWith("CONSENSUS")).length
       + " / " + market.filter(row => row.category === "DIVERGENCE").length],
-  ].filter(([label]) => !contextMode || !["Оценка AI в истории", "В очереди и анализе", "Согласия / расхождения"].includes(label))) {
+  ].filter(([label]) => !contextMode || !["Оценка AI в истории", "Согласия / расхождения"].includes(label))) {
     const card = node("div", null, $("overview"));
     card.className = "stat";
     node("small", label, card);

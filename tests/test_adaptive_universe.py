@@ -66,7 +66,7 @@ async def test_remote_and_candle_universe_are_exactly_the_same_plan():
 
     async def get(path, **params):
         if path == "/v1/attention":
-            return dict(enabled=True, active=[])
+            return dict(enabled=True, runtime_mode="unified", active=[])
         if path == "/v1/market":
             return dict(assets=overview, as_of=now)
         assert path == "/v1/snapshot"

@@ -131,7 +131,7 @@ def worker(args, forwarded):
             for name, url in {
                 "native": f"http://127.0.0.1:{args.api_port}/v1/live",
                 "screener": f"http://127.0.0.1:{args.web_port}/healthz",
-                **({"market_pulse": "http://127.0.0.1:8431/health"} if not args.without_pulse else {}),
+                **({"market_pulse": "http://127.0.0.1:8431/health"} if not args.demo else {}),
             }.items():
                 try:
                     result = fetch(url)
@@ -167,7 +167,6 @@ def worker(args, forwarded):
                 "forwarded": forwarded,
                 "api_port": args.api_port,
                 "web_port": args.web_port,
-                "without_pulse": args.without_pulse,
                 "demo": args.demo,
             }
         ),
@@ -185,7 +184,7 @@ def worker(args, forwarded):
             except OSError:
                 continue
             raise RuntimeError(f"port {port} is already used by an unmanaged process; stop the old launcher first")
-        if not args.without_pulse:
+        if not args.demo:
             env_path = ROOT / "deploy/market-pulse/.env"
             if not env_path.exists():
                 env_path.write_text(
@@ -198,9 +197,8 @@ def worker(args, forwarded):
             pulse_started = True
             compose("up", "-d", *([] if args.no_build else ["--build"]))
         env = os.environ.copy()
-        env["PULSE_UNIFIED"] = "0" if args.without_pulse else "1"
         env["PULSE_MARKETS"] = ""
-        env["PULSE_API_URL"] = "" if args.without_pulse else "http://127.0.0.1:8431"
+        env["PULSE_API_URL"] = "" if args.demo else "http://127.0.0.1:8431"
         command = [
             sys.executable,
             str(ROOT / "scripts/serve.py"),
@@ -216,7 +214,7 @@ def worker(args, forwarded):
         last_backup_attempt = 0
         deadline = time.monotonic() + 45
         while not shutdown.wait(1):
-            if not args.without_pulse and time.time() - last_backup_attempt >= 3600:
+            if not args.demo and time.time() - last_backup_attempt >= 3600:
                 last_backup_attempt = time.time()
                 snapshots = [
                     p for p in (RUNTIME / "backups").glob("market-pulse-*.dump") if p.with_suffix(".json").is_file()
@@ -266,14 +264,12 @@ def main():
     action.add_argument("--restart", action="store_true")
     action.add_argument("--status", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--without-pulse", action="store_true")
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--api-port", type=int, default=8420)
     parser.add_argument("--web-port", type=int, default=8421)
     args, forwarded = parser.parse_known_args()
     load_dotenv(ROOT / ".env")
-    args.without_pulse = args.without_pulse or args.demo
     RUNTIME.mkdir(exist_ok=True)
     if args.worker:
         worker(args, forwarded)
@@ -290,7 +286,6 @@ def main():
                 args.api_port = saved.get("api_port", args.api_port)
             if "--web-port" not in sys.argv:
                 args.web_port = saved.get("web_port", args.web_port)
-            args.without_pulse = args.without_pulse or saved.get("without_pulse", False)
             args.demo = args.demo or saved.get("demo", False)
         request_stop()
         if args.stop:
@@ -307,7 +302,6 @@ def main():
     flags += [
         name
         for enabled, name in (
-            (args.without_pulse, "--without-pulse"),
             (args.no_build, "--no-build"),
             (args.demo, "--demo"),
         )

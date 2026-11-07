@@ -212,7 +212,6 @@ async def test_ambiguous_initial_card_is_never_resent(journal):
 
 @pytest.mark.asyncio
 async def test_actual_auto_worker_free_and_strong_route(monkeypatch, journal):
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     now = time.time()
     card = dict(
@@ -293,7 +292,6 @@ async def test_actual_auto_worker_free_and_strong_route(monkeypatch, journal):
 async def test_meta_requires_two_material_episodes_and_is_not_repeated(monkeypatch, journal):
     from copy import deepcopy
 
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
     now = time.time()
     a = attention(now)
     a["policy_version"] = 4
@@ -341,7 +339,6 @@ async def test_meta_requires_two_material_episodes_and_is_not_repeated(monkeypat
 @pytest.mark.asyncio
 async def test_free_catalog_failure_never_calls_paid(monkeypatch, journal):
 
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
     a = attention(time.time())
     hub = SimpleNamespace(attention=a, alerts=SimpleNamespace(), demo=False)
     service = Screener(hub, journal, paid(), False)

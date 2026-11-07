@@ -174,8 +174,7 @@ API. Это осознанный компромисс: горячее перер
    рост RSS ≤ 50 МБ.
 
 Старый legacy web-стек (`ScalperHub`, `ScalperAPI`, `apps/scalper_web`, `--legacy`)
-удалён. Явный legacy-режим совместимости (`--without-pulse` / `PULSE_UNIFIED=0`)
-остаётся для проверки старых сценариев.
+удалён. Единственный поддерживаемый runtime — unified native hub + screener.
 
 ## Откат
 

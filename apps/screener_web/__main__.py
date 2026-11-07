@@ -90,7 +90,6 @@ async def screener(request: web.Request) -> web.Response:
                 **row,
                 "latest": latest[0] if latest else None,
                 "accepted": accepted[0] if accepted else None,
-                "queued": (symbol, frame) in service.pending,
                 "anomalies": sorted(active_anomalies(row["snapshot"])),
             }
         )
@@ -98,7 +97,7 @@ async def screener(request: web.Request) -> web.Response:
         {
             "mode": hub.status.mode,
             "runtime_mode": service.runtime_mode,
-            "runtime_error": service.runtime_diagnostic(),
+            "runtime_error": None if hub.demo else service.runtime_diagnostic(),
             "market": hub.status.market_data,
             "gemini": "configured" if service.gemini.key else "disabled",
             "ai_provider": service.gemini.provider,
@@ -215,7 +214,9 @@ async def healthz(request: web.Request) -> web.Response:
         or attention.get("archive", {}).get("error")
         or (f"attention_plan_{plan_status}" if plan_status in {"expired", "missing", "unavailable"} else None)
     )
-    runtime_error = service.runtime_diagnostic() if service is not None else None
+    runtime_error = (
+        service.runtime_diagnostic() if service is not None and not getattr(hub, "demo", False) else None
+    )
     healthy = healthy and not observation_error and not runtime_error
     return web.json_response(
         {
@@ -265,22 +266,10 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
     return app
 
 
-def service_workers(service: Screener):
-    """Background workers required by the selected runtime mode.
-
-    Unified mode keeps scanning, attention/context and card delivery, but it
-    must not start the legacy directional-AI queue or its delivery loop.
-    """
-    workers = [service.run]
-    if service.legacy_ai_enabled:
-        workers.extend([service.analyze, service.deliver])
-    return tuple(workers)
-
-
 async def run(args: argparse.Namespace) -> None:
     journal = None
     recorder = Recorder(args.record) if args.record else None
-    hub = RemoteHub(args.api_url, timeout=args.timeout)
+    hub = RemoteHub(args.api_url, timeout=args.timeout, demo=args.demo)
     runner: web.AppRunner | None = None
     tasks: list[asyncio.Task] = []
     try:
@@ -305,7 +294,8 @@ async def run(args: argparse.Namespace) -> None:
                 )
             )
             service = Screener(hub, journal, gemini, notify, recorder=recorder, pulse=pulse)
-            service.validate_runtime()
+            if not hub.demo:
+                service.validate_runtime()
             if pulse is not None:
                 tasks.append(asyncio.create_task(pulse.run(), name="market-pulse-context"))
             if service.ai_routes:
@@ -328,8 +318,8 @@ async def run(args: argparse.Namespace) -> None:
             site = web.TCPSite(runner, "127.0.0.1", args.port)
             await site.start()
             for interrupted in service.recover_pending():
-                LOG.info("Closed interrupted legacy candidate %s", interrupted)
-            tasks.extend(asyncio.create_task(worker()) for worker in service_workers(service))
+                LOG.info("Closed interrupted candidate %s", interrupted)
+            tasks.append(asyncio.create_task(service.run(), name="screener-run"))
             tasks.append(asyncio.create_task(service.refresh_quality(path), name="screener-quality"))
             if not hub.demo:
                 tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))

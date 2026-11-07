@@ -20,7 +20,7 @@ from hyperdata_terminal.data_layer.alerts import AlertManager
 from hyperdata_terminal.data_layer.market_data import AssetInfo
 from hyperdata_terminal.data_layer.orderbook import OrderBookLevel, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import CVDSnapshot, Trade
-from hyperdata_terminal.runtime_mode import UNIFIED, runtime_mode
+from hyperdata_terminal.runtime_mode import UNIFIED
 
 LOG = logging.getLogger(__name__)
 
@@ -81,14 +81,14 @@ class RemoteMarket:
 class RemoteHub:
     """A `HyperDataHub`-shaped facade over the native REST API."""
 
-    def __init__(self, api_url: str, *, timeout: float = 10.0) -> None:
+    def __init__(self, api_url: str, *, timeout: float = 10.0, demo: bool = False) -> None:
         self.api_url = api_url.rstrip("/")
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.market = RemoteMarket(self)
         self.orderflow = RemoteOrderFlow()
         self.alerts = AlertManager()
         self.status = SimpleNamespace(mode="unknown", market_data="starting")
-        self.demo = False
+        self.demo = demo
         self.ready = False
         self.last_error: str | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -138,9 +138,8 @@ class RemoteHub:
                 if exc.status != 404:
                     raise
                 self.attention = {"enabled": False}
-            if runtime_mode() == UNIFIED:
-                # A legacy or disabled native attention report means the two
-                # processes disagree; never fall back to a Top-20 legacy scan.
+            # Demo has no live attention; every live hub must expose it.
+            if not self.demo:
                 if self.attention.get("runtime_mode") != UNIFIED:
                     raise RuntimeError("native attention is not in unified mode")
                 if not self.attention.get("enabled"):

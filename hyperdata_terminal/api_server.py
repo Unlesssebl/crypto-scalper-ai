@@ -53,7 +53,7 @@ from hyperdata_terminal.native_payloads import (
     hlp_payload,
     smart_money_payload,
 )
-from hyperdata_terminal.runtime_mode import runtime_mode
+from hyperdata_terminal.runtime_mode import UNIFIED
 from hyperdata_terminal.screener_snapshot import (
     SNAPSHOT_WINDOWS,
     build_candles,
@@ -942,7 +942,7 @@ class HyperDataAPI:
     async def handle_attention(self, request: web.Request) -> web.Response:
         observation = getattr(self.hub, "observation", None)
         report = observation.report() if observation else {"enabled": False}
-        report.setdefault("runtime_mode", runtime_mode())
+        report.setdefault("runtime_mode", UNIFIED)
         return web.json_response(report)
 
     async def handle_market_symbol(self, request: web.Request) -> web.Response:

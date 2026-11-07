@@ -1,4 +1,4 @@
-"""M5: unified mode must fail explicitly instead of falling back to legacy scan."""
+"""Unified runtime must fail explicitly instead of falling back to a Top-20 scan."""
 
 import asyncio
 import time
@@ -10,22 +10,28 @@ import pytest
 
 from extensions.scalper.history.pulse_runtime import PulseObservation
 from extensions.scalper.remote import RemoteHub
+from hyperdata_terminal.runtime_mode import compatibility_error
 
 
 def _attention_error(status):
     return aiohttp.ClientResponseError(request_info=None, history=(), status=status)
 
 
+def test_runtime_contract_requires_unified_attention():
+    assert compatibility_error({"enabled": True, "runtime_mode": "unified"}) is None
+    assert "missing" in compatibility_error({"enabled": True})
+    assert "disabled" in compatibility_error({"enabled": False, "runtime_mode": "unified"})
+
+
 @pytest.mark.asyncio
-async def test_unified_remote_rejects_legacy_attention(monkeypatch):
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
+async def test_unified_remote_rejects_non_unified_attention(monkeypatch):
     hub = RemoteHub("http://unused")
 
-    async def legacy(path, **params):
+    async def non_unified(path, **params):
         assert path == "/v1/attention"
         return {"enabled": True, "runtime_mode": "legacy"}
 
-    hub._get = legacy
+    hub._get = non_unified
     with pytest.raises(RuntimeError, match="unified"):
         await hub.refresh_snapshot()
 
@@ -35,7 +41,6 @@ async def test_unified_remote_rejects_legacy_attention(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unified_remote_rejects_missing_attention(monkeypatch):
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
     hub = RemoteHub("http://unused")
 
     async def missing(path, **params):
@@ -51,7 +56,6 @@ async def test_unified_remote_rejects_missing_attention(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unified_remote_accepts_unified_attention(monkeypatch):
-    monkeypatch.setenv("PULSE_UNIFIED", "1")
     hub = RemoteHub("http://unused")
     now = time.time()
 

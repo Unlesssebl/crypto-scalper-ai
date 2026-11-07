@@ -1,44 +1,31 @@
-"""Explicit process mode shared by the native API and the screener.
+"""Unified runtime contract shared by the native API and the screener.
 
-``PULSE_UNIFIED`` is the single switch: the launcher sets it for both child
-processes, so each side can decide its own behaviour without depending on the
-temporary state of the other process's API.
+There is one supported runtime: the native hub owns exchange sockets and the
+screener owns the attention plan. ``runtime_mode`` is kept in the attention
+report so a stale or downgraded native API fails explicitly.
 """
 
 from __future__ import annotations
 
-import os
-
 UNIFIED = "unified"
-LEGACY = "legacy"
 
 
 class RuntimeModeError(RuntimeError):
-    """Native and screener disagree about the process mode."""
+    """Native attention is not compatible with the unified screener."""
 
 
-def runtime_mode() -> str:
-    return UNIFIED if os.getenv("PULSE_UNIFIED", "0").strip() == "1" else LEGACY
-
-
-def compatibility_error(mode: str, attention: dict | None) -> str | None:
-    """Return an explicit diagnostic when the native attention state is unsafe."""
+def compatibility_error(attention: dict | None) -> str | None:
+    """Return an explicit diagnostic when native attention is unsafe."""
     attention = attention if isinstance(attention, dict) else {}
     actual = attention.get("runtime_mode")
-    if mode == UNIFIED:
-        if actual != UNIFIED:
-            return (
-                "unified screener requires unified native attention "
-                f"(native mode: {actual or 'missing'})"
-            )
-        if not attention.get("enabled"):
-            return "unified screener requires native attention, but it is disabled"
-    elif actual == UNIFIED:
-        return f"legacy screener cannot use unified native attention (native mode: {actual})"
+    if actual != UNIFIED:
+        return f"native attention is not unified (native mode: {actual or 'missing'})"
+    if not attention.get("enabled"):
+        return "native attention is disabled"
     return None
 
 
-def require_compatible(mode: str, attention: dict | None) -> None:
-    error = compatibility_error(mode, attention)
+def require_compatible(attention: dict | None) -> None:
+    error = compatibility_error(attention)
     if error:
         raise RuntimeModeError(error)

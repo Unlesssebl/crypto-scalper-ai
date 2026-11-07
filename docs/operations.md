@@ -99,8 +99,7 @@ uv sync                 # или: .\.venv\Scripts\python.exe -m pip install -e .
 ## Откат
 
 Старый legacy web-стек (`ScalperHub`, `ScalperAPI`, `apps/scalper_web`, `--legacy`)
-удалён. Явный legacy-режим совместимости (`--without-pulse` или `PULSE_UNIFIED=0`)
-остаётся в коде. Откат — через git:
+и отдельный legacy-runtime удалены. Откат — через git:
 
 ```powershell
 git switch --detach scalper-baseline   # состояние форка до миграции

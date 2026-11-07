@@ -23,12 +23,13 @@
 Использовать существующий запуск native HyperData с REST API и внешнего screener. Владелец WebSocket-соединений — native Hub; screener читает `/v1/attention`, не открывая вторые биржевые соединения. После обновления кода нужно перезапустить native Hub и внешний screener.
 
 ```dotenv
-HYPERDATA_ATTENTION_ENABLED=1
-HYPERDATA_ATTENTION_SLOTS=4
+SCALPER_ATTENTION_SLOTS=20
+PULSE_ATTENTION_DETAIL_SLOTS=6
+PULSE_ATTENTION_HOLD_SECONDS=300
 HYPERDATA_HISTORY_DIR=
 ```
 
-Без явно заданного каталога история записывается в пользовательский каталог `hyperdata-screener/market-history` (`LOCALAPPDATA` на Windows). Демо не создаёт live-архив. В unified режиме (`PULSE_UNIFIED=1`) `HYPERDATA_ATTENTION_ENABLED` игнорируется: план attention задаёт screener. В явном legacy-режиме `HYPERDATA_ATTENTION_ENABLED=0` возвращает прежний режим подписок и прежний направленный AI-процесс. Не использовать этот флаг как способ «отключить только запись»: в legacy он меняет режим наблюдения целиком.
+Без явно заданного каталога история записывается в пользовательский каталог `hyperdata-screener/market-history` (`LOCALAPPDATA` на Windows). Демо не создаёт live-архив. План attention всегда задаёт screener; отдельного legacy-переключателя подписок нет.
 
 В режиме внимания автоматические направленные AI-запросы и контрольные обращения не допускаются, в том числе уже стоявшие в очереди. Вместо них работает [автоматический отбор содержательных изменений контекста](automatic-context-review.md). `/analyze SYMBOL WINDOW` сохраняет ручную [проверку фактов и интерпретаций](fact-consistency.md), если есть ключ, свежий пакет и бюджет. Без ключа измерения доступны без LLM. `/report` показывает новый фактологический отчёт. Прежняя независимая алгоритмическая оценка остаётся в журнале; она не превращается в рекомендацию входа. Автоматические и ручные разборы используют общий лимит/cooldown.
 

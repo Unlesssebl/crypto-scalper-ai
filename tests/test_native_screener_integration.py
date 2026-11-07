@@ -114,7 +114,16 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
     now = time.time()
     fake = FakeHub(now)
     api = HyperDataAPI(hub=fake)
+    fake.observation = SimpleNamespace(
+        report=lambda: {
+            "enabled": True,
+            "runtime_mode": "unified",
+            "context_only": False,
+            "active": [{"symbol": "BTC"}, {"symbol": "ETH"}],
+        }
+    )
     app = web.Application()
+    app.router.add_get("/v1/attention", api.handle_attention)
     app.router.add_get("/v1/market", api.handle_market)
     app.router.add_get("/v1/snapshot", api.handle_snapshot)
     app.router.add_get("/v1/candles", api.handle_candles)
@@ -132,7 +141,6 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
         assert book is not None and book.best_bid == 69999.0
 
         from extensions.scalper.pulse import PulseContext
-        from extensions.scalper.service import alert_market_facts
 
         pulse = PulseContext("")
         service = Screener(
@@ -148,7 +156,6 @@ async def test_native_snapshot_flows_through_remote_hub_into_screener(tmp_path) 
         assert row["snapshot"]["metrics"]["price"]["value"] == 70000.0
         assert row["hyperdata"]["direction"] == "BULLISH"
         assert row["snapshot"]["market_pulse"]["status"] == "disabled"
-        assert any(label == "Межбиржевые данные" for label, _ in alert_market_facts(row["snapshot"]))
         journal.record("pulse-evidence", {}, row["snapshot"], row["hyperdata"])
         recorded = journal.db.execute("SELECT snapshot FROM analyses WHERE id='pulse-evidence'").fetchone()[0]
         assert "market_pulse" in recorded

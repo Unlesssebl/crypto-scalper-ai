@@ -358,11 +358,11 @@ class TelegramUX:
                     continue
                 kind, reason = "strengthening", "new_level" if new_zone else "strengthened"
                 generation += 1
-            # Existing delivered legacy episodes establish a baseline; no retrospective push.
-            legacy = self.db.execute(
+            # Existing delivered episodes establish a baseline; no retrospective push.
+            existing = self.db.execute(
                 "SELECT message_id FROM episode_cards WHERE episode_id=?", (packet["episode_id"],)
             ).fetchone()
-            migrated = not previous and legacy and legacy["message_id"]
+            migrated = not previous and existing and existing["message_id"]
             card = f"ux:ops:{packet['episode_id']}:{generation}"
             with self.db:
                 if not migrated:

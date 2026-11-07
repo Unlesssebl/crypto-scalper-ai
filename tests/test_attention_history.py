@@ -10,7 +10,7 @@ from extensions.scalper.attention import Attention, AttentionPolicy
 from extensions.scalper.history.archive import Archive, read_archive
 from extensions.scalper.history.facts import Facts
 from extensions.scalper.history.replay import replay
-from extensions.scalper.history.runtime import Observation, configure
+from extensions.scalper.history.runtime import configure
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
 from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, Trade
 
@@ -190,35 +190,6 @@ def test_archive_invalid_payload_and_unfinished_run_cannot_claim_complete(tmp_pa
         list(read_archive(archive.path))
 
 
-@pytest.mark.asyncio
-async def test_observation_uses_all_assets_and_replays_assignments_without_llm(tmp_path):
-    asset = SimpleNamespace(price=1., volume_24h=1000.)
-    hub = SimpleNamespace(market=SimpleNamespace(assets={"NOT_TOP20": asset},
-                          observed_fields={"NOT_TOP20": {"price", "volume_24h"}}, observed_at=0),
-                          orderbook=SimpleNamespace(set_symbols=AsyncMock()),
-                          orderflow=SimpleNamespace(set_attention_symbols=AsyncMock()))
-    observation = Observation(hub, tmp_path)
-    for i in range(14):
-        asset.volume_24h = 1000 + i
-        hub.market.observed_at = i * 5
-        await observation.tick(i * 5)
-    asset.volume_24h = 1033
-    hub.market.observed_at = 70
-    await observation.tick(70)
-    assert list(observation.attention.active) == ["NOT_TOP20"]
-    hub.orderbook.set_symbols.assert_awaited_with(["NOT_TOP20"])
-    frame = book(70)
-    frame["data"]["coin"] = "NOT_TOP20"
-    observation.raw("book", json.dumps(frame), "book1", 70, 1)
-    observation.raw("trades:NOT_TOP20", json.dumps(dict(channel="trades", data=[dict(
-        coin="NOT_TOP20", px="1", sz="2", time=70000, tid=1, side="B")])), "trade1", 70, 2)
-    asset.volume_24h = 1034
-    hub.market.observed_at = 75
-    await observation.tick(75)
-    card = observation.report(75)["active"][0]["facts"]
-    assert card["observed_trade_count_60s"] == 1 and card["observed_trade_imbalance"] == 1
-    await observation.close()
-    assert replay(observation.archive.path)["verified"]
 
 
 @pytest.mark.asyncio
@@ -299,7 +270,7 @@ async def test_remote_idle_attention_does_not_fall_back_to_top20(monkeypatch):
     now = time.time()
     async def get(path, **params):
         if path == "/v1/attention":
-            return dict(enabled=True, context_only=True, active=[])
+            return dict(enabled=True, runtime_mode="unified", context_only=True, active=[])
         assert path == "/v1/market" and params == {"limit": 1000}
         return dict(as_of=now, assets=[dict(symbol="BTC", price=1, mark_price=1)])
     monkeypatch.setattr(hub, "_get", get)
@@ -308,16 +279,6 @@ async def test_remote_idle_attention_does_not_fall_back_to_top20(monkeypatch):
     assert hub.ready and not hub.get_all_assets() and hub.status.market_data == "connected"
 
 
-def test_manual_context_card_never_requires_or_calls_model():
-    from extensions.scalper.service import Screener
-    facts = Facts()
-    facts.apply(raw(book()))
-    service = Screener.__new__(Screener)
-    service.hub = SimpleNamespace(attention=dict(context_only=True, active=[dict(
-        symbol="SMALL", facts=facts.card("SMALL", 100))]))
-    result = service.request_analysis("small", "1m", 101)
-    assert "факты наблюдения" in result and "наблюдается 0 с" in result
-    assert "Нет свежей" in service.request_analysis("SMALL", "1m", 116)
 
 
 def test_forward_outcomes_keep_censored_and_observed_background_separate(tmp_path):

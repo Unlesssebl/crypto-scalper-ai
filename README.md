@@ -222,15 +222,13 @@ The hub owns every data component and its lifecycle; dashboards, API, MCP server
 `.\start.ps1` starts the unified runtime: native API (`8420`), screener (`8421`),
 Market Pulse (`8431`) and PostgreSQL. The screener owns the attention plan, uses
 selective context AI, and delivers Telegram cards through one persistent
-`CardOutbox`. `--without-pulse` is the explicit legacy compatibility mode; only
-then does the launcher start the old directional AI pipeline.
+`CardOutbox`. There is no alternate directional runtime.
 
-Manual unified run (both processes need `PULSE_UNIFIED=1`; omit it for the explicit
-legacy mode):
+Manual run (Market Pulse must already be running):
 
 ```bash
-PULSE_UNIFIED=1 PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata api --port 8420
-PULSE_UNIFIED=1 PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --tui --notify
+PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata api --port 8420
+PULSE_API_URL=http://127.0.0.1:8431 uv run hyperdata-screener --api-url http://127.0.0.1:8420 --port 8421 --tui --notify
 ```
 
 Record scans and compare two runs for signal regressions:

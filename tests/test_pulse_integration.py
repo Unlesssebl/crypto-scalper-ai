@@ -220,7 +220,7 @@ def test_failed_stack_start_cleans_up_partial_stack_and_management_state(tmp_pat
             raise RuntimeError("partial startup failure")
 
     monkeypatch.setattr(project, "compose", compose)
-    args = SimpleNamespace(api_port=8420, web_port=8421, without_pulse=False, no_build=True, demo=False)
+    args = SimpleNamespace(api_port=8420, web_port=8421, no_build=True, demo=False)
     with pytest.raises(RuntimeError, match="partial startup failure"):
         project.worker(args, [])
     assert commands == [("up", "-d"), ("stop",)]
