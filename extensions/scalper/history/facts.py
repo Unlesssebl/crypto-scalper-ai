@@ -5,6 +5,8 @@ from collections import OrderedDict, defaultdict, deque
 from decimal import Decimal, InvalidOperation
 from statistics import median
 
+from hyperdata_terminal.utils.helpers import exchange_time_fresh
+
 
 def number(value):
     try:
@@ -99,7 +101,7 @@ class Facts:
         if not symbol or px is None or sz is None or px <= 0 or sz <= 0 or stamp is None:
             self.errors += 1
             return
-        if not 0 <= now - stamp / 1000 <= self.max_gap:
+        if not exchange_time_fresh(now, stamp / 1000, self.max_gap):
             return  # Reconnect batches are preserved raw but are not fresh observation.
         key = (symbol, t.get("time"), t.get("tid"))
         if t.get("tid") is None or key in self.seen:
@@ -119,7 +121,7 @@ class Facts:
         if not isinstance(symbol, str) or self.managed and symbol not in self.selected:
             return
         stamp = number(book.get("time"))
-        if not symbol or stamp is None or not 0 <= now - stamp / 1000 <= self.max_gap:
+        if not symbol or stamp is None or not exchange_time_fresh(now, stamp / 1000, self.max_gap):
             if symbol:
                 self.reset(symbol)
             return

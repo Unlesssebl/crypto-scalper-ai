@@ -8,6 +8,7 @@ import aiohttp
 
 from hyperdata_terminal.instruments import binance_key, identity
 from hyperdata_terminal.network import exchange_session
+from hyperdata_terminal.utils.helpers import exchange_time_fresh
 
 from .orderbook import OrderBookEngine
 
@@ -59,7 +60,7 @@ class BinanceOrderBookEngine(OrderBookEngine):
                         if self.raw_callback:
                             self.raw_callback("binance_book", message.data, epoch, now, time.monotonic_ns())
                         stamp, update = data.get("T", data.get("E")), data.get("u")
-                        if (type(stamp) is not int or not 0 <= now - stamp / 1000 <= 15
+                        if (type(stamp) is not int or not exchange_time_fresh(now, stamp / 1000, 15)
                                 or type(update) is not int or update <= self._last_update_ids.get(symbol, -1)):
                             continue
                         self._last_update_ids[symbol] = update

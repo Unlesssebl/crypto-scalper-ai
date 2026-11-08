@@ -119,6 +119,21 @@ def source_cooldown_seconds(exc: BaseException) -> float:
     return TRANSIENT_SOURCE_COOLDOWN
 
 
+# Exchange event time may run ahead of the local wall clock: a PC that is one
+# second behind NTP sees every fresh frame with a slightly negative age. The
+# same bound is where snapshot flow quality starts reporting "clock_skew".
+CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
+
+
+def exchange_time_fresh(now: float, stamp_seconds: float, max_age: float) -> bool:
+    """True when an exchange timestamp is at most ``max_age`` old.
+
+    A stamp up to ``CLOCK_SKEW_TOLERANCE_SECONDS`` in the future still counts
+    as fresh; anything further ahead is a clock fault, not a live frame.
+    """
+    return -CLOCK_SKEW_TOLERANCE_SECONDS <= now - stamp_seconds <= max_age
+
+
 def format_distance_pct(value: float) -> str:
     """Format a distance-to-liquidation that is already a percentage.
 

@@ -20,6 +20,7 @@ import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
 from hyperdata_terminal.network import exchange_session
+from hyperdata_terminal.utils.helpers import exchange_time_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -950,7 +951,7 @@ class OrderFlowEngine:
                 or event.get("delivery_kind") != "live" or event.get("side") not in ("buy", "sell")):
             return False
         now = time.time()
-        if not 0 <= now-event["event_time_ms"]/1000 <= 15:
+        if not exchange_time_fresh(now, event["event_time_ms"] / 1000, 15):
             return False
         identity = (symbol, event.get("trade_id"), event.get("event_time_ms"))
         if event.get("trade_id") and identity in self._seen_hl_tids:
