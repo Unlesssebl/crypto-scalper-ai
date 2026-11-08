@@ -64,6 +64,7 @@ class Screener:
             slots=int(os.getenv("SCALPER_ATTENTION_SLOTS", "20")),
             detail_slots=int(os.getenv("PULSE_ATTENTION_DETAIL_SLOTS", "6")),
             hold_seconds=int(os.getenv("PULSE_ATTENTION_HOLD_SECONDS", "600")),
+            movers_slots=int(os.getenv("SCALPER_MOVERS_SLOTS", "2")),
         )
         if hub is not None:
             hub.attention_selector = self.attention
@@ -106,6 +107,9 @@ class Screener:
         from .liquidation_context import LiquidationContext
 
         self.liquidations = LiquidationContext()
+        from .whales import WhaleWatcher
+
+        self.whales = WhaleWatcher()
         if self.consistency and getattr(gemini, "session", None) is not None:
             from dataclasses import replace
 
@@ -245,12 +249,62 @@ class Screener:
                                volatility(now) if volatility else None)
             except Exception:
                 LOG.exception("Bot observation tick failed")
+        if self.bots is not None and not self.hub.demo:
+            try:
+                self.observe_liquidations(now)
+                self.observe_whales(now)
+            except Exception:
+                LOG.exception("Liquidation/whale observers failed")
         self.refresh_context_packets(now)
         if self.context_memory:
             for packet in self.context_packets.values():
                 self.context_memory.observe(packet)
         if self.telegram_ux and self.notify:
             self.telegram_ux.observe(now)
+
+    def observe_liquidations(self, now):
+        """Feed both liquidation observers from confirmed cascades across the whole universe.
+
+        Liquidation symbols are venue-agnostic (BTC); the Binance perpetual is preferred for the price and
+        24h volume when it exists, else the Hyperliquid one.
+        """
+        from .bots.triggers import liquidation_cascade
+
+        for base, totals in self.liquidations.cascades(now).items():
+            found = Screener._asset_for(self, "BINANCE:" + base) or Screener._asset_for(self, base)
+            if found is None:
+                continue
+            symbol, price, volume = found
+            for bot_id, exhaustion in (("liquidation.continuation", False), ("liquidation.exhaustion", True)):
+                self.bots.record(bot_id, symbol, liquidation_cascade(
+                    totals["longs_usd"], totals["shorts_usd"], volume, price, exhaustion=exhaustion), now)
+
+    def _asset_for(self, symbol):
+        """(symbol, price, 24h volume) from the whole market universe, else the loaded subset."""
+        found = (getattr(self.hub, "universe", None) or {}).get(symbol)
+        if found:
+            return symbol, found.get("mark_price") or found.get("price") or 0, found.get("volume_24h") or 0
+        asset = (getattr(getattr(self.hub, "market", None), "assets", None) or {}).get(symbol)
+        if asset is None:
+            return None
+        return symbol, getattr(asset, "mark_price", 0) or getattr(asset, "price", 0), asset.volume_24h
+
+    def observe_whales(self, now):
+        """Feed whale.follow from new/increased Hyperliquid positions.
+
+        The size is compared with the coin's Hyperliquid + Binance volume (where its price is made); the
+        outcome is priced like the liquidation observers (Binance perpetual when it exists).
+        """
+        from .bots.triggers import whale_position
+
+        for event in self.whales.drain():
+            venues = [Screener._asset_for(self, s) for s in ("BINANCE:" + event["symbol"], event["symbol"])]
+            venues = [v for v in venues if v is not None and v[1] and v[1] > 0]
+            if not venues:
+                continue
+            symbol, price, _ = venues[0]
+            volume = sum(v[2] or 0 for v in venues)
+            self.bots.record("whale.follow", symbol, whale_position(event, volume, price), now)
 
     def refresh_context_packets(self, now):
         attention = getattr(self.hub, "attention", {})

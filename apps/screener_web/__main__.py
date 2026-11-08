@@ -353,6 +353,8 @@ async def run(args: argparse.Namespace) -> None:
                     tasks.append(asyncio.create_task(service.telegram_ux.outcomes.run(hub), name="signal-outcomes"))
                 if hasattr(hub, "fetch_liquidations"):
                     tasks.append(asyncio.create_task(service.liquidations.run(hub), name="liquidation-context"))
+                if hasattr(hub, "fetch_whales") and service.bots is not None:
+                    tasks.append(asyncio.create_task(service.whales.run(hub), name="whale-positions"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
                 if service.liveness is not None:
                     tasks.append(asyncio.create_task(service.liveness.run(), name="pipeline-liveness"))

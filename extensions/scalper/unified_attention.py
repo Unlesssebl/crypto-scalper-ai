@@ -4,11 +4,15 @@ import json
 import math
 from collections import deque
 
+from .movers import MoversSelector
 from .relative_attention import Attention, AttentionPolicy
+
+# The native hub accepts at most 8 detail subscriptions; movers take what anomalies leave of it.
+MAX_DETAIL = 8
 
 
 class UnifiedAttention:
-    def __init__(self, journal, *, slots=20, detail_slots=6, hold_seconds=600):
+    def __init__(self, journal, *, slots=20, detail_slots=6, hold_seconds=600, movers_slots=2):
         if (type(slots) is not int or type(detail_slots) is not int
                 or not 1 <= detail_slots <= min(slots, 8) or slots > 20
                 or type(hold_seconds) is not int or not 60 <= hold_seconds <= 3600):
@@ -20,6 +24,8 @@ class UnifiedAttention:
                             context_seconds=max(330, hold_seconds))
         )
         self.activity, self.selected, self.feedback = {}, {}, {}
+        # Liquid movers never compete with anomalies for the relative allocator's slots.
+        self.movers = MoversSelector(slots=max(0, min(movers_slots, MAX_DETAIL - detail_slots)))
         self.last_at = 0
         self.plan = dict(schema_version="attention.v1", selected=[], detail=[], controls=[])
         self.archive = None
@@ -88,7 +94,9 @@ class UnifiedAttention:
             for change in changes:
                 self.archive.record("assignment", change, now)
         ranking = sorted(observations, key=lambda s: (-self.engine.scouts.get(s, {}).get("score", 0), s))
-        detail = list(self.engine.active)
+        anomalies = list(self.engine.active)
+        movers = self.movers.choose(assets, now, exclude=set(anomalies), capacity=MAX_DETAIL - len(anomalies))
+        detail = [*anomalies, *movers]
         chosen = list(dict.fromkeys([*detail, *ranking]))[: self.slots]
         self.selected = {s: {} for s in chosen}
         self.plan = dict(
@@ -106,7 +114,8 @@ class UnifiedAttention:
             policy_version=6,
             hold_seconds=self.engine.policy.context_seconds,
             requested_hold_seconds=self.requested_hold_seconds,
-            active=list(self.engine.active.values()),
+            active=[*self.engine.active.values(), *self.movers.rows()],
+            movers=self.movers.rows(),
             reasons={s: self.engine.scouts.get(s, {}) for s in chosen},
             transitions=list(self.engine.transitions)[-50:],
         )

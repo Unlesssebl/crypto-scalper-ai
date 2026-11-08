@@ -68,6 +68,15 @@ class LiquidationContext:
             cascade_side=dominant if big and aligned else None,
         )
 
+    def cascades(self, now):
+        """Per-asset confirmed totals of the last 60s for every asset with liquidations (observers)."""
+        totals = {}
+        for e in self.events:
+            if 0 <= now - e["t"] <= WINDOW:
+                row = totals.setdefault(e["symbol"], dict(longs_usd=0.0, shorts_usd=0.0))
+                row["longs_usd" if e["side"] == "long" else "shorts_usd"] += e["usd"]
+        return totals
+
     async def run(self, hub):
         while True:
             try:

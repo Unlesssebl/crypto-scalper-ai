@@ -13,7 +13,7 @@ import re
 from .context_auto import summarize
 from .fact_packet import packet_ready
 from .signal_outcomes import SignalOutcomes
-from .telegram_ux import operational
+from .telegram_ux import number, operational, usd
 
 TAG = re.compile(r"<[^>]+>")
 QUOTES = ("USDT", "USDC", "BUSD", "USD")
@@ -74,8 +74,46 @@ def zone_of(at, zone):
     )
 
 
+def eat_words(ratio):
+    """Zone notional / last-60s turnover, said as time of trading at the current pace plus what that means."""
+    seconds = ratio * 60
+    took = ("<1с" if seconds < 1 else f"~{seconds:.0f}с" if seconds < 120
+            else f"~{seconds / 60:.0f} мин" if seconds < 600 else "10+ мин")
+    size = "тонкая" if seconds < 30 else "заметная" if seconds < 120 else "крупная"
+    return f"Чтобы её съесть, нужно {took} сделок в нынешнем темпе — {size}"
+
+
+def zone_lines(state):
+    """The card's terse 🧱 line, spelled out for a hover tooltip where there is room to say what the band is."""
+    zone, mid = state.get("zone"), state.get("midpoint")
+    if not zone:
+        return []
+    bid = zone["side"] == "bid"
+    wall = (state.get("tape") or {}).get("wall")
+    head = f"🧱 {'Зелёная' if bid else 'Красная'} полоса — заявки на {'покупку' if bid else 'продажу'}"
+    if wall and wall["price"] == zone["price"]:
+        head += " на пути цены"
+    head += f": {number(zone['price'], 8)}"
+    if mid:
+        head += f" ({(zone['price'] / mid - 1) * 100:+.2f}% от цены)"
+    if zone.get("notional_usd"):
+        head += f" на {usd(zone['notional_usd'])}"
+    lines = [head]
+    if zone.get("size_to_observed_turnover") is not None:
+        lines.append(eat_words(zone["size_to_observed_turnover"]))
+    age = zone.get("observed_age_seconds")
+    if age is not None and age < 10:
+        lines.append("Появилась меньше 10с назад — может исчезнуть")
+    return lines
+
+
 def mark_of(at, symbol, reason, state, text):
     lines = card_lines(text)
+    explained = zone_lines(state)
+    if explained:
+        at_zone = next((i for i, line in enumerate(lines) if line.startswith("🧱")), None)
+        if at_zone is not None:
+            lines[at_zone:at_zone + 1] = explained
     header = lines[0] if lines else ""
     return dict(
         at=int(at * 1000),

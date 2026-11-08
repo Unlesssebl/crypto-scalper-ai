@@ -132,7 +132,7 @@ def test_sided_active_tape_pushes_before_two_minute_cooldown(service):
 
 
 def test_discovery_gate_needs_two_of_tape_activity_tradable_zone():
-    zone = dict(notional_usd=50_000, distance_bps=-20, size_to_observed_turnover=0.5)
+    zone = dict(relative_size=12, distance_bps=-20, size_to_observed_turnover=0.5)
     tape = dict(flow=-0.5, count=40)
     assert discovery_gate(dict(tape, ratio=4)) is None
     assert discovery_gate(dict(tape, zone=zone)) is None
@@ -140,8 +140,12 @@ def test_discovery_gate_needs_two_of_tape_activity_tradable_zone():
     assert discovery_gate(dict(tape, ratio=4, wide_spread=True)) == "discovery_wide_spread"
     assert discovery_gate(dict(ratio=40)) == "discovery_quiet"
     assert discovery_gate(dict(flow=-1, count=6, ratio=4)) == "discovery_quiet"  # thin tape is not a side
-    for weak in (dict(notional_usd=900), dict(distance_bps=240), dict(size_to_observed_turnover=12)):
+    for weak in (dict(relative_size=3), dict(distance_bps=240), dict(size_to_observed_turnover=12)):
         assert discovery_gate(dict(ratio=4, zone=dict(zone, **weak))) == "discovery_quiet"
+    # No dollar floor: a $900 zone in a thin book can be tradable; a near zone is judged by this volatility.
+    assert discovery_gate(dict(ratio=4, zone=dict(zone, notional_usd=900))) is None
+    assert discovery_gate(dict(ratio=4, natr_1m=0.5, zone=dict(zone, distance_bps=90))) is None  # 0.9% < 2×0.5%
+    assert discovery_gate(dict(ratio=4, natr_1m=0.1, zone=dict(zone, distance_bps=30))) == "discovery_quiet"
 
 
 def test_discovery_policy_and_interest_replay_exactly(tmp_path):

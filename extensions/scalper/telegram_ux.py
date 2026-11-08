@@ -2,6 +2,7 @@
 
 import html
 import json
+import logging
 import math
 import os
 import secrets
@@ -9,9 +10,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from .analytics_context import admission, fact_value
+from .bots.triggers import level_break, level_hold, tape_reading
 from .context_auto import decide, summarize
 from .desktop import DesktopNotifier
-from .fact_packet import packet_ready
+from .fact_packet import checksum, packet_ready
+from .levels import LevelWatcher, zones_of
 from .liquidation_context import liquidation_line
 from .microstructure import NOTABLE
 from .microstructure import label as microstructure_label
@@ -20,6 +23,7 @@ from .phase import PHASES
 from .signal_outcomes import SignalOutcomes
 from .tiger import TigerBridge
 
+LOG = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 TITLES = {
     "interesting_instrument": "Кандидат для наблюдения",
@@ -29,6 +33,7 @@ TITLES = {
     "density_context": "Удерживается значимая зона",
     "flow_price_conflict": "Поток расходится с реакцией цены",
     "early_context": "Ускорение подтверждается движением цены",
+    "mover_selected": "Ликвидное движение",
 }
 
 
@@ -176,8 +181,11 @@ def flow_side(state):
 # Discovery push gate: initial engineering thresholds, not proven trading edges.
 PUSH_MIN_TRADES = 20
 PUSH_MIN_ACTIVITY = 3
-PUSH_ZONE_MIN_USD = 25_000
-PUSH_ZONE_MAX_DISTANCE_BPS = 50
+# The zone criterion is relative to the instrument (no dollar floor): large against this book's usual
+# level, near the price for this instrument's volatility, eaten in seconds-to-minutes at its own pace.
+PUSH_ZONE_MIN_RELATIVE = 6
+PUSH_ZONE_NEAR_NATR = 2.0
+PUSH_ZONE_NEAR_FALLBACK_BPS = 50
 PUSH_ZONE_EAT_SECONDS = (10, 300)
 
 
@@ -185,7 +193,7 @@ def discovery_gate(state):
     """None when a discovery candidate deserves its own push; otherwise why it stays in the watch list.
 
     A push needs two of three: a sided tape, activity well above the norm, a tradable zone
-    (sized in dollars, near the price, eaten in seconds-to-minutes at the current pace).
+    (large for this book, near the price for this volatility, eaten in seconds-to-minutes at this pace).
     """
     if state.get("wide_spread"):
         return "discovery_wide_spread"
@@ -196,10 +204,12 @@ def discovery_gate(state):
     )
     zone = state.get("zone") or {}
     eat = zone.get("size_to_observed_turnover")
+    natr = state.get("natr_1m")
+    near = PUSH_ZONE_NEAR_NATR * natr * 100 if natr else PUSH_ZONE_NEAR_FALLBACK_BPS
     tradable_zone = bool(
-        (zone.get("notional_usd") or 0) >= PUSH_ZONE_MIN_USD
+        (zone.get("relative_size") or 0) >= PUSH_ZONE_MIN_RELATIVE
         and zone.get("distance_bps") is not None
-        and abs(zone["distance_bps"]) <= PUSH_ZONE_MAX_DISTANCE_BPS
+        and abs(zone["distance_bps"]) <= near
         and eat is not None
         and PUSH_ZONE_EAT_SECONDS[0] <= eat * 60 <= PUSH_ZONE_EAT_SECONDS[1]
     )
@@ -425,7 +435,9 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     raw = packet["symbol"]
     binance = raw.startswith("BINANCE:")
     symbol = html.escape(raw.removeprefix("BINANCE:"))
-    if state.get("discovery_kind"):
+    if state.get("mover"):
+        title = "ликвидное движение"
+    elif state.get("discovery_kind"):
         title = DISCOVERY_TITLES.get(state["discovery_kind"], "активность")
     else:
         title = TITLES.get(reason, "изменение ситуации").lower()
@@ -448,6 +460,7 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     parts = [f"<b>{header}</b>"]
 
     phrase = verdict(state, arrow)
+    mover = state.get("mover")
     spike = phrase is None and not tape and ratio is not None and ratio >= 1
     if spike:
         # Nothing but a burst of prints: the burst itself is the headline.
@@ -457,6 +470,16 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         phrase += " · 💥 на каскаде"
     if phrase:
         parts.append(phrase)
+    if mover:
+        moves = []
+        if mover.get("change_24h") is not None:
+            moves.append(f"{pct(mover['change_24h'] * 10000)} за 24ч")
+        if mover.get("change_1h") is not None:
+            moves.append(f"{pct(mover['change_1h'] * 10000)} за 1ч")
+        if mover.get("volume_24h"):
+            moves.append(f"оборот {usd(mover['volume_24h'])} за 24ч")
+        if moves:
+            parts.append("🚀 " + " · ".join(moves))
 
     reading = tape_lines(reading_state)
     if reading:
@@ -494,6 +517,56 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         parts.append(cost)
     clock = datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S")
     parts.append(f"<i>{'Binance' if binance else 'Hyperliquid'} · {title} · {clock}</i>")
+    return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
+
+
+def level_card(packet, state):
+    """A density card: where the level is, what it means for this instrument, who trades at it now."""
+    level, mid = state["level"], state.get("midpoint")
+    zone = level["zone"]
+    raw = packet["symbol"]
+    symbol = html.escape(raw.removeprefix("BINANCE:"))
+    side = "Спрос" if zone["side"] == "bid" else "Предложение"
+    where = f"🧱 {side} <code>{number(zone['price'], 8)}</code>"
+    if mid:
+        where += f" ({(zone['price'] / mid - 1) * 100:+.2f}%)"
+    header = f"{STRENGTH_MARKS.get(state.get('strength'), '')} T{state['tier']} · {symbol} · {where}".lstrip()
+    parts = [f"<b>{header}</b>"]
+    if level["kind"] == "appeared":
+        parts.append(f"Появилась крупная заявка и стоит {zone['observed_age_seconds']:.0f}с")
+    elif (level.get("eaten_share") or 0) >= 0.25:
+        parts.append(f"⚡ Заявку съедают: −{level['eaten_share'] * 100:.0f}% размера за {level.get('since') or 0:.0f}с")
+    else:
+        parts.append("⚡ Цена подошла к заявке")
+    size = []
+    if zone.get("notional_usd"):
+        size.append(usd(zone["notional_usd"]))
+    size.append(f"{zone['relative_size']:.0f}× обычного уровня стакана")
+    if zone.get("size_to_observed_turnover") is not None:
+        size.append(eat_text(zone["size_to_observed_turnover"]))
+    parts.append(" · ".join(size))
+    reading = tape_lines(state.get("tape"))
+    if reading:
+        parts.extend(reading)
+    else:
+        arrow, tape = flow_side(state)
+        if tape and not tape.startswith("Сделок мало"):
+            flow = state["flow"]
+            buys = (flow + 1) * 50
+            side_text = f"Покупки {buys:.0f}%" if flow >= 0 else f"Продажи {100 - buys:.0f}%"
+            line = f"{share_bar((flow + 1) / 2)} {side_text}"
+            if state.get("turnover_60s"):
+                line += f" · {usd(state['turnover_60s'])}/мин"
+            parts.append(line)
+    forced = liquidation_line(state.get("liquidations"), usd)
+    if forced:
+        parts.append(forced)
+    cost = cost_line(state, value(packet, "context.1m.natr"))
+    if cost:
+        parts.append(cost)
+    clock = datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S")
+    venue = "Binance" if raw.startswith("BINANCE:") else "Hyperliquid"
+    parts.append(f"<i>{venue} · плотность · {clock}</i>")
     return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
 
 
@@ -573,6 +646,7 @@ class TelegramUX:
         self.tiger = TigerBridge()
         self.desktop = DesktopNotifier()
         self.outcomes = SignalOutcomes(self.db)
+        self.levels = LevelWatcher()
         self.watch_at = 0
         self.quality = NotificationQuality(self.db)
         self.db.executescript("""
@@ -642,8 +716,19 @@ class TelegramUX:
         for packet in service.context_packets.values():
             if not packet_ready(packet, now):
                 continue
+            try:
+                self.observe_levels(packet, now)
+            except Exception:  # a level card must never stop the anomaly/mover pipeline
+                LOG.exception("Level event failed for %s", packet["symbol"])
             memory = service.context_memory.get(packet["episode_id"])
             priority, reason, state = decide(packet, memory["samples"])
+            bots = getattr(service, "bots", None)
+            if bots is not None:
+                # Measure every tape reading, sent or not: the observer, not the push filter, decides
+                # whether readings carry information.
+                bots.record("tape.reading", packet["symbol"],
+                            tape_reading(state.get("tape"), state.get("midpoint"),
+                                         value(packet, "context.1m.natr")), now)
             state["scale"] = scale(packet, state)
             state["ratio"] = activity(service, packet["symbol"], now)
             candle = getattr(service.attention, "activity", {}).get(packet["symbol"], {})
@@ -660,15 +745,27 @@ class TelegramUX:
             previous = self.db.execute(
                 "SELECT * FROM telegram_episodes WHERE episode=?", (packet["episode_id"],)
             ).fetchone()
+            movers = getattr(getattr(service, "attention", None), "movers", None)
+            mover = movers.picked.get(packet["symbol"]) if movers else None
+            if mover:
+                state["mover"] = {k: mover.get(k) for k in ("change_1h", "change_24h", "volume_24h", "score")}
+                if priority is None and previous is None:
+                    # Being picked is the news for the movers bot, once the fresh tape can say who is
+                    # pushing (or 90s have passed): a first snapshot right after subscribing reads "1 trade".
+                    warm = (state.get("count") or 0) >= MIN_FLOW_TRADES or now - mover["assigned_at"] >= 90
+                    if not warm:
+                        continue
+                    priority, reason = 1, "mover_selected"
             if priority is None:
                 continue
-            discovery = bool(state.get("discovery_kind"))
+            discovery = bool(state.get("discovery_kind")) and not mover
             # Discovery still finds instruments for the quiet watch list; only a tradable one interrupts.
-            blocked = (
-                ("discovery_wide_spread" if state.get("wide_spread") else None)
-                if discovery
-                else admission(state, reason)
-            )
+            if mover:
+                blocked = "mover_wide_spread" if state.get("wide_spread") else None
+            elif discovery:
+                blocked = "discovery_wide_spread" if state.get("wide_spread") else None
+            else:
+                blocked = admission(state, reason)
             if blocked:
                 self.quality.record(packet, state, "blocked", blocked)
                 continue
@@ -678,7 +775,7 @@ class TelegramUX:
                 or (state.get("rolling_activity") is not None and state["rolling_activity"] >= 2)
                 or (state.get("flow") is not None and abs(state["flow"]) >= 0.6 and (state.get("count") or 0) >= 20)
             )
-            if not active and not discovery:
+            if not active and not discovery and not mover:
                 self.quality.record(packet, state, "blocked", "activity_unconfirmed")
                 continue
             if previous is None:
@@ -753,7 +850,9 @@ class TelegramUX:
                 "SELECT message_id FROM episode_cards WHERE episode_id=?", (packet["episode_id"],)
             ).fetchone()
             migrated = not previous and existing and existing["message_id"]
-            card = f"ux:ops:{packet['episode_id']}:{generation}"
+            channels = getattr(service, "channels", None) or {}
+            channel = channels.get("movers" if mover else "anomalies")
+            card = f"ux:{'mov' if mover else 'ops'}:{packet['episode_id']}:{generation}"
             with self.db:
                 if not migrated:
                     pulse = service.pulse.facts(packet["symbol"], now) if service.pulse else None
@@ -769,15 +868,15 @@ class TelegramUX:
                         text,
                         rich,
                         now + 120,
-                        chat_id=str(service.hub.alerts.telegram_chat_id),
-                        destination="operations",
+                        chat_id=channel.chat_id if channel else str(service.hub.alerts.telegram_chat_id),
+                        destination=channel.spec.destination if channel else "operations",
                         reply_markup=self.markup(card, packet, now + 120),
                         silent=state["route"] == "silent",
                     )
-                    if state["route"] == "alert":
+                    if state["route"] == "alert" and (channel is None or channel.spec.desktop):
                         # Strong and liquid only: the trading PC; a click opens it in TigerTrade.
                         self.desktop.notify(packet["symbol"], text, now + 120)
-                    self.audit(packet, reason, "queued", state)
+                    self.audit(packet, reason, "queued", state, channel.name if channel else "anomalies")
                     self.quality.record(packet, state, "queued", reason, card=card)
                 self.db.execute(
                     "INSERT OR REPLACE INTO telegram_episodes VALUES(?,?,?,?,?)",
@@ -785,6 +884,53 @@ class TelegramUX:
                 )
         if now - self.watch_at >= 60:
             self.watch(now)
+
+    def observe_levels(self, packet, now):
+        """Densities for the levels bot: relative to the instrument, one card per level and event."""
+        service = self.service
+        events = self.levels.process(packet["symbol"], zones_of(packet), value(packet, "context.1m.natr"), now)
+        if not events:
+            return
+        assets = getattr(getattr(service.hub, "market", None), "assets", None) or {}
+        turnover = value(packet, "tape.observed_turnover_60s")
+        tier, tier_source = liquidity_tier(getattr(assets.get(packet["symbol"]), "volume_24h", None), turnover)
+        channels = getattr(service, "channels", None) or {}
+        channel = channels.get("levels")
+        bots = getattr(service, "bots", None)
+        natr = value(packet, "context.1m.natr")
+        price = value(packet, "book.midpoint")
+        for event in events:
+            if bots is not None and event["kind"] == "approach":
+                # The same approach is measured both ways: did the level hold, or did price go through?
+                bots.record("formation.hold", packet["symbol"], level_hold(event["zone"], price, natr), now)
+                bots.record("formation.break", packet["symbol"], level_break(event["zone"], price, natr), now)
+            # Coming to (or eating) an announced level is the urgent one; a new level is notable.
+            strength = "strong" if event["kind"] == "approach" else "notable"
+            state = dict(summarize(packet), tier=tier, tier_source=tier_source, strength=strength,
+                         route=route(tier, strength), turnover_60s=turnover,
+                         level=dict(kind=event["kind"], zone=event["zone"], eaten_share=event.get("eaten_share"),
+                                    since=event.get("since")))
+            reason = "level_" + event["kind"]
+            if state["route"] == "watch":
+                self.quality.record(packet, state, "blocked", f"{reason}_t{tier}")
+                continue
+            context = getattr(service, "liquidations", None)
+            if context is not None:
+                state["liquidations"] = context.recent(packet["symbol"], now, turnover, state.get("tape_change"))
+            text, rich = level_card(packet, state)
+            zone_key = checksum(dict(zone=event["zone"]["id"]))[:12]
+            card = f"ux:lvl:{packet['episode_id']}:{zone_key}:{event['kind']}"
+            with self.db:
+                service.consistency.save_packet(packet)
+                service.outbox.enqueue(
+                    card, text, rich, now + 120,
+                    chat_id=channel.chat_id if channel else str(service.hub.alerts.telegram_chat_id),
+                    destination=channel.spec.destination if channel else "operations",
+                    reply_markup=self.markup(card, packet, now + 120),
+                    silent=state["route"] == "silent",
+                )
+                self.audit(packet, reason, "queued", state, channel.name if channel else "anomalies")
+                self.quality.record(packet, state, "queued", reason, card=card)
 
     def watch(self, now):
         self.watch_at = now

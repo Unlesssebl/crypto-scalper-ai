@@ -88,6 +88,10 @@ class SignalOutcomes:
 
         arrow = card_arrow(state)
         side = 1 if arrow == "▲" else -1 if arrow == "▼" else 0
+        level = state.get("level")
+        if level:
+            # A level card is scored as "the level held": up from a bid, down from an ask.
+            side = 1 if level["zone"]["side"] == "bid" else -1
         price = state.get("midpoint")
         result = score(at, price, side, candles) if candles else None
         status = "measured" if result else "missing"

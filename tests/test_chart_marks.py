@@ -42,6 +42,23 @@ def test_card_lines_drop_html_but_keep_the_words():
     ]
 
 
+def test_zone_line_is_spelled_out_for_the_tooltip():
+    from extensions.scalper.chart_marks import zone_lines
+
+    state = dict(midpoint=1277.35, zone=dict(side="bid", price=1275.9, notional_usd=152_000,
+                 size_to_observed_turnover=4.7, observed_age_seconds=300))
+    assert zone_lines(state) == [
+        "🧱 Зелёная полоса — заявки на покупку: 1275.9 (-0.11% от цены) на $152k",
+        "Чтобы её съесть, нужно ~5 мин сделок в нынешнем темпе — крупная",
+    ]
+    ask = dict(midpoint=100, tape=dict(wall=dict(price=100.05)),
+               zone=dict(side="ask", price=100.05, size_to_observed_turnover=0.2, observed_age_seconds=4))
+    head, eat, new = zone_lines(ask)
+    assert head.startswith("🧱 Красная полоса — заявки на продажу на пути цены: 100.05")
+    assert eat.endswith("~12с сделок в нынешнем темпе — тонкая") and new.startswith("Появилась")
+    assert zone_lines(dict(midpoint=1)) == []
+
+
 def test_marks_return_the_sent_card_for_the_chart_instrument(service):
     now = time.time()
     observe(service, now)  # BTC on Hyperliquid, T1 notable → a sent card
@@ -51,6 +68,8 @@ def test_marks_return_the_sent_card_for_the_chart_instrument(service):
     assert mark["symbol"] == "BTC" and mark["venue"] == "Hyperliquid" and mark["side"] == 1
     assert mark["tier"] == 1 and mark["strength"] == "notable" and mark["price"] == 10
     assert mark["lines"][0] == "🔸 T1 · BTC ▲" and not any("<" in line for line in mark["lines"])
+    assert any(line.startswith("🧱 Зелёная полоса — заявки на покупку") for line in mark["lines"])
+    assert not any(line.startswith("🧱 Спрос") for line in mark["lines"])
     zone = mark["zone"]
     assert zone["side"] == "bid" and zone["price"] == 9.99 and zone["notional_usd"] is None
     assert zone["first_seen"] == pytest.approx(mark["at"] - 40_000, abs=1)  # visible 40s before the card

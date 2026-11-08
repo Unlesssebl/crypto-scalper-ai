@@ -243,7 +243,9 @@ def test_summary_marks_declared_but_unimplemented_bots():
     payload = obs.report()
     by_id = {bot["id"]: bot for bot in payload["bots"]}
     assert by_id["flow.continuation"]["implemented"] is True
-    assert by_id["attention.relative_move"]["implemented"] is False
+    assert by_id["attention.relative_move"]["implemented"] is True  # fed by the plan diff
+    assert by_id["tape.reading"]["implemented"] is True  # fed by events
+    assert by_id["ai.direction"]["implemented"] is False
     assert "ожидает реализации" in payload["text"]
 
 

@@ -104,6 +104,7 @@ class RemoteHub:
         self._as_of = 0.0
         self.attention = {"enabled": False}
         self.scout_prices = {}
+        self.universe = {}  # every /v1/market asset by symbol (market.assets holds only the selected ones)
         self._warnings: list[str] = []
         key = os.getenv("HYPERDATA_API_KEY", "").strip()
         self._headers = {"X-API-Key": key} if key else {}
@@ -179,6 +180,7 @@ class RemoteHub:
             assets = [a for a in overview if selected is None or a["symbol"] in selected]
             if selected is None:
                 assets = assets[:20]
+            self.universe = {a["symbol"]: a for a in overview if isinstance(a.get("symbol"), str)}
             self.scout_prices = {
                 a["symbol"]: (a.get("mark_price"), observed)
                 for a in overview

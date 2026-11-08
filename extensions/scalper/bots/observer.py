@@ -15,7 +15,7 @@ import time
 
 from .contracts import active_specs, spec_by_id
 from .store import derive_id, dumps, ensure_schema, register_spec, save_state, state_row
-from .triggers import TRIGGERS
+from .triggers import EVENT_TRIGGERS, TRIGGERS, attention_entry
 
 LOG = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ EXIT_TOLERANCE_S = 30.0
 END_GRACE_S = 15.0
 MIN_EPISODE_S = 60.0
 CONTROL_TARGET = 5
+ATTENTION_QUIET_S = 600  # a detail slot counts as a new entry after 10 minutes without one
 
 
 def _quote(prices: dict, symbol: str):
@@ -167,6 +168,12 @@ class BotObservatory:
         self._implemented = {spec.id: TRIGGERS.get(spec.trigger) for spec in self.specs}
         self._fallback_attempts: dict[tuple[str, int], float] = {}
         self._last_true: dict[tuple[str, str, str], float] = {}
+        # The latest pass's plan and price/volatility context, for events recorded between passes.
+        self._last_selected: set[str] = set()
+        self._last_detail: set[str] = set()
+        self._last_context: dict = {}
+        self._prev_plan: tuple[set[str], set[str]] | None = None  # first pass is a baseline
+        self._detail_seen: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -190,6 +197,8 @@ class BotObservatory:
         detail = set(plan.get("detail") or [])
         selected = set(plan.get("selected") or []) | detail
         context = dict(prices=prices, volatility=volatility)
+        self._last_selected, self._last_detail, self._last_context = selected, detail, context
+        self._observe_attention(now, plan, selected, detail, rows, prices)
         for spec in self.specs:
             trigger = self._implemented.get(spec.id)
             if not spec.enabled or trigger is None:
@@ -206,6 +215,50 @@ class BotObservatory:
                 except Exception:
                     LOG.exception("Bot %s trigger failed for %s/%s", spec.id, symbol, window)
         self._capture_marks(now, prices)
+
+    def implemented(self, spec) -> bool:
+        return self._implemented.get(spec.id) is not None or spec.trigger in EVENT_TRIGGERS
+
+    def _observe_attention(self, now, plan, selected, detail, rows, prices) -> None:
+        """attention.relative_move: one event per symbol getting a detail slot (anomaly or mover).
+
+        plan.selected is not used: its tail is a scout ranking that rotates through hundreds of symbols
+        a minute. An entry counts only after ATTENTION_QUIET_S out of detail, and never on the first pass.
+        """
+        first = self._prev_plan is None
+        self._prev_plan = (set(selected), set(detail))
+        entries = [s for s in sorted(detail)
+                   if not first and now - self._detail_seen.get(s, float("-inf")) > ATTENTION_QUIET_S]
+        for symbol in detail:
+            self._detail_seen[symbol] = now
+        for symbol in [s for s, at in self._detail_seen.items() if now - at > 2 * ATTENTION_QUIET_S]:
+            del self._detail_seen[symbol]
+        movers = {r.get("symbol") for r in plan.get("movers") or []}
+        for symbol in entries:
+            quote = _quote(prices, symbol)
+            if quote is None:
+                continue
+            slot = "mover" if symbol in movers else "detail" if symbol in detail else "overview"
+            rank = ((rows.get((symbol, "5m")) or {}).get("strength") or {}).get("rank")
+            self.record("attention.relative_move", symbol,
+                        attention_entry(slot, quote[0], rank if type(rank) is int else None), now)
+
+    def record(self, bot_id: str, symbol: str, event: dict | None, now: float) -> bool:
+        """Observe an event that does not come from a screener row (tape reading, level, cascade).
+
+        Episodes, cooldowns, controls and outcomes follow the same rules as row triggers; controls use
+        the last pass's scout volatility. Returns True when the bot is active and took the event.
+        """
+        spec = next((s for s in self.specs if s.id == bot_id), None)
+        if spec is None or not spec.enabled or event is None:
+            return False
+        try:
+            self._observe_event(spec, symbol, spec.window, {}, event, now, {}, self._last_selected,
+                                self._last_detail, self._last_context)
+        except Exception:
+            LOG.exception("Bot %s event failed for %s", bot_id, symbol)
+            return False
+        return True
 
     def _end_state(self, spec, symbol: str, window: str, now: float) -> None:
         state = state_row(self.db, spec, symbol, window)
@@ -642,7 +695,7 @@ class BotObservatory:
             if spec is None:
                 return {"status": "unknown", "bot_id": bot_id, "text": "Неизвестный бот.", "html": "Неизвестный бот."}
             data = summarize(
-                self.db, spec, implemented=self._implemented.get(spec.id) is not None, source=self.source
+                self.db, spec, implemented=self.implemented(spec), source=self.source
             )
             return {
                 "status": "ok",
@@ -652,7 +705,7 @@ class BotObservatory:
             }
         bots = [
             summarize(
-                self.db, spec, implemented=self._implemented.get(spec.id) is not None, source=self.source
+                self.db, spec, implemented=self.implemented(spec), source=self.source
             )
             for spec in active_specs()
         ]
