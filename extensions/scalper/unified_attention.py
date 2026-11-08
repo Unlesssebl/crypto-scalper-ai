@@ -118,6 +118,27 @@ class UnifiedAttention:
                 )
         return chosen
 
+    def volatility(self, now):
+        """Scout volatility for every instrument: RMS mark-move rate, bps/s.
+
+        The same reference the v5+ allocator ranks against: the last
+        ``baseline_size`` scout intervals (~10 minutes), at least
+        ``baseline_samples`` of them, and the instrument seen within
+        ``stale_seconds``.  Used to match bot controls across the universe.
+        """
+        p = self.engine.policy
+        result = {}
+        for symbol, movements in self.engine.movement_baselines.items():
+            seen = self.engine.previous.get(symbol)
+            # The scan's `now` is taken before the refresh that scouts, so the
+            # last scout may be slightly newer than `now`.
+            if len(movements) < p.baseline_samples or not seen or abs(now - seen[0]) > p.stale_seconds:
+                continue
+            value = math.hypot(*movements) / math.sqrt(len(movements))
+            if math.isfinite(value):
+                result[symbol] = value
+        return result
+
     def close(self):
         if self.archive:
             self.archive.close()

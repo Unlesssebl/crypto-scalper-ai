@@ -66,20 +66,43 @@ def natr_bucket(natr):
     return round(math.log2(natr) * 2) / 2
 
 
-def choose_controls(rows: dict, window: str, signal_symbol: str, excluded: set[str], signal_natr, seed: str):
-    """Pick same-time, same-volatility-bucket inactive instruments.
+def _pick(metric_by_symbol: dict, signal_metric, seed: str, distinct=None):
+    """Deterministic same-bucket draw; widen to the nearest buckets if thin.
 
-    ``excluded`` is the detail set (``plan.detail``): instruments with a live
-    tape that could carry the signal themselves.  In the unified runtime the
-    scan rows are exactly ``plan.selected``, so excluding the whole overview
-    left no candidates at all.  Overview-only rows have NATR and a mark but no
-    tape, so the trigger cannot fire on them.
-
-    The bucket is a coarse log2 NATR band so a quiet instrument is not compared
-    with a high-volatility one.  If the bucket is too thin we widen the search
-    rather than silently substitute a mismatched control.
+    The bucket is a coarse log2 band so a quiet instrument is not compared
+    with a high-volatility one.  If the bucket is too thin the search widens
+    rather than silently substituting a mismatched control; the stored bucket
+    shows what was targeted.  ``distinct`` maps a symbol to a key allowed
+    once among the chosen controls (the underlying asset).
     """
-    target_bucket = natr_bucket(signal_natr)
+    target_bucket = natr_bucket(signal_metric)
+    if not metric_by_symbol:
+        return [], target_bucket
+    rng = random.Random(seed)
+    symbols = sorted(metric_by_symbol)
+    rng.shuffle(symbols)
+    if target_bucket is not None:
+        # Stable sort: same bucket first, then the nearest ones, each in seeded order.
+        symbols.sort(key=lambda symbol: abs((natr_bucket(metric_by_symbol[symbol]) or 0) - target_bucket))
+    chosen, seen = [], set()
+    for symbol in symbols:
+        key = distinct(symbol) if distinct else symbol
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(symbol)
+        if len(chosen) == CONTROL_TARGET:
+            break
+    return chosen, target_bucket
+
+
+def choose_controls(rows: dict, window: str, signal_symbol: str, excluded: set[str], signal_natr, seed: str):
+    """``random_natr_5``: same-time scan rows matched on the NATR bucket.
+
+    ``excluded`` is the detail set (``plan.detail``).  In the unified runtime
+    the scan rows are exactly ``plan.selected``, which rotates every scan, so
+    overview rows rarely carry NATR; see ``choose_scout_controls``.
+    """
     natr_by_symbol = {}
     for (symbol, frame), row in rows.items():
         if frame != window or symbol == signal_symbol or symbol in excluded:
@@ -88,22 +111,37 @@ def choose_controls(rows: dict, window: str, signal_symbol: str, excluded: set[s
         if natr is None or natr <= 0:
             continue
         natr_by_symbol[symbol] = natr
-    if not natr_by_symbol:
-        return [], target_bucket
+    return _pick(natr_by_symbol, signal_natr, seed)
 
-    rng = random.Random(seed)
-    symbols = list(natr_by_symbol)
-    rng.shuffle(symbols)
-    if target_bucket is None:
-        return symbols[:CONTROL_TARGET], None
 
-    exact = [symbol for symbol in symbols if natr_bucket(natr_by_symbol[symbol]) == target_bucket]
-    chosen = exact[:CONTROL_TARGET]
-    if len(chosen) < CONTROL_TARGET:
-        rest = [symbol for symbol in symbols if symbol not in chosen]
-        rest.sort(key=lambda symbol: abs((natr_bucket(natr_by_symbol[symbol]) or 0) - target_bucket))
-        chosen.extend(rest[: CONTROL_TARGET - len(chosen)])
-    return chosen, target_bucket
+def underlying(symbol: str) -> str:
+    """Venue-free asset name: BINANCE:BNB and BNB are the same underlying."""
+    return symbol.removeprefix("BINANCE:").upper()
+
+
+def choose_scout_controls(volatility: dict, prices: dict, signal_symbol: str, excluded: set[str], seed: str):
+    """``random_scout_vol_5``: inactive instruments from the whole scouted universe.
+
+    ``volatility`` is the allocator's RMS mark-move rate (bps/s, ~10 min) for
+    every scouted instrument, signal included, so both sides of the match use
+    one measure.  Candidates are outside the attention plan (``excluded`` is
+    ``plan.selected | plan.detail``), not the signal's underlying on another
+    venue, and must have a mark now so their entry can be priced.  At most one
+    control per underlying, so BINANCE:ETH and ETH never both count.
+    """
+    base = underlying(signal_symbol)
+    pool = {
+        symbol: value
+        for symbol, value in volatility.items()
+        if symbol != signal_symbol
+        and symbol not in excluded
+        and underlying(symbol) != base
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+        and _quote(prices, symbol) is not None
+    }
+    return _pick(pool, volatility.get(signal_symbol), seed, distinct=underlying)
 
 
 class BotObservatory:
@@ -134,11 +172,24 @@ class BotObservatory:
     # Ingestion
     # ------------------------------------------------------------------
 
-    def tick(self, now: float, rows: dict, prices: dict, attention: dict | None = None) -> None:
-        """Observe one screener pass.  Safe to call from the synchronous scan."""
+    def tick(
+        self,
+        now: float,
+        rows: dict,
+        prices: dict,
+        attention: dict | None = None,
+        volatility: dict | None = None,
+    ) -> None:
+        """Observe one screener pass.  Safe to call from the synchronous scan.
+
+        ``volatility`` is the scout volatility of the whole universe; contracts
+        with ``control="random_scout_vol_5"`` need it.  Without it (replay
+        recordings do not carry it) their control sets stay empty.
+        """
         plan = attention or {}
         detail = set(plan.get("detail") or [])
         selected = set(plan.get("selected") or []) | detail
+        context = dict(prices=prices, volatility=volatility)
         for spec in self.specs:
             trigger = self._implemented.get(spec.id)
             if not spec.enabled or trigger is None:
@@ -151,7 +202,7 @@ class BotObservatory:
                     if event is None:
                         self._end_state(spec, symbol, window, now)
                     else:
-                        self._observe_event(spec, symbol, window, row, event, now, rows, selected, detail)
+                        self._observe_event(spec, symbol, window, row, event, now, rows, selected, detail, context)
                 except Exception:
                     LOG.exception("Bot %s trigger failed for %s/%s", spec.id, symbol, window)
         self._capture_marks(now, prices)
@@ -180,7 +231,9 @@ class BotObservatory:
             last_seen=now,
         )
 
-    def _observe_event(self, spec, symbol, window, row, event, now, rows, selected, detail=frozenset()) -> None:
+    def _observe_event(
+        self, spec, symbol, window, row, event, now, rows, selected, detail=frozenset(), context=None
+    ) -> None:
         direction = int(event["direction"])
         self._last_true[(spec.id, symbol, window)] = now
         state = state_row(self.db, spec, symbol, window)
@@ -242,9 +295,8 @@ class BotObservatory:
                         "VALUES(?,?,?,'pending')",
                         (episode_id, horizon, now + 1.0 + horizon),
                     )
-                controls, bucket = choose_controls(
-                    rows, window, symbol, detail, event.get("natr"), seed=episode_id
-                )
+                controls, bucket = self._controls(spec, symbol, window, rows, event, selected, detail,
+                                                  context or {}, episode_id)
                 self.db.execute(
                     "INSERT OR IGNORE INTO bot_control_sets("
                     "id,trigger_event_id,direction,mode,symbols,bucket,created_at"
@@ -277,6 +329,14 @@ class BotObservatory:
             started_at=now,
             last_seen=now,
         )
+
+    def _controls(self, spec, symbol, window, rows, event, selected, detail, context, episode_id):
+        if spec.control == "random_scout_vol_5":
+            volatility = context.get("volatility")
+            if not volatility:
+                return [], None
+            return choose_scout_controls(volatility, context.get("prices") or {}, symbol, selected, episode_id)
+        return choose_controls(rows, window, symbol, detail, event.get("natr"), seed=episode_id)
 
     def _touch_state(self, spec, symbol: str, window: str, state, now: float) -> None:
         last_seen = float(state["last_seen"])

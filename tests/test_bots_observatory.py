@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from extensions.scalper.bots.contracts import spec_by_id
-from extensions.scalper.bots.observer import BotObservatory, choose_controls
+from extensions.scalper.bots.observer import BotObservatory, choose_controls, choose_scout_controls
 from extensions.scalper.bots.report import bot_card
 from extensions.scalper.bots.stats import benjamini_hochberg, status_for, status_for_bot
 from extensions.scalper.bots.store import ensure_schema
@@ -117,9 +117,10 @@ async def test_outcomes_and_stats_use_marks_and_controls():
     plan = {"selected": ["ETH"]}
     control_prices = {"SOL": 10.0, "XRP": 10.0, "DOGE": 10.0, "ADA": 10.0, "AVAX": 10.0}
 
-    obs.tick(1_000.0, market_rows(), quotes({"BTC": 100.0, **control_prices}, 1_001.2), plan)
-    obs.tick(1_002.0, market_rows(), quotes({"BTC": 100.0, **control_prices}, 1_001.2), plan)
-    obs.tick(1_062.0, market_rows(), quotes({"BTC": 101.0, **control_prices}, 1_061.2), plan)
+    volatility = {symbol: 1.0 for symbol in ("BTC", "ETH", *control_prices)}
+    obs.tick(1_000.0, market_rows(), quotes({"BTC": 100.0, **control_prices}, 1_001.2), plan, volatility)
+    obs.tick(1_002.0, market_rows(), quotes({"BTC": 100.0, **control_prices}, 1_001.2), plan, volatility)
+    obs.tick(1_062.0, market_rows(), quotes({"BTC": 101.0, **control_prices}, 1_061.2), plan, volatility)
     await obs.settle(1_063.0)
     obs.tick(1_302.0, market_rows(), quotes({"BTC": 102.0, **control_prices}, 1_301.2), plan)
     await obs.settle(1_303.0)
@@ -315,14 +316,15 @@ def test_entry_mark_after_the_window_is_not_used():
     assert tuple(_entry(db)) == (None, None, "unscored", "no_entry_mark")
 
 
-def test_unified_plan_controls_come_from_overview_rows_not_detail():
-    """Unified runtime: every scan row is in plan.selected.
+def test_natr_contract_controls_come_from_overview_rows_not_detail():
+    """random_natr_5: every unified scan row is in plan.selected.
 
     Excluding the whole overview left every control set empty. Only the
     detail set (live tape) is excluded; overview-only rows are valid controls.
     """
     db = make_db()
-    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    spec = replace(spec_by_id("flow.continuation"), version=1, control="random_natr_5")
+    obs = BotObservatory(db, [spec], now=1_000.0)
     rows = market_rows()
     symbols = [symbol for symbol, _ in rows]
     plan = {"selected": symbols, "detail": ["BTC", "ETH"]}
@@ -334,3 +336,96 @@ def test_unified_plan_controls_come_from_overview_rows_not_detail():
     assert points == 5 * 3
     trigger = json.loads(db.execute("SELECT trigger_json FROM bot_observations").fetchone()[0])
     assert trigger["selected"] is True
+
+
+def test_flow_continuation_v2_declares_scout_volatility_controls():
+    spec = spec_by_id("flow.continuation")
+    assert (spec.version, spec.control) == (2, "random_scout_vol_5")
+
+
+def test_scout_controls_come_from_universe_outside_the_plan():
+    """Inactive = outside plan.selected | plan.detail, other underlying, priced now."""
+    volatility = {
+        "BINANCE:BNB": 0.40,  # signal
+        "BNB": 0.40,  # same underlying on Hyperliquid
+        "OVERVIEW": 0.40,  # in plan.selected
+        "DETAIL": 0.40,  # in plan.detail
+        "UNPRICED": 0.40,  # no mark now
+        "ZERO": 0.0,  # no movement: no bucket
+        **{f"MATCH{i}": 0.41 for i in range(7)},  # same bucket as 0.40
+        "FAR": 4.0,
+    }
+    prices = quotes({s: 1.0 for s in volatility if s != "UNPRICED"}, 1_001.0)
+    chosen, bucket = choose_scout_controls(volatility, prices, "BINANCE:BNB", {"OVERVIEW", "DETAIL"}, "seed")
+    assert bucket == round(__import__("math").log2(0.40) * 2) / 2
+    assert len(chosen) == 5
+    assert all(symbol.startswith("MATCH") for symbol in chosen)
+    assert chosen == choose_scout_controls(volatility, prices, "BINANCE:BNB", {"OVERVIEW", "DETAIL"}, "seed")[0]
+
+
+def test_scout_controls_widen_to_nearest_bucket_when_thin():
+    volatility = {"SIG": 0.4, "A": 0.41, "NEAR": 0.6, "FAR": 8.0, "MID": 1.6}
+    prices = quotes({s: 1.0 for s in volatility}, 1_001.0)
+    chosen, _ = choose_scout_controls(volatility, prices, "SIG", set(), "seed")
+    assert chosen[:1] == ["A"]
+    assert chosen.index("NEAR") < chosen.index("MID") < chosen.index("FAR")
+
+
+def test_live_tick_records_scout_controls_and_their_points():
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    rows = market_rows()
+    plan = {"selected": [s for s, _ in rows], "detail": ["BTC"]}
+    universe = {f"U{i}": 1.0 for i in range(9)}
+    volatility = {"BTC": 1.0, **{s: 1.0 for s, _ in rows}, **universe}
+    obs.tick(1_000.0, rows, quotes({"BTC": 100.0, **universe}, 1_001.2), plan, volatility)
+
+    chosen, bucket = db.execute("SELECT symbols,bucket FROM bot_control_sets").fetchone()
+    chosen = json.loads(chosen)
+    assert len(chosen) == 5 and set(chosen) <= set(universe)
+    assert bucket == "+0.0"
+    assert db.execute("SELECT COUNT(*) FROM bot_control_points").fetchone()[0] == 5 * 3
+    obs.tick(1_005.0, rows, quotes({"BTC": 100.0, **universe}, 1_002.5), plan, volatility)
+    assert db.execute("SELECT COUNT(*) FROM bot_control_points WHERE status='active'").fetchone()[0] == 15
+
+
+def test_scout_controls_stay_empty_without_volatility():
+    """Replay recordings carry no scout volatility; no silent NATR substitute."""
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    obs.tick(1_000.0, market_rows(), quotes({"BTC": 100.0}, 1_001.2), {"selected": ["ETH"]})
+    assert tuple(db.execute("SELECT symbols,bucket FROM bot_control_sets").fetchone()) == ("[]", "")
+    assert db.execute("SELECT COUNT(*) FROM bot_observations").fetchone()[0] == 1
+
+
+def test_allocator_scout_volatility_is_rms_of_fresh_baselines():
+    import math
+    from collections import deque
+
+    from extensions.scalper.unified_attention import UnifiedAttention
+
+    selector = UnifiedAttention(None)
+    engine = selector.engine
+    need = engine.policy.baseline_samples
+    engine.movement_baselines = {
+        "READY": deque([3.0, 4.0] * need),
+        "SHORT": deque([1.0] * (need - 1)),
+        "STALE": deque([1.0] * need),
+        "AHEAD": deque([2.0] * need),
+    }
+    engine.previous = {"READY": [100.0, 1, 0], "SHORT": [100.0, 1, 0], "STALE": [60.0, 1, 0],
+                       "AHEAD": [101.5, 1, 0]}  # scouted just after the scan's `now`
+    result = selector.volatility(100.0)
+    assert set(result) == {"READY", "AHEAD"}
+    assert math.isclose(result["READY"], math.sqrt((9 + 16) / 2))
+    assert math.isclose(result["AHEAD"], 2.0)
+
+
+def test_scout_controls_take_one_symbol_per_underlying():
+    volatility = {"SIG": 0.4, "ETH": 0.4, "BINANCE:ETH": 0.4, "SOL": 0.4, "BINANCE:SOL": 0.4,
+                  "XRP": 0.4, "ADA": 0.4, "DOGE": 0.4}
+    prices = quotes({s: 1.0 for s in volatility}, 1_001.0)
+    for seed in ("a", "b", "c", "d"):
+        chosen, _ = choose_scout_controls(volatility, prices, "SIG", set(), seed)
+        bases = [s.removeprefix("BINANCE:") for s in chosen]
+        assert len(chosen) == 5 and len(set(bases)) == 5

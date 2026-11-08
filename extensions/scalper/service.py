@@ -227,7 +227,9 @@ class Screener:
             bot_prices.update(scout_prices)
         if self.bots is not None and not self.hub.demo:
             try:
-                self.bots.tick(now, self.rows, bot_prices, self.attention.plan)
+                volatility = getattr(self.attention, "volatility", None)
+                self.bots.tick(now, self.rows, bot_prices, self.attention.plan,
+                               volatility(now) if volatility else None)
             except Exception:
                 LOG.exception("Bot observation tick failed")
         self.refresh_context_packets(now)

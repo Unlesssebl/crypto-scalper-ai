@@ -111,6 +111,11 @@ BOTS: tuple[BotSpec, ...] = (
         hypothesis="Сильный поток (rank 3–4) продолжается лучше слабого (rank 1–2)",
         primary_test="mean signed bps, rank 3-4 > rank 1-2",
         window="5m",
+        # v2: controls from the whole scouted universe matched on scout
+        # volatility. v1 matched NATR of scan rows, which in the unified
+        # runtime left every control set empty.
+        version=2,
+        control="random_scout_vol_5",
         note="Первая волна: журнал, исходы, Telegram-отчёт.",
     ),
     BotSpec(
