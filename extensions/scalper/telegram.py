@@ -367,6 +367,7 @@ async def listen_reports(session, service):
             {"command": "analyze", "description": "Анализ: /analyze BTC 1m"},
             {"command": "bots", "description": "Статистика наблюдателей"},
             {"command": "bot", "description": "Детально: /bot flow.continuation"},
+            {"command": "stats", "description": "Статистика сигналов этого бота"},
         )
         if commands is not None and not any(c["command"] == item["command"] for c in commands)
     ]
@@ -411,6 +412,18 @@ async def listen_reports(session, service):
                 )
             command = report_command(update, chat_id, bot["username"], time.time())
             service.journal.save_telegram_offset(bot["id"], offset)
+            message = update.get("message") or {}
+            if (
+                getattr(service, "telegram_ux", None)
+                and str(message.get("chat", {}).get("id", "")) == str(chat_id)
+                and (message.get("text") or "").strip().split("@")[0] == "/stats"
+            ):
+                from .channels import stats_text
+
+                anomalies = service.channels.get("anomalies")
+                if anomalies:
+                    await alerts.send_telegram(stats_text(service, anomalies), chat_id=chat_id)
+                continue
             bot_query = bots_command(update, chat_id, bot["username"], time.time())
             if bot_query is not None:
                 requested = None if bot_query[0] == "summary" else bot_query[1]

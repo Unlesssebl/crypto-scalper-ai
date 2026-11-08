@@ -28,7 +28,13 @@ def test_liquidity_tier(volume, turnover, expected):
 
 
 def test_strength_scale():
-    assert signal_strength(dict(tape=ABSORPTION), discovery=True) == "strong"
+    big = dict(ABSORPTION, prior=dict(move_bps=30))
+    assert signal_strength(dict(tape=big, natr_1m=0.3), discovery=True) == "strong"  # 0.30% ≥ half of 0.3%
+    # EVAA 08.11 15:44: +0.11% impulse in a 0.3% minute is not worth a sound, however clean the reading.
+    assert signal_strength(dict(tape=dict(ABSORPTION, prior=dict(move_bps=11.4)), natr_1m=0.3), True) == "notable"
+    # Volatility unknown: a 0.4% impulse is the floor (ERA +0.71% stays strong, EVAA +0.11% does not).
+    assert signal_strength(dict(tape=big), discovery=True) == "notable"
+    assert signal_strength(dict(tape=dict(ABSORPTION, prior=dict(move_bps=71.4))), discovery=True) == "strong"
     assert signal_strength(dict(phase="confirmed", formation_strength=3), discovery=False) == "strong"
     assert signal_strength(dict(phase="confirmed", formation_strength=2), discovery=False) == "notable"
     assert signal_strength(dict(flow=0.8, count=40, ratio=4), discovery=True) == "notable"

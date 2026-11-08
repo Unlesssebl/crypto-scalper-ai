@@ -8,8 +8,10 @@ import time
 
 
 class CardOutbox:
-    def __init__(self, journal, alerts):
+    def __init__(self, journal, alerts, senders=None):
         self.db, self.journal, self.alerts = journal.db, journal, alerts
+        # destination -> bot; cards of other destinations go through the main (anomalies) bot.
+        self.senders = dict(senders or {})
         self.db.executescript("""CREATE TABLE IF NOT EXISTS episode_cards(
             episode_id TEXT PRIMARY KEY,message_id INTEGER,rich INTEGER DEFAULT 1,
             text TEXT NOT NULL,html TEXT NOT NULL,hash TEXT NOT NULL,status TEXT NOT NULL,
@@ -83,6 +85,7 @@ class CardOutbox:
         if not row:
             return
         card = dict(row)
+        sender = self.senders.get(card.get("destination"), self.alerts)
         options = {}
         if card["chat_id"] is not None:
             options["chat_id"] = card["chat_id"]
@@ -95,7 +98,7 @@ class CardOutbox:
             )
         try:
             if card["message_id"] is None:
-                result = await self.alerts.send_telegram(
+                result = await sender.send_telegram(
                     card["text"],
                     rich_html=card["html"],
                     return_message=True,
@@ -109,10 +112,10 @@ class CardOutbox:
                             (*result, card["episode_id"]),
                         )
             else:
-                result = await self.alerts.edit_telegram(
+                result = await sender.edit_telegram(
                     card["message_id"], card["text"], rich_html=card["html"] if card["rich"] else None, **options
                 )
-            detail = dict(getattr(self.alerts, "last_telegram_result", {}))
+            detail = dict(getattr(sender, "last_telegram_result", {}))
         except Exception as exc:
             result = None
             detail = dict(state="outcome_unknown", reason=type(exc).__name__)

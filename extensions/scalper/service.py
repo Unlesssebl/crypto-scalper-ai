@@ -102,6 +102,10 @@ class Screener:
         self.outbox = None
         self.ai_routes = None
         self.telegram_ux = None
+        self.channels = {}
+        from .liquidation_context import LiquidationContext
+
+        self.liquidations = LiquidationContext()
         if self.consistency and getattr(gemini, "session", None) is not None:
             from dataclasses import replace
 
@@ -110,9 +114,11 @@ class Screener:
             self.ai_routes = AIRoutes(journal, gemini)
             self.policy = replace(self.policy, hourly_limit=min(40, self.policy.hourly_limit), experiments=False)
             if getattr(hub, "alerts", None) is not None:
+                from .channels import load_channels, senders_by_destination
                 from .delivery import CardOutbox
 
-                self.outbox = CardOutbox(journal, hub.alerts)
+                self.channels = load_channels(hub.alerts)
+                self.outbox = CardOutbox(journal, hub.alerts, senders_by_destination(self.channels))
                 if os.getenv("SCALPER_TELEGRAM_UX", "0") == "1":
                     from .telegram_ux import TelegramUX
 
@@ -286,6 +292,7 @@ class Screener:
             routes=self.ai_routes.summary(now, limit=self.policy.hourly_limit,
                                           cooldown_seconds=self.policy.cooldown_seconds) if self.ai_routes else None,
             telegram_ux=self.telegram_ux.status() if self.telegram_ux else dict(enabled=False),
+            channels=[c.status() for c in self.channels.values()],
             notification_quality=self.telegram_ux.quality.report(now) if self.telegram_ux else None,
             delivery=self.outbox.summary() if self.outbox else None,
             packets=[

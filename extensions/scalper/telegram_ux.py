@@ -12,10 +12,12 @@ from .analytics_context import admission, fact_value
 from .context_auto import decide, summarize
 from .desktop import DesktopNotifier
 from .fact_packet import packet_ready
+from .liquidation_context import liquidation_line
 from .microstructure import NOTABLE
 from .microstructure import label as microstructure_label
 from .notification_quality import NotificationQuality
 from .phase import PHASES
+from .signal_outcomes import SignalOutcomes
 from .tiger import TigerBridge
 
 MSK = timezone(timedelta(hours=3))
@@ -216,11 +218,21 @@ def liquidity_tier(volume_24h, turnover_60s):
     return 4, "unknown"  # unknown liquidity never interrupts
 
 
+# A tape reading is "strong" only when the impulse it reads is at least this share of a usual 1m range:
+# a +0.11% push and a -0.07% pullback inside a 0.3% minute are noise however clean the 15s split looks.
+STRONG_IMPULSE_NATR = 0.5
+STRONG_IMPULSE_FALLBACK_BPS = 40  # when the 1m volatility is unknown: an impulse of at least 0.4%
+
+
 def signal_strength(state, discovery):
     """strong / notable / background — one scale for every kind of event."""
     reading = state.get("tape")
+    natr = state.get("natr_1m")
     if reading and reading["kind"] in NOTABLE:
-        return "strong"
+        floor = STRONG_IMPULSE_NATR * natr * 100 if natr else STRONG_IMPULSE_FALLBACK_BPS
+        if abs(reading["prior"]["move_bps"]) >= floor:
+            return "strong"
+        return "notable"  # a real reading, but too small to interrupt with sound
     rank = state.get("formation_strength") or state.get("rank") or 0
     if state.get("phase") == "confirmed" and rank >= 3:
         return "strong"
@@ -393,6 +405,21 @@ def zone_line(state):
     return " · ".join(parts)
 
 
+def card_arrow(state):
+    """The side a card names now: ▲, ▼ or None. The same rule draws the card and scores its outcome."""
+    arrow, _ = flow_side(state)
+    reading = state.get("tape")
+    if not reading:
+        return arrow
+    # The arrow describes what is happening now, not the impulse that preceded it.
+    moved = reading["recent"]["move_bps"]
+    if reading["kind"] == "counter_aggression":
+        return "▼" if reading["side"] > 0 else "▲"
+    if reading["kind"] in {"exhaustion", "slowdown"} or (moved is not None and moved * reading["side"] < 0):
+        return None  # stalled or going back: the impulse direction no longer describes it
+    return "▲" if reading["side"] > 0 else "▼"
+
+
 def operational(packet, state, reason, kind, ratio=None, pulse=None):
     """Who/what/how much first, then why, then the level, then the cost of entry; source last and muted."""
     raw = packet["symbol"]
@@ -405,24 +432,14 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     if kind == "strengthening":
         title = "усиление: " + ("новый значимый уровень" if reason == "new_level" else "ситуация усилилась")
     arrow, tape = flow_side(state)
+    arrow = card_arrow(state)
     reading_state = state.get("tape")
     change = state.get("change")
     window = "1м"
     if change is None and state.get("tape_change") is not None:
         change, window = state["tape_change"], "60с"
-    if reading_state:
-        # The arrow and the move describe what is happening now, not the impulse that preceded it.
-        moved = reading_state["recent"]["move_bps"]
-        if reading_state["kind"] == "counter_aggression":
-            arrow = "▼" if reading_state["side"] > 0 else "▲"
-        elif reading_state["kind"] in {"exhaustion", "slowdown"} or (
-            moved is not None and moved * reading_state["side"] < 0
-        ):
-            arrow = None  # stalled or going back: the impulse direction no longer describes it
-        else:
-            arrow = "▲" if reading_state["side"] > 0 else "▼"
-        if moved is not None:
-            change, window = moved, "15с"
+    if reading_state and reading_state["recent"]["move_bps"] is not None:
+        change, window = reading_state["recent"]["move_bps"], "15с"
     header = symbol + (f" {arrow}" if arrow else "")
     if change is not None:
         header += f" {pct(change)} за {window}"
@@ -435,6 +452,9 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     if spike:
         # Nothing but a burst of prints: the burst itself is the headline.
         phrase = "📊 " + norm_text(ratio).capitalize()
+    liquidations = state.get("liquidations")
+    if phrase and liquidations and liquidations.get("cascade"):
+        phrase += " · 💥 на каскаде"
     if phrase:
         parts.append(phrase)
 
@@ -461,6 +481,10 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
             parts.append("🔗 HL и OKX: " + ("покупки" if flow == "aligned_buy" else "продажи") + " на обеих")
         elif flow == "opposed":
             parts.append("🔗 HL и OKX: стороны расходятся")
+
+    forced = liquidation_line(liquidations, usd)
+    if forced:
+        parts.append(forced)
 
     level = zone_line(state)
     if level:
@@ -548,6 +572,7 @@ class TelegramUX:
         self.db = service.journal.db
         self.tiger = TigerBridge()
         self.desktop = DesktopNotifier()
+        self.outcomes = SignalOutcomes(self.db)
         self.watch_at = 0
         self.quality = NotificationQuality(self.db)
         self.db.executescript("""
@@ -560,6 +585,10 @@ class TelegramUX:
             CREATE TABLE IF NOT EXISTS telegram_ux_events(
                 id INTEGER PRIMARY KEY,episode TEXT,at REAL,reason TEXT,status TEXT,packet TEXT,state TEXT);
         """)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(telegram_ux_events)")}
+        if "channel" not in columns:
+            # Which bot sent the card; rows before multi-bot delivery belong to the anomalies bot.
+            self.db.execute("ALTER TABLE telegram_ux_events ADD COLUMN channel TEXT DEFAULT 'anomalies'")
         # Pending old-format cards must not leak after switching the interface.
         with self.db:
             self.db.execute(
@@ -600,10 +629,11 @@ class TelegramUX:
         ticker = packet["symbol"].removeprefix("BINANCE:")
         return dict(inline_keyboard=[buttons, [dict(text="Копировать тикер", copy_text=dict(text=ticker))]])
 
-    def audit(self, packet, reason, status, state):
+    def audit(self, packet, reason, status, state, channel="anomalies"):
         self.db.execute(
-            "INSERT INTO telegram_ux_events(episode,at,reason,status,packet,state) VALUES(?,?,?,?,?,?)",
-            (packet["episode_id"], packet["captured_at"], reason, status, packet["packet_id"], json.dumps(state)),
+            "INSERT INTO telegram_ux_events(episode,at,reason,status,packet,state,channel) VALUES(?,?,?,?,?,?,?)",
+            (packet["episode_id"], packet["captured_at"], reason, status, packet["packet_id"], json.dumps(state),
+             channel),
         )
 
     def observe(self, now):
@@ -701,6 +731,14 @@ class TelegramUX:
             assets = getattr(getattr(service.hub, "market", None), "assets", None) or {}
             asset = assets.get(packet["symbol"])
             state["turnover_60s"] = value(packet, "tape.observed_turnover_60s")
+            state["natr_1m"] = value(packet, "context.1m.natr")
+            context = getattr(service, "liquidations", None)
+            if context is not None:
+                tape = state.get("tape") or {}
+                moved = (tape.get("recent") or {}).get("move_bps")
+                if moved is None:
+                    moved = state.get("change") if state.get("change") is not None else state.get("tape_change")
+                state["liquidations"] = context.recent(packet["symbol"], now, state["turnover_60s"], moved)
             state["tier"], state["tier_source"] = liquidity_tier(
                 getattr(asset, "volume_24h", None), state["turnover_60s"]
             )

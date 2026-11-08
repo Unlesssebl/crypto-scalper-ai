@@ -285,6 +285,10 @@ class RemoteHub:
         resolved = self._resolve_symbol(symbol)
         return await self._get(f"/v1/orderflow/{resolved}")
 
+    async def fetch_liquidations(self, minutes: int = 3, limit: int = 1000) -> dict:
+        """Recent liquidation events across venues (confirmed and estimated; callers filter)."""
+        return await self._get("/v1/liquidations", minutes=minutes, limit=limit)
+
     async def fetch_liquidation_stats(self, minutes: int = 60) -> dict:
         return await self._get(
             "/v1/liquidations/stats",

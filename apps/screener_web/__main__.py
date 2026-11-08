@@ -170,6 +170,21 @@ async def update_policy(request: web.Request) -> web.Response:
     return web.json_response(asdict(policy))
 
 
+async def chart_marks(request: web.Request) -> web.Response:
+    """Signals for a terminal chart: ?code=BTCUSDT&exchange=BINANCE-FUT&minutes=60 (TigerTrade indicator)."""
+    from extensions.scalper.chart_marks import chart_marks as build
+
+    service = request.app["service"]
+    try:
+        minutes = int(request.query.get("minutes", "60"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="minutes must be an integer") from None
+    if not getattr(service, "consistency", None):
+        raise web.HTTPServiceUnavailable(text="Signal journal is not available")
+    body = build(service, request.query.get("code", ""), request.query.get("exchange", ""), minutes, time.time())
+    return web.json_response(body)
+
+
 async def context_packet(request: web.Request) -> web.Response:
     service = request.app["service"]
     service.refresh_context_packets(time.time())
@@ -264,6 +279,7 @@ def build_app(hub: RemoteHub, service: Screener) -> web.Application:
     app.router.add_get("/scalper", dashboard)
     app.router.add_get("/v1/scalper", screener)
     app.router.add_post("/v1/scalper/policy", update_policy)
+    app.router.add_get("/v1/scalper/chart-marks", chart_marks)
     app.router.add_get("/v1/scalper/context/{symbol}", context_packet)
     app.router.add_post("/v1/scalper/context/{symbol}", review_context)
     app.router.add_get("/v1/scalper/{symbol}", detail)
@@ -333,6 +349,10 @@ async def run(args: argparse.Namespace) -> None:
             if not hub.demo:
                 tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
+                if service.telegram_ux:
+                    tasks.append(asyncio.create_task(service.telegram_ux.outcomes.run(hub), name="signal-outcomes"))
+                if hasattr(hub, "fetch_liquidations"):
+                    tasks.append(asyncio.create_task(service.liquidations.run(hub), name="liquidation-context"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
                 if service.liveness is not None:
                     tasks.append(asyncio.create_task(service.liveness.run(), name="pipeline-liveness"))
@@ -340,6 +360,13 @@ async def run(args: argparse.Namespace) -> None:
                 if not service.telegram_ux:
                     tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))
                 tasks.append(asyncio.create_task(listen_reports(session, service), name="telegram-reports"))
+                if service.telegram_ux:
+                    from extensions.scalper.channels import listen_channel
+
+                    for channel in service.channels.values():
+                        if channel.name != "anomalies" and channel.configured:
+                            tasks.append(asyncio.create_task(listen_channel(session, service, channel),
+                                                             name=f"telegram-{channel.name}"))
                 digest_seconds = int(os.getenv("HYPERDATA_DIGEST_SECONDS", "0"))
                 if digest_seconds > 0 and not service.telegram_ux:
                     tasks.append(
@@ -429,6 +456,9 @@ async def run(args: argparse.Namespace) -> None:
             await asyncio.to_thread(service.attention.close)
             if service.telegram_ux:
                 await service.telegram_ux.desktop.close()
+            for channel in service.channels.values():
+                if channel.name != "anomalies":
+                    await channel.sender.stop()
         if runner is not None:
             await runner.cleanup()
         await hub.stop()
