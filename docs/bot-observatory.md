@@ -106,8 +106,11 @@ episode_id = sha1(bot_id, version, symbol, window, direction, floor(now / window
 Для каждого наблюдения:
 
 1. `entry_due_at = decided_at + 1s`.
-2. Первый mark price в окне `[entry_due_at, entry_due_at + 5s]` становится входом.
-   Если mark нет — наблюдение `unscored`, без импутации.
+2. Первый mark price в окне `[entry_due_at, entry_due_at + 10s]` становится входом.
+   Если mark нет — наблюдение `unscored`, без импутации. Окно шире шага
+   обновления native-снимка рынка (~5.5–6 с): при прежних 5 с примерно каждое
+   пятое решение оставалось без входа. Фактическая задержка хранится в
+   `entry_at − entry_due_at`, её можно отфильтровать при анализе.
 3. Для каждого горизонта `h ∈ {60, 300, 900}`:
    `exit_due_at = decided_at + 1s + h`.
 4. Выход — первый mark в окне `[exit_due_at, exit_due_at + 30s]`.

@@ -268,3 +268,47 @@ def test_telegram_bot_commands_are_strict():
     stale = update("/bots")
     stale["message"]["date"] = int(now) - 500
     assert bots_command(stale, "123", "screener_bot", now) is None
+
+
+def _entry(db):
+    return db.execute(
+        "SELECT entry_price,entry_at,status,unscored_reason FROM bot_observations"
+    ).fetchone()
+
+
+def test_entry_mark_survives_a_market_refresh_slower_than_five_seconds():
+    """The native market snapshot refreshes every ~5.8s.
+
+    Decision at 1000 → entry due at 1001. The previous refresh (999.5) is too
+    early and the next one (1007.0) fell outside the old 5s window, which left
+    the observation unscored with no_entry_mark.
+    """
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    plan = {"selected": ["ETH"]}
+    obs.tick(1_000.0, market_rows(), quotes({"BTC": 100.0}, 999.5), plan)
+    obs.tick(1_005.0, market_rows(), quotes({"BTC": 100.0}, 999.5), plan)
+    obs.settle_mark_only(1_005.0)
+    obs.tick(1_010.0, market_rows(), quotes({"BTC": 101.0}, 1_007.0), plan)
+    obs.settle_mark_only(1_010.0)
+    assert tuple(_entry(db)) == (101.0, 1_007.0, "observed", None)
+
+
+def test_in_window_mark_seen_by_a_late_scan_is_still_captured():
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    plan = {"selected": ["ETH"]}
+    obs.tick(1_000.0, market_rows(), {}, plan)
+    obs.settle_mark_only(1_015.0)  # due 1001: window ends 1011, scan lag allows until 1021
+    obs.tick(1_018.0, market_rows(), quotes({"BTC": 100.0}, 1_010.5), plan)
+    assert tuple(_entry(db))[:3] == (100.0, 1_010.5, "observed")
+
+
+def test_entry_mark_after_the_window_is_not_used():
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    plan = {"selected": ["ETH"]}
+    obs.tick(1_000.0, market_rows(), {}, plan)
+    obs.tick(1_013.0, market_rows(), quotes({"BTC": 100.0}, 1_012.0), plan)  # due+11s
+    obs.settle_mark_only(1_025.0)
+    assert tuple(_entry(db)) == (None, None, "unscored", "no_entry_mark")

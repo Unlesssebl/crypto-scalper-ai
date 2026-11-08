@@ -22,7 +22,14 @@ LOG = logging.getLogger(__name__)
 HORIZONS = (60, 300, 900)
 WINDOW_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 CANDLE_WINDOW = {60: "1m", 300: "5m", 900: "15m", 3600: "1h"}
-ENTRY_TOLERANCE_S = 5.0
+# The native market snapshot (the mark timestamp) refreshes every ~5.5-6s, so
+# a 5s entry window missed roughly one decision in five. 10s always spans at
+# least one refresh; the actual lag stays recorded in entry_at.
+ENTRY_TOLERANCE_S = 10.0
+# A scan sees a mark up to one scan interval after the mark's own timestamp.
+# Capture and expiry share this bound so an in-window mark is never expired
+# before the scan that carries it.
+ENTRY_CAPTURE_LAG_S = 10.0
 EXIT_TOLERANCE_S = 30.0
 END_GRACE_S = 15.0
 MIN_EPISODE_S = 60.0
@@ -295,7 +302,7 @@ class BotObservatory:
         for row in self.db.execute(
             "SELECT id,symbol,entry_due_at FROM bot_observations "
             "WHERE entry_price IS NULL AND status='observed' AND entry_due_at<=? AND entry_due_at>=?",
-            (now, now - 10),
+            (now, now - ENTRY_TOLERANCE_S - ENTRY_CAPTURE_LAG_S),
         ).fetchall():
             quote = _quote(prices, row["symbol"])
             if quote is None or not 0 <= quote[1] - row["entry_due_at"] <= ENTRY_TOLERANCE_S:
@@ -345,7 +352,7 @@ class BotObservatory:
         for row in self.db.execute(
             "SELECT control_set_id,symbol,horizon_s,entry_due_at FROM bot_control_points "
             "WHERE status='pending' AND entry_due_at<=? AND entry_due_at>=?",
-            (now, now - 10),
+            (now, now - ENTRY_TOLERANCE_S - ENTRY_CAPTURE_LAG_S),
         ).fetchall():
             quote = _quote(prices, row["symbol"])
             if quote is None or not 0 <= quote[1] - row["entry_due_at"] <= ENTRY_TOLERANCE_S:
@@ -398,7 +405,7 @@ class BotObservatory:
         rows = self.db.execute(
             "SELECT id FROM bot_observations WHERE entry_price IS NULL AND status='observed' "
             "AND entry_due_at<?",
-            (now - ENTRY_TOLERANCE_S,),
+            (now - ENTRY_TOLERANCE_S - ENTRY_CAPTURE_LAG_S,),
         ).fetchall()
         for row in rows:
             with self.db:
