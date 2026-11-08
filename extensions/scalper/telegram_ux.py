@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from .analytics_context import admission, fact_value
 from .context_auto import decide, summarize
+from .desktop import DesktopNotifier
 from .fact_packet import packet_ready
 from .microstructure import NOTABLE
 from .microstructure import label as microstructure_label
@@ -66,9 +67,13 @@ def scale(packet, state):
 
 
 def activity(service, symbol, now):
+    """Trade-count ratio of the last closed minute (or the one before, while the newest is settling).
+
+    Prints, not base volume: one large print in a dead market multiplies volume, not activity.
+    """
     candle = getattr(service.attention, "activity", {}).get(symbol, {})
     target = int(now * 1000) // 60000 * 60000 - 60000
-    if candle.get("status") != "ready" or candle.get("start_ms") != target:
+    if candle.get("status") != "ready" or candle.get("start_ms") not in (target, target - 60000):
         return None
     ratio = candle.get("ratios", {}).get("trade_count")
     return ratio if type(ratio) in (int, float) and math.isfinite(ratio) and ratio >= 0 else None
@@ -148,17 +153,6 @@ def usd(amount):
     return f"${amount:.0f}"
 
 
-def eat_time(ratio):
-    """Zone notional / last-60s turnover → time to trade through it at the current pace."""
-    seconds = ratio * 60
-    if seconds < 1:
-        return "<1с оборота"
-    if seconds < 120:
-        return f"≈{seconds:.0f}с оборота"
-    # Beyond ~10 minutes the tape is too thin for the estimate to mean anything to a scalper.
-    return f"≈{seconds / 60:.0f} мин оборота" if seconds < 600 else "оборот >10 мин"
-
-
 def flow_side(state):
     """Returns (arrow, line) for the tape, or (None, line|None) when the sample is too thin."""
     flow, count = state.get("flow"), state.get("count")
@@ -210,116 +204,272 @@ def discovery_gate(state):
     return None if tape + active + tradable_zone >= 2 else "discovery_quiet"
 
 
+# Liquidity tiers by 24h quote volume; the 60s turnover is the fallback when 24h is unknown.
+TIERS_24H = ((1, 200e6), (2, 20e6), (3, 2e6))
+TIERS_60S = ((1, 140e3), (2, 14e3), (3, 1.4e3))  # the same floors spread evenly over a day
+
+
+def liquidity_tier(volume_24h, turnover_60s):
+    for source, amount, floors in (("24h", volume_24h, TIERS_24H), ("60s", turnover_60s, TIERS_60S)):
+        if type(amount) in (int, float) and math.isfinite(amount) and amount > 0:
+            return next((tier for tier, floor in floors if amount >= floor), 4), source
+    return 4, "unknown"  # unknown liquidity never interrupts
+
+
+def signal_strength(state, discovery):
+    """strong / notable / background — one scale for every kind of event."""
+    reading = state.get("tape")
+    if reading and reading["kind"] in NOTABLE:
+        return "strong"
+    rank = state.get("formation_strength") or state.get("rank") or 0
+    if state.get("phase") == "confirmed" and rank >= 3:
+        return "strong"
+    if discovery:
+        return "notable" if discovery_gate(state) is None else "background"
+    return "notable"  # core signals here already passed admission and the activity check
+
+
+def route(tier, strength):
+    """alert: Telegram with sound + Windows toast; silent: Telegram without sound; watch: quiet list."""
+    if tier >= 4 or strength == "background":
+        return "watch"
+    if strength == "strong":
+        return "alert" if tier <= 2 else "silent"
+    return "silent" if tier <= 2 else "watch"
+
+
+TIGER_BUTTON_SECONDS = 1800  # the TigerTrade button works for 30 minutes after the card
+STRENGTH_MARKS = {"strong": "🔥", "notable": "🔸"}
+
+
 def bps(x):
     if abs(x) < 0.05:
         return "0 б.п."
     return f"{x:+.1f} б.п." if abs(x) < 10 else f"{x:+.0f} б.п."
 
 
-def times(x):
-    return f"×{number(x, 2)}" if x < 0.1 else f"×{number(x, 1)}"
+def pct(basis_points):
+    """Signed percent from basis points: +1.76%, -0.48%, 0%."""
+    value = basis_points / 100
+    if abs(value) < 0.005:
+        return "0%"
+    return f"{value:+.2f}%" if abs(value) < 10 else f"{value:+.1f}%"
+
+
+def fold(x):
+    """'в 2.6 раза', 'в 12 раз' — a multiple said in words, not as ×N."""
+    shown = f"{x:.0f}" if x >= 10 else number(x, 1)
+    if "." in shown:
+        return f"в {shown} раза"  # fractions always take "раза"
+    n = int(shown)
+    word = "раза" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "раз"
+    return f"в {shown} {word}"
+
+
+def pace_text(ratio, noun):
+    if ratio >= 1.2:
+        return f"{noun} усилились {fold(ratio)}"
+    if ratio <= 0.83:
+        return f"{noun} ослабли {fold(1 / ratio)}" if ratio > 0 else f"{noun} прекратились"
+    return f"{noun} в прежнем темпе"
+
+
+def norm_text(ratio):
+    if ratio >= 1000:
+        return "сделок в 1000+ раз больше обычного"
+    return f"сделок {fold(ratio)} больше обычного"
+
+
+def efficiency_text(ratio):
+    """How much price a unit of aggressor volume buys now, compared with the impulse."""
+    if ratio is None:
+        return None
+    if ratio <= 0.05:
+        return "объём не двигает цену"
+    if ratio < 0.3:
+        return "объём почти не двигает цену"
+    if ratio < 0.75:
+        return "объём двигает цену слабее"
+    if ratio > 1.5:
+        return "цена идёт легче, чем в импульсе"
+    return None
+
+
+def share_bar(buy_share):
+    """Five squares: green for the buy share, red for the sell share."""
+    green = max(0, min(5, round(buy_share * 5)))
+    return "🟩" * green + "🟥" * (5 - green)
+
+
+def eat_text(ratio):
+    """Zone notional / last-60s turnover → how long the current pace takes to trade through it."""
+    seconds = ratio * 60
+    if seconds < 1:
+        return "съедят за <1с"
+    if seconds < 120:
+        return f"съедят за ~{seconds:.0f}с"
+    return f"съедят за ~{seconds / 60:.0f} мин" if seconds < 600 else "съедят за 10+ мин"
 
 
 def tape_lines(reading, mid=None):
-    """Effort vs result: what the last 15s of aggression bought compared with the impulse before it."""
+    """Both sides of the last 15s, then what the impulse before it looked like — in plain words."""
     if not reading:
         return []
     up = reading["side"] > 0
-    head = "⚡ " + microstructure_label(reading) if reading["kind"] in NOTABLE else microstructure_label(reading)
-    wall = reading.get("wall")
-    if wall:
-        where = "предложения" if wall["side"] == "ask" else "спроса"
-        head += f" · у {where} {number(wall['price'], 8)}"
-        if wall.get("notional_usd"):
-            head += f" ({usd(wall['notional_usd'])})"
     prior, recent = reading["prior"], reading["recent"]
-    aggressor = "Покупки" if up else "Продажи"
-    if reading["kind"] == "counter_aggression":
-        counter, against = ("Продажи", "покупок") if up else ("Покупки", "продаж")
-        effort = f"{counter} {usd(recent['opposite_usd'])} за {recent['seconds']}с"
-        effort += f" против {against} {usd(recent['aggressor_usd'])}"
-    else:
-        effort = f"{aggressor} {usd(recent['aggressor_usd'])} за {recent['seconds']}с"
-        if reading.get("effort_ratio") is not None:
-            effort += f" · темп {times(reading['effort_ratio'])} к импульсу"
-    travel = "сделок нет" if recent["move_bps"] is None else bps(recent["move_bps"])
-    lines = [head, effort + f" · цена {travel} (импульс {bps(prior['move_bps'])} за {prior['seconds']}с)"]
-    ratio = reading.get("efficiency_ratio")
-    if ratio is not None and reading["kind"] != "counter_aggression":
-        if ratio <= 0:
-            lines.append("Цена за тот же объём: не продвигается")
-        else:
-            lines.append(f"Цена за тот же объём: {times(ratio)} к импульсу")
+    buys, sells = recent["aggressor_usd"], recent["opposite_usd"]
+    if not up:
+        buys, sells = sells, buys
+    lines = [f"🟩 Покупки {usd(buys)} · 🟥 Продажи {usd(sells)} · за 15с"]
+    context = [f"↩️ До этого {pct(prior['move_bps'])} за 30с"]
+    if reading.get("effort_ratio") is not None:
+        context.append(pace_text(reading["effort_ratio"], "покупки" if up else "продажи"))
+    # With aggression faded or reversed, price per unit of volume says nothing.
+    if reading["kind"] not in {"counter_aggression", "exhaustion"}:
+        effect = efficiency_text(reading.get("efficiency_ratio"))
+        if effect:
+            context.append(effect)
+    lines.append(" · ".join(context))
     return lines
 
 
+PHASE_VERDICTS = {
+    "early": "🚀 Ранний импульс",
+    "confirmed": "✅ Движение подтвердилось",
+    "extended": "⚠️ Движение уже далеко ушло",
+    "weakening": "🪫 Импульс слабеет",
+}
+
+
+def verdict(state, arrow):
+    """One phrase a scalper can act on: the tape reading first, then phase, then who is pushing."""
+    reading = state.get("tape")
+    if reading and reading["kind"] in NOTABLE:
+        return "⚡ " + microstructure_label(reading)
+    if state.get("phase") in PHASE_VERDICTS:
+        return PHASE_VERDICTS[state["phase"]]
+    if reading:
+        return microstructure_label(reading)
+    if arrow:
+        return "🟩 Покупатели давят" if arrow == "▲" else "🟥 Продавцы давят"
+    return None
+
+
+def cost_line(state, natr):
+    """Price (tap to copy) and the cost of entry; the light compares the spread with the usual 1m range."""
+    parts = []
+    if state.get("midpoint") is not None:
+        parts.append(f"💲 <code>{number(state['midpoint'], 8)}</code>")
+    spread = state.get("spread")
+    if spread is not None:
+        text = f"спред {small(spread / 100, 2)}%"
+        if natr:
+            share = spread / (natr * 100)
+            text = ("🟢 " if share < 0.1 else "🟡 " if share < 0.25 else "🔴 ") + text
+        elif state.get("wide_spread"):
+            text = "🔴 " + text
+        parts.append(text)
+    return " · ".join(parts)
+
+
+def zone_line(state):
+    zone, mid = state.get("zone"), state.get("midpoint")
+    if not zone:
+        return None
+    wall = (state.get("tape") or {}).get("wall")
+    on_path = bool(wall and wall["price"] == zone["price"])
+    side = "Спрос" if zone["side"] == "bid" else "Предложение"
+    head = ("🧱 На пути: " if on_path else "🧱 ") + f"{side} <code>{number(zone['price'], 8)}</code>"
+    if mid:
+        head += f" ({(zone['price'] / mid - 1) * 100:+.2f}%)"
+    parts = [head]
+    if zone.get("notional_usd"):
+        parts.append(usd(zone["notional_usd"]))
+    if zone.get("size_to_observed_turnover") is not None:
+        parts.append(eat_text(zone["size_to_observed_turnover"]))
+    age = zone.get("observed_age_seconds")
+    if age is not None and age < 10:
+        parts.append("новая")  # a level seen for seconds is not yet a level to lean on
+    return " · ".join(parts)
+
+
 def operational(packet, state, reason, kind, ratio=None, pulse=None):
+    """Who/what/how much first, then why, then the level, then the cost of entry; source last and muted."""
     raw = packet["symbol"]
     binance = raw.startswith("BINANCE:")
     symbol = html.escape(raw.removeprefix("BINANCE:"))
     if state.get("discovery_kind"):
-        title = "Для наблюдения: " + DISCOVERY_TITLES.get(state["discovery_kind"], "активность")
+        title = DISCOVERY_TITLES.get(state["discovery_kind"], "активность")
     else:
-        title = TITLES.get(reason, "Изменение ситуации")
+        title = TITLES.get(reason, "изменение ситуации").lower()
     if kind == "strengthening":
-        title = "Усиление: " + ("новый значимый уровень" if reason == "new_level" else "ситуация заметно усилилась")
+        title = "усиление: " + ("новый значимый уровень" if reason == "new_level" else "ситуация усилилась")
     arrow, tape = flow_side(state)
-    parts = [f"<b>{arrow + ' ' if arrow else ''}{symbol}</b> · {title}"]
-    parts.extend(tape_lines(state.get("tape"), state.get("midpoint")))
+    reading_state = state.get("tape")
+    change = state.get("change")
+    window = "1м"
+    if change is None and state.get("tape_change") is not None:
+        change, window = state["tape_change"], "60с"
+    if reading_state:
+        # The arrow and the move describe what is happening now, not the impulse that preceded it.
+        moved = reading_state["recent"]["move_bps"]
+        if reading_state["kind"] == "counter_aggression":
+            arrow = "▼" if reading_state["side"] > 0 else "▲"
+        elif reading_state["kind"] in {"exhaustion", "slowdown"} or (
+            moved is not None and moved * reading_state["side"] < 0
+        ):
+            arrow = None  # stalled or going back: the impulse direction no longer describes it
+        else:
+            arrow = "▲" if reading_state["side"] > 0 else "▼"
+        if moved is not None:
+            change, window = moved, "15с"
+    header = symbol + (f" {arrow}" if arrow else "")
+    if change is not None:
+        header += f" {pct(change)} за {window}"
+    if state.get("tier") is not None:
+        header = f"{STRENGTH_MARKS.get(state.get('strength'), '')} T{state['tier']} · {header}".lstrip()
+    parts = [f"<b>{header}</b>"]
 
-    if tape:
-        # Activity below the norm contradicts any "active" title; only an excess is informative.
-        if ratio is not None and ratio >= 1 and not tape.startswith("Сделок мало"):
-            tape += f" · {'≥' if ratio >= 1000 else ''}{number(ratio, 1)}× нормы"
-        parts.append(tape)
-    elif ratio is not None and ratio >= 1:
-        parts.append(f"Сделок {'≥' if ratio >= 1000 else ''}{number(ratio, 1)}× нормы · закрытая 1м")
+    phrase = verdict(state, arrow)
+    spike = phrase is None and not tape and ratio is not None and ratio >= 1
+    if spike:
+        # Nothing but a burst of prints: the burst itself is the headline.
+        phrase = "📊 " + norm_text(ratio).capitalize()
+    if phrase:
+        parts.append(phrase)
 
-    metrics = []
-    mid = state.get("midpoint")
-    if mid is not None:
-        metrics.append("Цена " + number(mid, 8))
-    if state.get("spread") is not None:
-        label = "⚠ широкий спред " if state.get("wide_spread") else "спред "
-        metrics.append(label + small(state["spread"]) + " б.п.")
-    if state.get("change") is not None:
-        metrics.append(f"Δ1м {state['change'] / 100:+.2f}%")
-    elif state.get("tape_change") is not None:
-        # Trade-price travel over the observed tape when the native 1m frame is absent.
-        metrics.append(f"Δ≤60с {state['tape_change'] / 100:+.2f}%")
-    natr = value(packet, "context.1m.natr")
-    if natr is not None:
-        metrics.append(f"NATR {small(natr, 2)}%")
-    if metrics:
-        parts.append(" · ".join(metrics))
-
-    zone = state.get("zone")
-    if zone:
-        side = "Спрос" if zone["side"] == "bid" else "Предложение"
-        line = [f"{side} {number(zone['price'], 8)}"]
-        if mid:
-            line[0] += f" ({(zone['price'] / mid - 1) * 100:+.2f}%)"
-        if zone.get("notional_usd"):
-            line.append(usd(zone["notional_usd"]))
-        rel = zone["relative_size"]
-        line.append(f"{rel:.0f}× медианы" if rel >= 10 else f"{number(rel, 1)}× медианы")
-        if zone.get("size_to_observed_turnover") is not None:
-            line.append(eat_time(zone["size_to_observed_turnover"]))
-        line.append(f"стоит {zone['observed_age_seconds']:.0f}с")
-        parts.append(" · ".join(line))
-
-    phase, frame = state.get("phase"), scale(packet, state)
-    if phase in CARD_PHASES:
-        parts.append(f"Фаза 1м: {PHASES[phase]}" + (f" · масштаб {frame}" if frame in {"1m", "5m"} else ""))
-
+    reading = tape_lines(reading_state)
+    if reading:
+        parts.extend(reading)
+    elif tape:
+        flow, count = state.get("flow"), state.get("count")
+        if tape.startswith("Сделок мало"):
+            parts.append(f"▫️ Сделок мало ({int(count)}) — сторона не ясна")
+        else:
+            buys = (flow + 1) * 50  # name the side that outweighs, never "покупки 0%"
+            side = f"Покупки {buys:.0f}%" if flow >= 0 else f"Продажи {100 - buys:.0f}%"
+            line = f"{share_bar((flow + 1) / 2)} {side}"
+            turnover = state.get("turnover_60s")
+            line += f" · {usd(turnover)}/мин" if turnover else f" · {int(count)} сделок/мин"
+            parts.append(line)
+            # Activity below the norm contradicts any "active" title; only an excess is informative.
+            if ratio is not None and ratio >= 1.5:
+                parts.append("📊 " + norm_text(ratio).capitalize())
     if state.get("context_version") or (pulse and pulse.get("status") == "ready"):
         flow = state.get("cross_venue") if state.get("context_version") else pulse.get("flow")
         if flow in {"aligned_buy", "aligned_sell"}:
-            parts.append("HL и OKX: " + ("покупки" if flow == "aligned_buy" else "продажи") + " на обеих · закрытая 1м")
+            parts.append("🔗 HL и OKX: " + ("покупки" if flow == "aligned_buy" else "продажи") + " на обеих")
         elif flow == "opposed":
-            parts.append("HL и OKX: стороны расходятся · закрытая 1м")
+            parts.append("🔗 HL и OKX: стороны расходятся")
+
+    level = zone_line(state)
+    if level:
+        parts.append(level)
+    cost = cost_line(state, value(packet, "context.1m.natr"))
+    if cost:
+        parts.append(cost)
     clock = datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S")
-    parts.append(f"{'Binance USDT-M' if binance else 'Hyperliquid'} · {clock} МСК")
+    parts.append(f"<i>{'Binance' if binance else 'Hyperliquid'} · {title} · {clock}</i>")
     return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
 
 
@@ -397,6 +547,7 @@ class TelegramUX:
         self.service = service
         self.db = service.journal.db
         self.tiger = TigerBridge()
+        self.desktop = DesktopNotifier()
         self.watch_at = 0
         self.quality = NotificationQuality(self.db)
         self.db.executescript("""
@@ -465,10 +616,6 @@ class TelegramUX:
             priority, reason, state = decide(packet, memory["samples"])
             state["scale"] = scale(packet, state)
             state["ratio"] = activity(service, packet["symbol"], now)
-            if state.get("discovery_kind"):
-                candle_ratio = value(packet, "discovery.candle_ratio")
-                if candle_ratio is not None:
-                    state["ratio"] = max(state["ratio"] or 0, candle_ratio)
             candle = getattr(service.attention, "activity", {}).get(packet["symbol"], {})
             state["activity_source"] = {
                 k: candle.get(k) for k in ("source", "start_ms", "reference_policy", "reference_minutes", "ratios")
@@ -487,7 +634,11 @@ class TelegramUX:
                 continue
             discovery = bool(state.get("discovery_kind"))
             # Discovery still finds instruments for the quiet watch list; only a tradable one interrupts.
-            blocked = discovery_gate(state) if discovery else admission(state, reason)
+            blocked = (
+                ("discovery_wide_spread" if state.get("wide_spread") else None)
+                if discovery
+                else admission(state, reason)
+            )
             if blocked:
                 self.quality.record(packet, state, "blocked", blocked)
                 continue
@@ -544,7 +695,21 @@ class TelegramUX:
                     continue
                 kind = "situation" if discovery_upgrade else "strengthening"
                 reason = "active_instrument" if discovery_upgrade else "new_level" if new_zone else "strengthened"
-                generation += 1
+                # Candidate → active within the cooldown updates the same message instead of a second push.
+                if not (discovery_upgrade and now - previous["last_at"] < 120):
+                    generation += 1
+            assets = getattr(getattr(service.hub, "market", None), "assets", None) or {}
+            asset = assets.get(packet["symbol"])
+            state["turnover_60s"] = value(packet, "tape.observed_turnover_60s")
+            state["tier"], state["tier_source"] = liquidity_tier(
+                getattr(asset, "volume_24h", None), state["turnover_60s"]
+            )
+            state["strength"] = signal_strength(state, discovery)
+            state["route"] = route(state["tier"], state["strength"])
+            if state["route"] == "watch":
+                # Found, but not worth an interruption at this liquidity/strength: quiet watch list only.
+                self.quality.record(packet, state, "blocked", f"watch_t{state['tier']}_{state['strength']}")
+                continue
             # Existing delivered episodes establish a baseline; no retrospective push.
             existing = self.db.execute(
                 "SELECT message_id FROM episode_cards WHERE episode_id=?", (packet["episode_id"],)
@@ -569,7 +734,11 @@ class TelegramUX:
                         chat_id=str(service.hub.alerts.telegram_chat_id),
                         destination="operations",
                         reply_markup=self.markup(card, packet, now + 120),
+                        silent=state["route"] == "silent",
                     )
+                    if state["route"] == "alert":
+                        # Strong and liquid only: the trading PC; a click opens it in TigerTrade.
+                        self.desktop.notify(packet["symbol"], text, now + 120)
                     self.audit(packet, reason, "queued", state)
                     self.quality.record(packet, state, "queued", reason, card=card)
                 self.db.execute(
@@ -723,6 +892,7 @@ class TelegramUX:
             tiger_group=self.tiger.group or None,
             tiger_exchange=self.tiger.exchange,
             tiger_config_error=self.tiger.config_error,
+            desktop=self.desktop.status(),
             callback_errors=self.db.execute("SELECT COUNT(*) FROM telegram_clicks WHERE status='error'").fetchone()[0],
         )
 
@@ -775,7 +945,9 @@ class TelegramUX:
         card = self.db.execute("SELECT * FROM episode_cards WHERE episode_id=?", (action["card"],)).fetchone()
         if not card or chat != str(card["chat_id"]) or message.get("message_id") != card["message_id"]:
             return "Действие недоступно."
-        if action["expires_at"] < now:
+        # Opening the chart stays useful long after the snapshot; other actions follow the card's lifetime.
+        grace = TIGER_BUTTON_SECONDS if action["action"] == "tiger" else 0
+        if action["expires_at"] + grace < now:
             return "Карточка устарела. Используй свежую ситуацию."
         if self.db.execute("SELECT 1 FROM telegram_clicks WHERE query_id=?", (query["id"],)).fetchone():
             return "Этот запрос уже обработан."

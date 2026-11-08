@@ -20,6 +20,7 @@ MIN_IMPULSE_BPS = 3
 STALL_MOVE_RATIO = 0.3  # recent travel per second ≤ 30% of the impulse's
 HELD_AGGRESSION = 0.8  # aggressor pace kept ≥ 80% → effort held
 FADED_AGGRESSION = 0.5  # aggressor pace ≤ 50% → effort faded
+REVERSAL_RATIO = -0.3  # prices travel back at ≥30% of the impulse's pace: a reversal, not a stall
 COUNTER_IMBALANCE = 0.3
 COUNTER_PACE = 0.6  # opposite side's pace vs the impulse aggressor's
 ZONE_NEAR_BPS = 15
@@ -76,7 +77,17 @@ def read_tape(packet, spread_bps=None, zone=None, midpoint=None):
     def efficiency(travel, usd):
         return travel * side / (usd / 100_000) if usd > 0 else None
 
-    if recent_imbalance * side <= -COUNTER_IMBALANCE and opposite_pace >= COUNTER_PACE * prior_pace:
+    # A reversal must move beyond noise on real volume; a few dollars ticking back is not a takeover.
+    reversal = (
+        result <= REVERSAL_RATIO
+        and abs(recent_move) >= max(MIN_IMPULSE_BPS, threshold / 2)  # 15s stretch vs the 30s impulse threshold
+        and recent_volume >= MIN_RECENT_USD_FOR_EFFICIENCY
+    )
+    if reversal:
+        # Prices are going back. Whoever traded more while they did decides the reading:
+        # the opposite side → it took over; the impulse side still buying/selling → it is being absorbed.
+        kind = "counter_aggression" if recent[opposite] >= recent[aggressor] else "absorption"
+    elif recent_imbalance * side <= -COUNTER_IMBALANCE and opposite_pace >= COUNTER_PACE * prior_pace:
         kind = "counter_aggression"
     elif result <= STALL_MOVE_RATIO:
         busy = recent["trade_count"] >= MIN_RECENT_TRADES_FOR_ABSORPTION

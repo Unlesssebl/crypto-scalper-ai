@@ -83,12 +83,14 @@ class TigerBridge:
                         if message.data == "pong":
                             continue
                         body = json.loads(message.data)
-                        if body.get("requestId") != command["requestId"]:
+                        # Tiger echoes requestId; a reply without it is still the answer to our only command.
+                        if body.get("requestId") not in (None, command["requestId"]):
                             continue
                         response = body.get("response", {})
                         if response.get("type") == "successfully":
-                            return "TigerTrade принял переключение графика на ПК."
-                        return "TigerTrade отклонил переход: проверь контракт и группу линковки."
+                            return f"TigerTrade: {command['symbol']} открыт в группе {command['linkGroup']}."
+                        return (f"TigerTrade отклонил {command['symbol']} в группе {command['linkGroup']}: "
+                                f"{str(body.get('message') or 'проверь контракт и группу линковки')[:120]}")
         except (aiohttp.ClientError, OSError, TimeoutError, ValueError):
             return "TigerTrade на ПК недоступен. Переход не отложен и не будет выполнен позже."
         return "TigerTrade не подтвердил переключение. Автоматического повтора нет."

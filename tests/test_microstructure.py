@@ -13,8 +13,10 @@ from extensions.scalper.microstructure import label, read_tape
 from extensions.scalper.telegram_ux import operational, tape_lines
 
 
-def fake(prior, recent, spread=1.0):
+def fake(prior, recent, spread=1.0, natr=None):
     facts = [dict(id="book.spread_bps", value=spread, quality="ok")]
+    if natr is not None:
+        facts.append(dict(id="context.1m.natr", value=natr, quality="ok"))
     for name, seg in (("prior", prior), ("recent", recent)):
         for key, v in seg.items():
             facts.append(dict(id=f"tape.{name}.{key}", value=v, quality="ok"))
@@ -46,8 +48,23 @@ def test_reading_separates_why_a_move_stops(recent, kind):
 
 def test_counter_aggression_leads_with_the_side_taking_over():
     lines = tape_lines(read_tape(fake(IMPULSE, seg(30_000, 250_000, 40, -4))))
-    assert lines[0] == "⚡ Продавцы перехватывают инициативу"
-    assert lines[1].startswith("Продажи $250k за 15с против покупок $30k · цена -4.0 б.п.")
+    assert lines[0] == "🟩 Покупки $30k · 🟥 Продажи $250k · за 15с"
+    assert lines[1] == "↩️ До этого +0.30% за 30с · покупки ослабли в 5 раз"
+
+
+def test_price_going_back_is_a_reversal_not_a_stall():
+    # TA, 08.11 14:14: buyers faded, sellers matched them and prices gave back 48 bps of a 176 bps impulse.
+    # NATR 1.84%: the 15s reversal threshold is half the 30s impulse one (27.6 bps), so -48 bps counts.
+    ta = fake(seg(86_376, 52_347, 1899, 175.75), seg(16_442, 17_024, 466, -48.3), spread=16.6, natr=1.84)
+    reading = read_tape(ta)
+    assert reading["kind"] == "counter_aggression"
+    state = dict(tape=reading, midpoint=0.09667, spread=16.6, flow=0.19, count=2384, window="observed_60s",
+                 tape_change=118)
+    text, _ = operational(dict(symbol="BINANCE:TA", captured_at=0, facts=[]), state, "active_instrument", "situation")
+    assert text.startswith("<b>TA ▼ -0.48% за 15с</b>\n⚡ Продавцы перехватывают инициативу\n")
+    assert "🟩 Покупки $16.4k · 🟥 Продажи $17k · за 15с" in text and "покупки ослабли в 2.6 раза" in text
+    # Impulse buyers still outweighing sellers while prices fall: their buying is being absorbed.
+    assert read_tape(fake(IMPULSE, seg(200_000, 40_000, 40, -12)))["kind"] == "absorption"
 
 
 def test_mirror_for_a_falling_market_and_labels_are_hypotheses():
@@ -73,10 +90,15 @@ def test_silent_recent_stretch_is_exhaustion_not_missing_data():
 def test_card_shows_effort_result_and_the_facing_wall():
     zone = dict(side="ask", price=100.05, notional_usd=95_000)
     reading = read_tape(fake(IMPULSE, seg(200_000, 20_000, 40, 0.5)), zone=zone, midpoint=100)
-    lines = tape_lines(reading)
-    assert lines[0] == "⚡ Вероятно поглощение покупок · у предложения 100.05 ($95k)"
-    assert "Покупки $200k за 15с · темп ×1.3 к импульсу" in lines[1] and "импульс +30 б.п. за 30с" in lines[1]
-    assert lines[2] == "Цена за тот же объём: ×0.02 к импульсу"
+    assert tape_lines(reading) == [
+        "🟩 Покупки $200k · 🟥 Продажи $20k · за 15с",
+        "↩️ До этого +0.30% за 30с · покупки усилились в 1.3 раза · объём не двигает цену",
+    ]
+    state = dict(tape=reading, zone=dict(zone, relative_size=40, observed_age_seconds=40), midpoint=100,
+                 spread=1, flow=0.8, count=40, window="1m")
+    text, _ = operational(dict(symbol="BTC", captured_at=0, facts=[]), state, "flow_price_conflict", "situation")
+    assert text.startswith("<b>BTC ▲ +0.01% за 15с</b>\n⚡ Вероятно поглощение покупок\n")
+    assert "🧱 На пути: Предложение <code>100.05</code> (+0.05%) · $95k" in text
 
 
 def test_segments_need_the_whole_span_observed():
@@ -117,5 +139,5 @@ def test_v3_facts_flow_into_the_packet_card_and_replay(tmp_path):
     assert state["tape"]["kind"] == "absorption"
     assert state["tape_change"] == pytest.approx(30, abs=0.5)
     text, _ = operational(packet, state, "flow_price_conflict", "situation")
-    assert "⚡ Вероятно поглощение покупок" in text and "Δ≤60с +0.30%" in text
+    assert text.startswith("<b>SMALL ▲ 0% за 15с</b>\n⚡ Вероятно поглощение покупок")
     json.dumps(state)  # stored as JSON in telegram_ux_events

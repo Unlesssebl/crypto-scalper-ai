@@ -56,7 +56,9 @@ def service(tmp_path, monkeypatch):
     )
     s = SimpleNamespace(
         journal=journal,
-        hub=SimpleNamespace(alerts=alerts, attention={}),
+        # 24h volume sets the liquidity tier: BTC is T1, NEW (discovery tests) is T2.
+        hub=SimpleNamespace(alerts=alerts, attention={}, market=SimpleNamespace(assets={
+            "BTC": SimpleNamespace(volume_24h=1e9), "NEW": SimpleNamespace(volume_24h=50e6)})),
         context_memory=ContextMemory(journal.db),
         consistency=ConsistencyStore(journal.db),
         context_packets={},
@@ -97,8 +99,9 @@ def test_operational_signal_is_independent_of_ai_and_ordinary_zone_is_quiet(serv
     rows = operations(service)
     assert len(rows) == 1
     text = rows[0]["text"]
-    assert text.startswith("<b>▲ BTC</b>") and "Hyperliquid ·" in text
-    assert "Спрос 9.99 (-0.10%)" in text and "× медианы" in text and "▲ покупки 90%" in text
+    assert text.startswith("<b>🔸 T1 · BTC ▲</b>\n🟩 Покупатели давят\n🟩🟩🟩🟩🟥 Покупки 90% · $100/мин")
+    assert "📊 Сделок в 2 раза больше обычного" in text and "<i>Hyperliquid ·" in text
+    assert "🧱 Спрос <code>9.99</code> (-0.10%)" in text
     assert "score" not in rows[0]["text"] and "Бесплатный" not in rows[0]["text"]
     assert service.journal.db.execute("SELECT COUNT(*) FROM ai_requests").fetchone()[0] == 0
 
@@ -113,7 +116,7 @@ def test_material_strengthening_only_and_restart_does_not_repeat(service):
     assert len(operations(service)) == 2
     observe(service, now + 300, ratio=4)
     assert len(operations(service)) == 2
-    assert "Усиление" in operations(service)[1]["text"]
+    assert "усиление" in operations(service)[1]["text"]
 
 
 def test_unknown_and_stale_data_cannot_push(service):
@@ -193,10 +196,15 @@ async def test_callback_authorization_expiry_and_dedup(service):
     assert await service.ux.callback(query, None) == "accepted"
     await service.ux.callback(query, None)
     service.ux.tiger.open.assert_awaited_once()
-    service.journal.db.execute("UPDATE telegram_actions SET expires_at=0")
+    # Ten minutes after the card expired the TigerTrade button still opens the chart.
+    service.journal.db.execute("UPDATE telegram_actions SET expires_at=?", (time.time() - 600,))
     query["id"] = "q2"
+    assert await service.ux.callback(query, None) == "accepted"
+    assert service.ux.tiger.open.await_count == 2
+    service.journal.db.execute("UPDATE telegram_actions SET expires_at=0")
+    query["id"] = "q3"
     assert "устарела" in await service.ux.callback(query, None)
-    service.ux.tiger.open.assert_awaited_once()
+    assert service.ux.tiger.open.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -241,7 +249,7 @@ async def test_tiger_wire_only_switches_chart(service, monkeypatch):
         monkeypatch.setenv("SCALPER_TIGER_WS_URL", str(server.make_url("/")).replace("http:", "ws:"))
         bridge = TigerBridge()
         async with aiohttp.ClientSession() as session:
-            assert "принял" in await bridge.open(session, "BTC")
+            assert await bridge.open(session, "BTC") == "TigerTrade: BTCUSDT открыт в группе S."
     assert len(commands) == 1
     assert {k: v for k, v in commands[0].items() if k != "requestId"} == dict(
         type="SETLINKSYMBOL", e="BINANCE-FUT", m="FUTURES", symbol="BTCUSDT", linkGroup="S"
@@ -296,11 +304,12 @@ def test_card_hides_side_on_a_thin_tape_and_flags_wide_spread():
     now = time.time()
     state = dict(summarize(packet(now)), flow=-1.0, count=4, wide_spread=True)
     text, _ = operational(packet(now), state, "density_context", "situation", ratio=0)
-    assert "Сделок мало (4" in text and "продажи" not in text and "▼" not in text
-    assert "0× нормы" not in text and "⚠ широкий спред" in text
+    assert "▫️ Сделок мало (4) — сторона не ясна" in text and "Продажи" not in text and "▼" not in text
+    assert "обычного" not in text and "🔴 спред" in text
     state = dict(state, count=40, zone=dict(state["zone"], notional_usd=48_000, size_to_observed_turnover=0.4))
     text, _ = operational(packet(now), state, "density_context", "situation")
-    assert "▼ продажи 100%" in text and "$48k" in text and "≈24с оборота" in text
+    assert text.startswith("<b>BTC ▼</b>\n🟥 Продавцы давят\n🟥🟥🟥🟥🟥 Продажи 100%")
+    assert "$48k" in text and "съедят за ~24с" in text
 
 
 def test_attention_reacquisition_does_not_repeat_the_same_situation(service):

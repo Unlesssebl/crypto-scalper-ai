@@ -118,11 +118,15 @@ def test_sided_active_tape_pushes_before_two_minute_cooldown(service):
     active = discovery_packet(125, live=True, trades=30, imbalance=0.6)
     service.context_memory.observe(active)
     service.context_packets = {"NEW": active}
+    # Activity is the trade-count ratio of the last closed minute, not the candle's volume ratio.
+    service.attention.activity = {"NEW": dict(status="ready", start_ms=125_000 // 60000 * 60000 - 60000,
+                                              ratios=dict(trade_count=8, base_volume=40))}
     service.ux.observe(125)
     rows = operations(service)
     assert len(rows) == 1
-    assert rows[0]["text"].startswith("<b>▲ NEW</b> · Для наблюдения: активный поток сделок")
-    assert "8× нормы" in rows[0]["text"]
+    assert rows[0]["text"].startswith("<b>🔸 T2 · NEW ▲</b>\n🟩 Покупатели давят\n🟩🟩🟩🟩🟥 Покупки 80%")
+    assert "активный поток сделок" in rows[0]["text"] and "📊 Сделок в 8 раз больше обычного" in rows[0]["text"]
+    assert rows[0]["silent"] == 1  # notable on T2: Telegram without sound, no Windows toast
     service.ux.observe(126)
     assert len(operations(service)) == 1
 
