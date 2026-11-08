@@ -1592,3 +1592,44 @@ async def test_acceptance_rejects_bypass_configuration(kwargs):
     store, _gaps, _windows, _ingest = await make_services()
     with pytest.raises(ValueError):
         await build_acceptance_report(store, start_ms=MINUTE, end_ms=MINUTE + WINDOW_MS, **kwargs)
+
+
+async def _store_with_gap(detected_at_ms: int) -> InMemoryMarketPulseStore:
+    store = InMemoryMarketPulseStore()
+    await store.add_gap(
+        Gap(gap_id=0, venue="hyperliquid", native_market_id="BTC", channel="trades", source_epoch="e1",
+            start_ms=detected_at_ms - 60_000, detected_at_ms=detected_at_ms,
+            state=QualityState.GAP_DETECTED.value, reason="collector restarted")
+    )
+    return store
+
+
+async def test_historical_open_gap_is_counted_but_does_not_degrade_health():
+    """An old unrecovered gap is a permanent data hole, not a failing collector."""
+    from hyperdata_terminal.market_pulse.storage import RECENT_GAP_MS
+
+    now = int(time.time() * 1_000)
+    store = await _store_with_gap(now - RECENT_GAP_MS - 1)
+    health = await store.health(now_ms=now)
+    assert health["status"] == "ok"
+    assert (health["open_gaps"], health["recent_open_gaps"], health["historical_open_gaps"]) == (1, 0, 1)
+
+
+async def test_recent_open_gap_still_degrades_health():
+    now = int(time.time() * 1_000)
+    store = await _store_with_gap(now - 60_000)
+    health = await store.health(now_ms=now)
+    assert health["status"] == "degraded"
+    assert (health["recent_open_gaps"], health["historical_open_gaps"]) == (1, 0)
+
+
+async def test_health_endpoint_is_ok_with_only_historical_gaps():
+    from hyperdata_terminal.market_pulse.storage import RECENT_GAP_MS
+
+    store = await _store_with_gap(int(time.time() * 1_000) - RECENT_GAP_MS - 60_000)
+    async with TestClient(TestServer(create_app(store))) as client:
+        response = await client.get("/health")
+        body = await response.json()
+    assert response.status == 200 and body["status"] == "ok"
+    assert body["storage"]["historical_open_gaps"] == 1
+    assert len(body["open_gaps"]) == 1  # the gap itself stays visible

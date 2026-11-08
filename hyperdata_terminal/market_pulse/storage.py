@@ -11,6 +11,7 @@ Both stores implement the same atomic append semantics:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 
@@ -114,6 +115,14 @@ class RawSegmentRecord:
             "sealed": self.sealed,
             "created_at_ms": self.created_at_ms,
         }
+
+
+# Health reflects the current state of collection. A gap detected long ago and
+# never recovered is an honest, permanent hole in the data (kept for coverage
+# and replay), not a sign that collection is failing now. Only gaps detected
+# within this window degrade the status, so a reconnect storm happening right
+# now still does.
+RECENT_GAP_MS = 15 * 60 * 1_000
 
 
 @runtime_checkable
@@ -233,7 +242,7 @@ class MarketPulseStore(Protocol):
 
     async def complete_recalc(self, affected: Iterable[tuple[str, str, str, str, int]]) -> None: ...
 
-    async def health(self) -> dict[str, Any]: ...
+    async def health(self, now_ms: int | None = None) -> dict[str, Any]: ...
 
     async def close(self) -> None: ...
 
@@ -602,22 +611,25 @@ class InMemoryMarketPulseStore:
         for key in affected:
             self._recalc.discard(key)
 
-    async def health(self) -> dict[str, Any]:
-        open_gaps = sum(
-            1 for gap in self._gaps if gap.state == QualityState.GAP_DETECTED.value
-        )
+    async def health(self, now_ms: int | None = None) -> dict[str, Any]:
+        now_ms = int(time.time() * 1_000) if now_ms is None else now_ms
+        detected = [gap for gap in self._gaps if gap.state == QualityState.GAP_DETECTED.value]
+        open_gaps = len(detected)
+        recent = sum(1 for gap in detected if gap.detected_at_ms >= now_ms - RECENT_GAP_MS)
         declared = sum(
             1 for gap in self._gaps if gap.state == QualityState.DECLARED_OUTAGE.value
         )
         coverage = await self.list_coverage()
         unavailable = [item for item in coverage if item.state == QualityState.UNAVAILABLE.value]
         return {
-            "status": "degraded" if open_gaps or unavailable or self._conflicts else "ok",
+            "status": "degraded" if recent or unavailable or self._conflicts else "ok",
             "events": len(self._events),
             "windows": len(self._windows),
             "cursor": self._next_seq - 1,
             "conflicts": len(self._conflicts),
             "open_gaps": open_gaps,
+            "recent_open_gaps": recent,
+            "historical_open_gaps": open_gaps - recent,
             "declared_outages": declared,
             "unavailable_channels": len(unavailable),
             "pending_recalc": len(self._recalc),

@@ -8,6 +8,7 @@ single-writer rule even if an operator accidentally starts two ingests.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from typing import Any, Iterable, Sequence
 
@@ -21,6 +22,7 @@ from .contracts import (
     affected_window,
 )
 from .storage import (
+    RECENT_GAP_MS,
     AppendResult,
     ChannelCoverage,
     ConflictRecord,
@@ -956,7 +958,8 @@ class PostgresStore:
                 rows,
             )
 
-    async def health(self) -> dict[str, Any]:
+    async def health(self, now_ms: int | None = None) -> dict[str, Any]:
+        now_ms = int(time.time() * 1_000) if now_ms is None else now_ms
         async with self.pool.acquire() as connection:
             events = await connection.fetchval("SELECT COUNT(*) FROM execution_events")
             windows = await connection.fetchval("SELECT COUNT(*) FROM windows")
@@ -965,6 +968,11 @@ class PostgresStore:
             open_gaps = await connection.fetchval(
                 "SELECT COUNT(*) FROM gaps WHERE state = $1",
                 QualityState.GAP_DETECTED.value,
+            )
+            recent_gaps = await connection.fetchval(
+                "SELECT COUNT(*) FROM gaps WHERE state = $1 AND detected_at_ms >= $2",
+                QualityState.GAP_DETECTED.value,
+                now_ms - RECENT_GAP_MS,
             )
             declared_outages = await connection.fetchval(
                 "SELECT COUNT(*) FROM gaps WHERE state = $1",
@@ -977,13 +985,15 @@ class PostgresStore:
             recalc = await connection.fetchval("SELECT COUNT(*) FROM recalc_queue")
             quarantined = await connection.fetchval("SELECT COUNT(*) FROM event_quarantine")
         return {
-            "status": "degraded" if open_gaps or unavailable or conflicts or quarantined else "ok",
+            "status": "degraded" if recent_gaps or unavailable or conflicts or quarantined else "ok",
             "quarantined_events": int(quarantined or 0),
             "events": int(events or 0),
             "windows": int(windows or 0),
             "cursor": int(cursor or 0),
             "conflicts": int(conflicts or 0),
             "open_gaps": int(open_gaps or 0),
+            "recent_open_gaps": int(recent_gaps or 0),
+            "historical_open_gaps": int(open_gaps or 0) - int(recent_gaps or 0),
             "declared_outages": int(declared_outages or 0),
             "unavailable_channels": int(unavailable or 0),
             "pending_recalc": int(recalc or 0),
