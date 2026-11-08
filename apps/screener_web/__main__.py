@@ -233,6 +233,9 @@ async def healthz(request: web.Request) -> web.Response:
             "warnings": hub.warnings,
             "attention_plan_status": plan_status,
             "observation_error": observation_error,
+            # Informational: a silent market must not make the supervisor
+            # treat the screener as unhealthy.
+            "pipeline": service.liveness.report() if getattr(service, "liveness", None) else None,
         },
         status=200 if healthy else 503,
     )
@@ -331,6 +334,8 @@ async def run(args: argparse.Namespace) -> None:
                 tasks.append(asyncio.create_task(service.auto_context(), name="screener-context-ai"))
                 tasks.append(asyncio.create_task(service.refresh_activity(), name="screener-activity"))
                 tasks.append(asyncio.create_task(service.refresh_profiles(path), name="screener-profiles"))
+                if service.liveness is not None:
+                    tasks.append(asyncio.create_task(service.liveness.run(), name="pipeline-liveness"))
             if notify:
                 if not service.telegram_ux:
                     tasks.append(asyncio.create_task(announce_online(service), name="telegram-online"))

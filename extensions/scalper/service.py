@@ -86,6 +86,13 @@ class Screener:
             and os.getenv("SCALPER_BOTS", "1").lower() in {"1", "true", "yes"}
             else None
         )
+        self.liveness = None
+        if self.bots is not None:
+            from .bots.liveness import PipelineLiveness
+
+            # Telegram only with --notify; without it the checks still run and
+            # surface in /healthz and the log.
+            self.liveness = PipelineLiveness(journal.db, getattr(hub, "alerts", None) if notify else None)
         self.context_packets = {}
         self.context_cache = OrderedDict()
         self.context_lock = asyncio.Lock()
