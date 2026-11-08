@@ -51,7 +51,7 @@ def record(at, btc_price, direction="BULLISH", rank=3):
         item["snapshot"]["captured_at"] = at
         for metric in item["snapshot"]["metrics"].values():
             metric["updated_at"] = at
-    return {"as_of": at, "attention": {"selected": ["ETH"]}, "rows": rows}
+    return {"as_of": at, "attention": {"selected": ["ETH"], "detail": ["ETH"]}, "rows": rows}
 
 
 def write_recording(path, records):

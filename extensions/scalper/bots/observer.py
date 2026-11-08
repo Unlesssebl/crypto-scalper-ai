@@ -66,8 +66,14 @@ def natr_bucket(natr):
     return round(math.log2(natr) * 2) / 2
 
 
-def choose_controls(rows: dict, window: str, signal_symbol: str, selected: set[str], signal_natr, seed: str):
+def choose_controls(rows: dict, window: str, signal_symbol: str, excluded: set[str], signal_natr, seed: str):
     """Pick same-time, same-volatility-bucket inactive instruments.
+
+    ``excluded`` is the detail set (``plan.detail``): instruments with a live
+    tape that could carry the signal themselves.  In the unified runtime the
+    scan rows are exactly ``plan.selected``, so excluding the whole overview
+    left no candidates at all.  Overview-only rows have NATR and a mark but no
+    tape, so the trigger cannot fire on them.
 
     The bucket is a coarse log2 NATR band so a quiet instrument is not compared
     with a high-volatility one.  If the bucket is too thin we widen the search
@@ -76,7 +82,7 @@ def choose_controls(rows: dict, window: str, signal_symbol: str, selected: set[s
     target_bucket = natr_bucket(signal_natr)
     natr_by_symbol = {}
     for (symbol, frame), row in rows.items():
-        if frame != window or symbol == signal_symbol or symbol in selected:
+        if frame != window or symbol == signal_symbol or symbol in excluded:
             continue
         natr = _metric(row, "natr")
         if natr is None or natr <= 0:
@@ -131,7 +137,8 @@ class BotObservatory:
     def tick(self, now: float, rows: dict, prices: dict, attention: dict | None = None) -> None:
         """Observe one screener pass.  Safe to call from the synchronous scan."""
         plan = attention or {}
-        selected = set(plan.get("selected") or []) | set(plan.get("detail") or [])
+        detail = set(plan.get("detail") or [])
+        selected = set(plan.get("selected") or []) | detail
         for spec in self.specs:
             trigger = self._implemented.get(spec.id)
             if not spec.enabled or trigger is None:
@@ -144,7 +151,7 @@ class BotObservatory:
                     if event is None:
                         self._end_state(spec, symbol, window, now)
                     else:
-                        self._observe_event(spec, symbol, window, row, event, now, rows, selected)
+                        self._observe_event(spec, symbol, window, row, event, now, rows, selected, detail)
                 except Exception:
                     LOG.exception("Bot %s trigger failed for %s/%s", spec.id, symbol, window)
         self._capture_marks(now, prices)
@@ -173,7 +180,7 @@ class BotObservatory:
             last_seen=now,
         )
 
-    def _observe_event(self, spec, symbol, window, row, event, now, rows, selected) -> None:
+    def _observe_event(self, spec, symbol, window, row, event, now, rows, selected, detail=frozenset()) -> None:
         direction = int(event["direction"])
         self._last_true[(spec.id, symbol, window)] = now
         state = state_row(self.db, spec, symbol, window)
@@ -236,7 +243,7 @@ class BotObservatory:
                         (episode_id, horizon, now + 1.0 + horizon),
                     )
                 controls, bucket = choose_controls(
-                    rows, window, symbol, selected, event.get("natr"), seed=episode_id
+                    rows, window, symbol, detail, event.get("natr"), seed=episode_id
                 )
                 self.db.execute(
                     "INSERT OR IGNORE INTO bot_control_sets("

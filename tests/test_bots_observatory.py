@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import replace
@@ -312,3 +313,24 @@ def test_entry_mark_after_the_window_is_not_used():
     obs.tick(1_013.0, market_rows(), quotes({"BTC": 100.0}, 1_012.0), plan)  # due+11s
     obs.settle_mark_only(1_025.0)
     assert tuple(_entry(db)) == (None, None, "unscored", "no_entry_mark")
+
+
+def test_unified_plan_controls_come_from_overview_rows_not_detail():
+    """Unified runtime: every scan row is in plan.selected.
+
+    Excluding the whole overview left every control set empty. Only the
+    detail set (live tape) is excluded; overview-only rows are valid controls.
+    """
+    db = make_db()
+    obs = BotObservatory(db, [spec_by_id("flow.continuation")], now=1_000.0)
+    rows = market_rows()
+    symbols = [symbol for symbol, _ in rows]
+    plan = {"selected": symbols, "detail": ["BTC", "ETH"]}
+    obs.tick(1_000.0, rows, quotes({s: 10.0 for s in symbols}, 1_001.2), plan)
+
+    chosen = json.loads(db.execute("SELECT symbols FROM bot_control_sets").fetchone()[0])
+    assert sorted(chosen) == ["ADA", "AVAX", "DOGE", "SOL", "XRP"]
+    points = db.execute("SELECT COUNT(*) FROM bot_control_points").fetchone()[0]
+    assert points == 5 * 3
+    trigger = json.loads(db.execute("SELECT trigger_json FROM bot_observations").fetchone()[0])
+    assert trigger["selected"] is True
