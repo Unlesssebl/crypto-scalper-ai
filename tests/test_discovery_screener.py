@@ -7,15 +7,16 @@ from extensions.scalper.fact_packet import build_packet
 from extensions.scalper.history.archive import Archive
 from extensions.scalper.history.replay import replay
 from extensions.scalper.relative_attention import Attention, AttentionPolicy
+from extensions.scalper.telegram_ux import discovery_gate
 from tests.test_attention_quality import observation
 from tests.test_telegram_product import operations
 from tests.test_telegram_product import service as service
 
 
-def discovery_packet(now=100, *, live=False, potential=True, healthy=True, spread=20):
+def discovery_packet(now=100, *, live=False, potential=True, healthy=True, spread=20, trades=3, imbalance=0):
     card = dict(status="observing", received_at=now, midpoint=1, spread_bps=spread,
                 observed_levels=[20, 20], evidence="run:book", densities=[],
-                observed_trade_count_60s=3 if live else 0, observed_trade_imbalance=0,
+                observed_trade_count_60s=trades if live else 0, observed_trade_imbalance=imbalance,
                 observed_turnover_60s_usd=10 if live else 0,
                 last_trade_received_at=now if live else None, trade_window_truncated=False)
     assignment = dict(symbol="NEW", assigned_at=90, state="focus" if live else "probe", score=7,
@@ -95,32 +96,48 @@ def test_one_price_burst_does_not_immediately_announce_a_candidate():
     assert attention.active["NEW"]["interest"]["potential"] is True
 
 
-def test_candidate_notification_does_not_need_ai_or_a_tight_spread(service):
+def test_thin_candidate_stays_in_the_quiet_watch_list(service):
     p = discovery_packet(spread=100)
     service.context_memory.observe(p)
     service.context_packets = {"NEW": p}
+    service.hub.attention = {"active": [dict(symbol="NEW", state="probe")]}
+    service.attention.plan = {"expires_at_ms": 10**15}
     service.ux.observe(100)
-    rows = operations(service)
-    assert len(rows) == 1
-    assert "Кандидат для наблюдения" in rows[0]["text"]
-    assert "8×" in rows[0]["text"]
+    assert not operations(service)
     assert service.journal.db.execute("SELECT COUNT(*) FROM ai_requests").fetchone()[0] == 0
-    service.ux.observe(101)
-    assert len(operations(service)) == 1
+    watch = service.journal.db.execute("SELECT text FROM episode_cards WHERE episode_id='ux:watch'").fetchone()[0]
+    assert "<b>NEW</b>" in watch and "Тихий список" in watch
 
 
-def test_activation_can_update_candidate_before_two_minute_cooldown(service):
+def test_sided_active_tape_pushes_before_two_minute_cooldown(service):
     p = discovery_packet()
     service.context_memory.observe(p)
     service.context_packets = {"NEW": p}
     service.ux.observe(100)
-    active = discovery_packet(125, live=True)
+    assert not operations(service)
+    active = discovery_packet(125, live=True, trades=30, imbalance=0.6)
     service.context_memory.observe(active)
     service.context_packets = {"NEW": active}
     service.ux.observe(125)
     rows = operations(service)
-    assert len(rows) == 2
-    assert any("Инструмент активен" in row["text"] for row in rows)
+    assert len(rows) == 1
+    assert rows[0]["text"].startswith("<b>▲ NEW</b> · Для наблюдения: активный поток сделок")
+    assert "8× нормы" in rows[0]["text"]
+    service.ux.observe(126)
+    assert len(operations(service)) == 1
+
+
+def test_discovery_gate_needs_two_of_tape_activity_tradable_zone():
+    zone = dict(notional_usd=50_000, distance_bps=-20, size_to_observed_turnover=0.5)
+    tape = dict(flow=-0.5, count=40)
+    assert discovery_gate(dict(tape, ratio=4)) is None
+    assert discovery_gate(dict(tape, zone=zone)) is None
+    assert discovery_gate(dict(ratio=4, zone=zone)) is None
+    assert discovery_gate(dict(tape, ratio=4, wide_spread=True)) == "discovery_wide_spread"
+    assert discovery_gate(dict(ratio=40)) == "discovery_quiet"
+    assert discovery_gate(dict(flow=-1, count=6, ratio=4)) == "discovery_quiet"  # thin tape is not a side
+    for weak in (dict(notional_usd=900), dict(distance_bps=240), dict(size_to_observed_turnover=12)):
+        assert discovery_gate(dict(ratio=4, zone=dict(zone, **weak))) == "discovery_quiet"
 
 
 def test_discovery_policy_and_interest_replay_exactly(tmp_path):

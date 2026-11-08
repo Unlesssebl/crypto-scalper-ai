@@ -96,8 +96,9 @@ def test_operational_signal_is_independent_of_ai_and_ordinary_zone_is_quiet(serv
     observe(service, now + 30)
     rows = operations(service)
     assert len(rows) == 1
-    assert "Ситуация" in rows[0]["text"] and "Данные Hyperliquid" in rows[0]["text"]
-    assert "медианы уровней" in rows[0]["text"] and "Покупки 90%" in rows[0]["text"]
+    text = rows[0]["text"]
+    assert text.startswith("<b>▲ BTC</b>") and "Hyperliquid ·" in text
+    assert "Спрос 9.99 (-0.10%)" in text and "× медианы" in text and "▲ покупки 90%" in text
     assert "score" not in rows[0]["text"] and "Бесплатный" not in rows[0]["text"]
     assert service.journal.db.execute("SELECT COUNT(*) FROM ai_requests").fetchone()[0] == 0
 
@@ -288,6 +289,18 @@ def test_unverified_ai_and_stale_reviews_cannot_publish(service):
         )
     text, rich = operational(packet(now), summarize(packet(now)), "density_context", "situation")
     assert "AI" not in text and len(text) < 900
+    assert "не определён" not in text and "Фаза не определена" not in text
+
+
+def test_card_hides_side_on_a_thin_tape_and_flags_wide_spread():
+    now = time.time()
+    state = dict(summarize(packet(now)), flow=-1.0, count=4, wide_spread=True)
+    text, _ = operational(packet(now), state, "density_context", "situation", ratio=0)
+    assert "Сделок мало (4" in text and "продажи" not in text and "▼" not in text
+    assert "0× нормы" not in text and "⚠ широкий спред" in text
+    state = dict(state, count=40, zone=dict(state["zone"], notional_usd=48_000, size_to_observed_turnover=0.4))
+    text, _ = operational(packet(now), state, "density_context", "situation")
+    assert "▼ продажи 100%" in text and "$48k" in text and "≈24с оборота" in text
 
 
 def test_attention_reacquisition_does_not_repeat_the_same_situation(service):

@@ -8,7 +8,7 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
-from .analytics_context import admission, analytical_state, fact_value
+from .analytics_context import admission, fact_value
 from .context_auto import decide, summarize
 from .fact_packet import packet_ready
 from .notification_quality import NotificationQuality
@@ -111,55 +111,166 @@ def scenarios(state):
     ]
 
 
+# Below this many prints a buy/sell share is noise, not a side of the flow.
+MIN_FLOW_TRADES = 10
+# A share this far from 50% is shown as a side (▲/▼); closer is "balanced".
+SIDE_SHARE = 0.2
+DISCOVERY_TITLES = {
+    "potential": "аномалия активности",
+    "active": "активный поток сделок",
+    "level": "зона в стакане",
+}
+WATCH_REASONS = {
+    "interesting_instrument": "аномалия активности",
+    "active_instrument": "активный поток",
+    "interesting_level": "зона в стакане",
+    "formation_confirmed": "движение подтвердилось",
+    "flow_price_conflict": "поток против цены",
+    "early_context": "ранний импульс",
+    "density_context": "значимая зона",
+}
+# Phases worth a line on the card; "unknown"/"not observed" are omitted, not printed.
+CARD_PHASES = {"early", "confirmed", "extended", "weakening"}
+
+
+def small(x, digits=1):
+    """Keeps tiny non-zero values visible: 0.04 б.п. must not print as 0."""
+    return number(x, digits) if x == 0 or abs(x) >= 10 ** -digits else f"{x:.1g}"
+
+
+def usd(amount):
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if amount >= div:
+            scaled = amount / div
+            return "$" + (number(scaled, 1) if scaled < 100 else f"{scaled:.0f}") + suffix
+    return f"${amount:.0f}"
+
+
+def eat_time(ratio):
+    """Zone notional / last-60s turnover → time to trade through it at the current pace."""
+    seconds = ratio * 60
+    if seconds < 1:
+        return "<1с оборота"
+    if seconds < 120:
+        return f"≈{seconds:.0f}с оборота"
+    # Beyond ~10 minutes the tape is too thin for the estimate to mean anything to a scalper.
+    return f"≈{seconds / 60:.0f} мин оборота" if seconds < 600 else "оборот >10 мин"
+
+
+def flow_side(state):
+    """Returns (arrow, line) for the tape, or (None, line|None) when the sample is too thin."""
+    flow, count = state.get("flow"), state.get("count")
+    if flow is None or count is None or abs(flow) > 1:
+        return None, None
+    window = "1м" if state.get("window") == "1m" else "≤60с"
+    if count < MIN_FLOW_TRADES:
+        return None, f"Сделок мало ({int(count)} за {window}) · сторона не определена"
+    buys = (flow + 1) * 50
+    if flow >= SIDE_SHARE:
+        arrow, side = "▲", f"покупки {buys:.0f}%"
+    elif flow <= -SIDE_SHARE:
+        arrow, side = "▼", f"продажи {100 - buys:.0f}%"
+    else:
+        arrow, side = None, f"баланс · покупки {buys:.0f}%"
+    return arrow, f"{arrow + ' ' if arrow else ''}{side} · {int(count)} сделок за {window}"
+
+
+# Discovery push gate: initial engineering thresholds, not proven trading edges.
+PUSH_MIN_TRADES = 20
+PUSH_MIN_ACTIVITY = 3
+PUSH_ZONE_MIN_USD = 25_000
+PUSH_ZONE_MAX_DISTANCE_BPS = 50
+PUSH_ZONE_EAT_SECONDS = (10, 300)
+
+
+def discovery_gate(state):
+    """None when a discovery candidate deserves its own push; otherwise why it stays in the watch list.
+
+    A push needs two of three: a sided tape, activity well above the norm, a tradable zone
+    (sized in dollars, near the price, eaten in seconds-to-minutes at the current pace).
+    """
+    if state.get("wide_spread"):
+        return "discovery_wide_spread"
+    flow, count = state.get("flow"), state.get("count") or 0
+    tape = flow is not None and abs(flow) >= SIDE_SHARE and count >= PUSH_MIN_TRADES
+    active = any(
+        type(state.get(k)) in (int, float) and state[k] >= PUSH_MIN_ACTIVITY for k in ("ratio", "rolling_activity")
+    )
+    zone = state.get("zone") or {}
+    eat = zone.get("size_to_observed_turnover")
+    tradable_zone = bool(
+        (zone.get("notional_usd") or 0) >= PUSH_ZONE_MIN_USD
+        and zone.get("distance_bps") is not None
+        and abs(zone["distance_bps"]) <= PUSH_ZONE_MAX_DISTANCE_BPS
+        and eat is not None
+        and PUSH_ZONE_EAT_SECONDS[0] <= eat * 60 <= PUSH_ZONE_EAT_SECONDS[1]
+    )
+    return None if tape + active + tradable_zone >= 2 else "discovery_quiet"
+
+
 def operational(packet, state, reason, kind, ratio=None, pulse=None):
-    symbol = html.escape(packet["symbol"])
-    frame = scale(packet, state)
-    phase = PHASES.get(state.get("phase"), "Фаза не определена")
-    title = TITLES.get(reason, "Изменение наблюдаемой ситуации")
-    if kind == "strengthening":
-        title = "Появился новый значимый уровень" if reason == "new_level" else "Ситуация заметно усилилась"
-    parts = [
-        f"<b>{symbol} · {title}</b>",
-        f"{'Усиление' if kind == 'strengthening' else 'Ситуация'} · масштаб {frame} · фаза 1м: {phase}",
-    ]
-    metrics = []
+    raw = packet["symbol"]
+    binance = raw.startswith("BINANCE:")
+    symbol = html.escape(raw.removeprefix("BINANCE:"))
     if state.get("discovery_kind"):
-        parts[1] = "Для наблюдения · " + {
-            "potential": "относительная аномалия", "active": "свежий устойчивый поток сделок",
-            "level": "устойчивая зона в стакане",
-        }.get(state["discovery_kind"], "исследование активности")
-        if state.get("wide_spread"):
-            parts.append("Широкий спред · учитывайте при изучении инструмента")
-    if state.get("midpoint") is not None:
-        metrics.append("Цена " + number(state["midpoint"], 8))
+        title = "Для наблюдения: " + DISCOVERY_TITLES.get(state["discovery_kind"], "активность")
+    else:
+        title = TITLES.get(reason, "Изменение ситуации")
+    if kind == "strengthening":
+        title = "Усиление: " + ("новый значимый уровень" if reason == "new_level" else "ситуация заметно усилилась")
+    arrow, tape = flow_side(state)
+    parts = [f"<b>{arrow + ' ' if arrow else ''}{symbol}</b> · {title}"]
+
+    if tape:
+        # Activity below the norm contradicts any "active" title; only an excess is informative.
+        if ratio is not None and ratio >= 1 and not tape.startswith("Сделок мало"):
+            tape += f" · {'≥' if ratio >= 1000 else ''}{number(ratio, 1)}× нормы"
+        parts.append(tape)
+    elif ratio is not None and ratio >= 1:
+        parts.append(f"Сделок {'≥' if ratio >= 1000 else ''}{number(ratio, 1)}× нормы · закрытая 1м")
+
+    metrics = []
+    mid = state.get("midpoint")
+    if mid is not None:
+        metrics.append("Цена " + number(mid, 8))
     if state.get("spread") is not None:
-        metrics.append("спред " + number(state["spread"]) + " б.п.")
+        label = "⚠ широкий спред " if state.get("wide_spread") else "спред "
+        metrics.append(label + small(state["spread"]) + " б.п.")
     if state.get("change") is not None:
-        metrics.append(f"Δ {state['change'] / 100:+.2f}% за наблюдаемую 1м")
+        metrics.append(f"Δ1м {state['change'] / 100:+.2f}%")
+    natr = value(packet, "context.1m.natr")
+    if natr is not None:
+        metrics.append(f"NATR {small(natr, 2)}%")
     if metrics:
         parts.append(" · ".join(metrics))
-    if ratio is not None:
-        parts.append(f"Активность {'≥' if ratio >= 1000 else ''}{number(ratio)}× нормы · закрытая 1м")
-    if state.get("flow") is not None and abs(state["flow"]) <= 1 and state.get("count") is not None:
-        label = "1м" if state["window"] == "1m" else "наблюдаемые ≤60с"
-        count_unit = "агрегатов" if packet["symbol"].startswith("BINANCE:") else "сделок"
-        parts.append(f"Покупки {(state['flow'] + 1) * 50:.0f}% объёма · {int(state['count'])} {count_unit} · {label}")
+
     zone = state.get("zone")
     if zone:
         side = "Спрос" if zone["side"] == "bid" else "Предложение"
-        parts.append(
-            f"{side} {number(zone['price'], 8)} · {number(zone['relative_size'])}× "
-            f"медианы уровней · видна {zone['observed_age_seconds']:.0f}с"
-        )
+        line = [f"{side} {number(zone['price'], 8)}"]
+        if mid:
+            line[0] += f" ({(zone['price'] / mid - 1) * 100:+.2f}%)"
+        if zone.get("notional_usd"):
+            line.append(usd(zone["notional_usd"]))
+        rel = zone["relative_size"]
+        line.append(f"{rel:.0f}× медианы" if rel >= 10 else f"{number(rel, 1)}× медианы")
+        if zone.get("size_to_observed_turnover") is not None:
+            line.append(eat_time(zone["size_to_observed_turnover"]))
+        line.append(f"стоит {zone['observed_age_seconds']:.0f}с")
+        parts.append(" · ".join(line))
+
+    phase, frame = state.get("phase"), scale(packet, state)
+    if phase in CARD_PHASES:
+        parts.append(f"Фаза 1м: {PHASES[phase]}" + (f" · масштаб {frame}" if frame in {"1m", "5m"} else ""))
+
     if state.get("context_version") or (pulse and pulse.get("status") == "ready"):
         flow = state.get("cross_venue") if state.get("context_version") else pulse.get("flow")
         if flow in {"aligned_buy", "aligned_sell"}:
-            parts.append("HL и OKX: совпадает сторона потока · закрытая 1м")
+            parts.append("HL и OKX: " + ("покупки" if flow == "aligned_buy" else "продажи") + " на обеих · закрытая 1м")
         elif flow == "opposed":
-            parts.append("HL и OKX: стороны потока расходятся · закрытая 1м")
+            parts.append("HL и OKX: стороны расходятся · закрытая 1м")
     clock = datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S")
-    venue = "Binance USDT-M" if packet["symbol"].startswith("BINANCE:") else "Hyperliquid"
-    parts.append(f"Данные {venue} · {clock} МСК")
+    parts.append(f"{'Binance USDT-M' if binance else 'Hyperliquid'} · {clock} МСК")
     return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
 
 
@@ -286,7 +397,8 @@ class TelegramUX:
             buttons.insert(0, dict(text="TigerTrade · ПК", callback_data=self.button(card, "tiger", packet, expires)))
         except (ValueError, TypeError):
             pass
-        return dict(inline_keyboard=[buttons, [dict(text="Копировать тикер", copy_text=dict(text=packet["symbol"]))]])
+        ticker = packet["symbol"].removeprefix("BINANCE:")
+        return dict(inline_keyboard=[buttons, [dict(text="Копировать тикер", copy_text=dict(text=ticker))]])
 
     def audit(self, packet, reason, status, state):
         self.db.execute(
@@ -325,7 +437,8 @@ class TelegramUX:
             if priority is None:
                 continue
             discovery = bool(state.get("discovery_kind"))
-            blocked = None if discovery else admission(state, reason)
+            # Discovery still finds instruments for the quiet watch list; only a tradable one interrupts.
+            blocked = discovery_gate(state) if discovery else admission(state, reason)
             if blocked:
                 self.quality.record(packet, state, "blocked", blocked)
                 continue
@@ -429,32 +542,10 @@ class TelegramUX:
         else:
             dynamic = [r for r in active if r.get("state") != "control"][:6]
             for row in dynamic:
-                symbol = row["symbol"]
-                packet = service.context_packets.get(symbol)
-                ready = bool(packet and packet_ready(packet, now))
-                why = (
-                    TITLES.get(
-                        (service.context_memory.latest(packet["episode_id"]) or {}).get("reason"),
-                        "относительная активность",
-                    )
-                    if packet
-                    else "относительная активность"
-                )
-                stage = {"focus": "в фокусе", "probe": "проверяем", "cooling": "затухает"}.get(
-                    row["state"], "наблюдение"
-                )
-                if ready:
-                    phase = analytical_state(packet)
-                    if phase.get("phase") in PHASES:
-                        stage = PHASES[phase["phase"]]
-                    if phase.get("wide_spread"):
-                        stage += " · широкий спред"
-                lines.append(
-                    f"<b>{html.escape(symbol)}</b> · {stage if ready else 'прогрев/нет свежих данных'} · {why}"
-                )
+                lines.append(self.watch_line(row, now))
             if not dynamic:
                 lines.append("Содержательных кандидатов пока нет.")
-        lines.append("Без отдельного оповещения до появления ситуации.")
+        lines.append("Тихий список: отдельный push только при потоке, активности или торгуемой зоне.")
         lines.append(datetime.fromtimestamp(now, MSK).strftime("Обновлено %H:%M МСК"))
         text = "\n".join(lines)
         service.outbox.enqueue(
@@ -466,6 +557,36 @@ class TelegramUX:
             chat_id=str(service.hub.alerts.telegram_chat_id),
             silent=True,
         )
+
+    def watch_line(self, row, now):
+        service = self.service
+        symbol = row["symbol"]
+        packet = service.context_packets.get(symbol)
+        name = html.escape(symbol.removeprefix("BINANCE:"))
+        if not (packet and packet_ready(packet, now)):
+            return f"{name} · прогрев, свежих данных нет"
+        reason = (service.context_memory.latest(packet["episode_id"]) or {}).get("reason")
+        why = WATCH_REASONS.get(reason) or {"focus": "в фокусе", "probe": "проверяем", "cooling": "затухает"}.get(
+            row.get("state"), "наблюдение"
+        )
+        state = summarize(packet)
+        arrow, tape = flow_side(state)
+        parts = [f"<b>{arrow + ' ' if arrow else ''}{name}</b> · {why}"]
+        if tape and not tape.startswith("Сделок мало"):
+            parts.append(tape.removeprefix(arrow + " ") if arrow else tape)
+        zone, mid = state.get("zone"), state.get("midpoint")
+        if zone and mid:
+            side = "спрос" if zone["side"] == "bid" else "предл."
+            parts.append(
+                f"{side} {(zone['price'] / mid - 1) * 100:+.2f}%"
+                + (" " + usd(zone["notional_usd"]) if zone.get("notional_usd") else "")
+            )
+        phase = state.get("phase")
+        if phase in CARD_PHASES:
+            parts.append(PHASES[phase].lower())
+        if state.get("wide_spread"):
+            parts.append("⚠ спред")
+        return " · ".join(parts)
 
     def publish_analysis(self, response):
         packet = response["packet"]

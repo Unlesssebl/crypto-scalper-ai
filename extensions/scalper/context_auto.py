@@ -45,7 +45,10 @@ def summarize(packet):
         zone = {n: value(prefix + "." + n) for n in ("price", "size", "relative_size", "observed_age_seconds")}
         if all(type(v) in (int, float) and math.isfinite(v) for v in zone.values()):
             zone.update(
-                {n: value(prefix + "." + n) for n in ("distance_bps", "size_change", "size_to_observed_turnover")}
+                {
+                    n: value(prefix + "." + n)
+                    for n in ("distance_bps", "size_change", "size_to_observed_turnover", "notional_usd")
+                }
             )
             zones.append(dict(zone, id=prefix, side=prefix.split(".")[1]))
     zones.sort(key=lambda z: (-z["relative_size"], z["id"]))
