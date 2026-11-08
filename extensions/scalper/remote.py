@@ -158,8 +158,19 @@ class RemoteHub:
             overview = market.get("assets", [])
             observed = float(market.get("as_of") or 0)
             selector = getattr(self, "attention_selector", None)
+            if selector:
+                selector.feedback = {
+                    row["symbol"]: {
+                        **row.get("facts", {}), "assigned_at": row.get("assigned_at"),
+                        "healthy": bool(row.get("ready")) and not self.attention.get("degraded", True),
+                    }
+                    for row in self.attention.get("active", [])
+                }
             selected = (
-                set(selector.choose(overview, observed)) if selector and 0 <= time.time() - observed <= 20 else None
+                # Decision time is after both responses. A fresh book can be
+                # newer than the REST market snapshot without being future data.
+                set(selector.choose(overview, time.time()))
+                if selector and 0 <= time.time() - observed <= 20 else None
             )
             if selected is None and selective:
                 selected = {r["symbol"] for r in self.attention.get("active", [])}
@@ -320,6 +331,7 @@ class RemoteHub:
                 mark_price=item.get("mark_price") or 0.0,
                 index_price=item.get("index_price") or 0.0,
                 premium_pct=item.get("premium_pct") or 0.0,
+                observed_at=item.get("observed_at") or self.market.observed_at,
             )
             for item in assets
         }

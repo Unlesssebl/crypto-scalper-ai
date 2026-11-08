@@ -265,6 +265,10 @@ class AutoRawRecovery:
                 continue
             if gap.venue == "okx":
                 normalizer = lambda payload, **kwargs: normalize_okx_trades(payload, spec, **kwargs)  # noqa: E731
+            elif gap.venue == "binance":
+                from .collectors.binance import normalize_binance_trades
+
+                normalizer = lambda payload, **kwargs: normalize_binance_trades(payload, spec, **kwargs)  # noqa: E731
             else:
                 normalizer = lambda payload, **kwargs: normalize_hyperliquid_trades(payload, spec, **kwargs)  # noqa: E731
             service = RawRecoveryService(self.store, self.ingest, self.gaps)

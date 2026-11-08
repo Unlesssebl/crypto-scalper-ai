@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -71,6 +73,7 @@ class OrderBookEngine:
     """Maintains live orderbooks via Hyperliquid l2Book WebSocket."""
 
     def __init__(self, symbols: list[str] | None = None, depth: int = DEFAULT_DEPTH) -> None:
+        self.binance = None
         self.symbols = list(DEFAULT_SYMBOLS) if symbols is None else list(symbols)
         self.raw_callback = None
         self.depth = depth
@@ -98,12 +101,17 @@ class OrderBookEngine:
         if self._running:
             return
         self._running = True
+        if self.binance is not None:
+            self.binance.raw_callback = self.raw_callback
+            await self.binance.start()
         self._task = asyncio.create_task(self._run_forever(), name="orderbook-ws")
         self._snapshot_task = asyncio.create_task(self._snapshot_loop(), name="orderbook-snapshots")
         logger.info("OrderBookEngine started for %s", self.symbols)
 
     async def stop(self) -> None:
         self._running = False
+        if self.binance is not None:
+            await self.binance.stop()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
@@ -127,6 +135,9 @@ class OrderBookEngine:
         otherwise the pre-episode snapshot could be served until the next frame.
         """
         wanted = list(dict.fromkeys(symbols))
+        if self.binance is not None:
+            await self.binance.set_symbols([s for s in wanted if s.startswith("BINANCE:")], reset=reset)
+            wanted = [s for s in wanted if not s.startswith("BINANCE:")]
         old = set(self.symbols)
         self.symbols = wanted
         if not wanted:
@@ -148,6 +159,8 @@ class OrderBookEngine:
                 raise
 
     def get_snapshot(self, symbol: str) -> OrderBookSnapshot | None:
+        if symbol.startswith("BINANCE:") and self.binance is not None:
+            return self.binance.get_snapshot(symbol)
         snap = self.snapshots.get(symbol) or self.snapshots.get(symbol.upper())
         if snap is not None:
             # Recompute staleness at read time so the flag keeps tracking age
@@ -157,9 +170,10 @@ class OrderBookEngine:
 
     def data_age(self, now: float | None = None) -> float:
         """Seconds since the last l2Book message (inf if none received yet)."""
-        if self.last_message_at <= 0:
+        last = max(self.last_message_at, self.binance.last_message_at if self.binance is not None else 0)
+        if last <= 0:
             return float("inf")
-        return (now if now is not None else time.time()) - self.last_message_at
+        return (now if now is not None else time.time()) - last
 
     def is_stale(self, now: float | None = None) -> bool:
         return self.data_age(now) > STALE_AFTER_SECONDS
@@ -247,7 +261,7 @@ class OrderBookEngine:
                 backoff = min(backoff * 2, 60.0)
 
     async def _connect_and_listen(self) -> None:
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         epoch = uuid.uuid4().hex
         try:
             # heartbeat=20 makes aiohttp ping the server and raise on a missing

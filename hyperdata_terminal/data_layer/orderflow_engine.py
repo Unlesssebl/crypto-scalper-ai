@@ -19,6 +19,7 @@ from typing import Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+from hyperdata_terminal.network import exchange_session
 
 logger = logging.getLogger(__name__)
 
@@ -583,10 +584,14 @@ class OrderFlowEngine:
           stale         had trades, socket open, nothing for STALE_AFTER_SECONDS
           disconnected  socket not open (never connected, or between reconnects)
         """
-        if venue == "binance" and not self.include_binance:
+        if venue == "binance" and not self.include_binance and not (
+                self.pulse_external and any(s.startswith("BINANCE:") for s in self.symbols)):
             return "disabled", "Binance not configured for this observation mode"
         if venue == "hyperliquid" and self.selective and not self.symbols:
             return "disabled", "No instrument currently assigned detailed observation"
+        if venue == "hyperliquid" and self.pulse_external and not any(
+                not s.startswith("BINANCE:") for s in self.symbols):
+            return "disabled", "No Hyperliquid instrument currently assigned detailed observation"
         now = time.time() if now is None else now
         st = self.venues[venue]
         trade_age = self.venue_data_age(venue, now)
@@ -937,8 +942,11 @@ class OrderFlowEngine:
 
     def accept_execution(self, event):
         """Consume the durable canonical tape; never open an exchange socket."""
-        symbol = event["native_market_id"]
-        if (not self.pulse_external or event.get("venue") != "hyperliquid" or symbol not in self.symbols
+        from hyperdata_terminal.instruments import observation_key
+
+        venue = event.get("venue")
+        symbol = observation_key(venue, event["native_market_id"])
+        if (not self.pulse_external or venue not in {"hyperliquid", "binance"} or symbol not in self.symbols
                 or event.get("delivery_kind") != "live" or event.get("side") not in ("buy", "sell")):
             return False
         now = time.time()
@@ -958,11 +966,11 @@ class OrderFlowEngine:
         trade = Trade(symbol=symbol, price=float(event["price"]),
                       size=float(event["base_amount"]), size_usd=float(event["quote_amount"]), side=event["side"],
                       timestamp=event["event_time_ms"]/1000)
-        if not self.venues["hyperliquid"].connected:
-            self._venue_connected("hyperliquid")
-        self._venue_frame("hyperliquid")
-        self._venue_trade("hyperliquid")
-        self._process_trade(trade, venue="hyperliquid")
+        if not self.venues[venue].connected:
+            self._venue_connected(venue)
+        self._venue_frame(venue)
+        self._venue_trade(venue)
+        self._process_trade(trade, venue=venue)
         return True
 
     def _process_trade(self, trade: Trade, venue: str | None = None) -> None:
@@ -1063,7 +1071,7 @@ class OrderFlowEngine:
         plan = self._hl_shard_plan or self._hl_shards()
         wanted = plan[shard] if shard < len(plan) else []
         state = self._shard_state(shard)
-        session = aiohttp.ClientSession()
+        session = exchange_session()
         epoch = uuid.uuid4().hex
         self._hl_sessions[shard] = session
         ws = None
@@ -1209,7 +1217,7 @@ class OrderFlowEngine:
         while self._running:
             close_code = None
             try:
-                async with aiohttp.ClientSession() as session:
+                async with exchange_session() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
                         backoff = 1.0
                         self._venue_connected("binance")

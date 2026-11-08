@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     api.add_argument("--forever", action="store_true", default=True, help=argparse.SUPPRESS)
 
     collector = sub.add_parser("collector", help="run one exchange collector")
-    collector.add_argument("--venue", choices=("hyperliquid", "okx"), required=True)
+    collector.add_argument("--venue", choices=("hyperliquid", "okx", "binance"), required=True)
     collector.add_argument("--markets", default="", help="explicit standalone markets; ignored in adaptive mode")
     collector.add_argument(
         "--no-refresh-okx",
@@ -78,13 +78,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "api":
             asyncio.run(service.run_api_service())
         elif args.command == "collector":
+            from hyperdata_terminal.lifecycle import run_managed
+
             selected = tuple(item.strip().upper() for item in args.markets.split(",") if item.strip())
             asyncio.run(
-                service.run_collector(
+                run_managed(service.run_collector(
                     args.venue,
                     markets_override=selected,
                     refresh_okx=not args.no_refresh_okx,
-                )
+                ))
             )
         elif args.command == "recover":
             now = int(time.time() * 1_000)

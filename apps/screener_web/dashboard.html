@@ -33,7 +33,7 @@ td small{display:block;margin-top:4px;line-height:1.3}.metric-detail{max-height:
 <body><main>
 <header><div class="kicker">HYPERDATA TERMINAL / HYPERLIQUID PERPETUALS</div>
 <h1>Crypto Scalper AI</h1>
-<p>Наблюдение за активностью Hyperliquid. Детали выбранных инструментов и проверяемые факты о рынке.</p>
+<p>Адаптивное наблюдение за Binance USDT-M и Hyperliquid. Инструменты разных площадок учитываются отдельно.</p>
 <div id="pulse-context"></div>
 <p id="pulse-status" role="status">Market Pulse: подключение…</p>
 <p id="status" role="status">Подключение к HyperData…</p></header>
@@ -592,8 +592,12 @@ function renderAttention(attention) {
   for (const item of attention.active) {
     const card = node("div", null, root);
     card.className = "stat";
-    const state = {probe:"Проверка", focus:"Фокус", cooling:"Затухание", control:"Контроль"}[item.state] ?? item.state;
+    const state = attention.policy_version === 6
+      ? (item.quality?.confirmed ? "Активный инструмент" : item.interest?.potential ? "Кандидат для наблюдения" : "Изучаем активность")
+      : ({probe:"Проверка", focus:"Фокус", cooling:"Затухание", control:"Контроль"}[item.state] ?? item.state);
     node("h3", item.symbol + " · " + state, card);
+    if (attention.policy_version === 6 && item.interest?.candle_ratio != null)
+      node("p", "Активность закрытой минуты: " + item.interest.candle_ratio.toFixed(1) + "× собственной нормы.", card);
     if (item.context_until > Date.now() / 1000) node("p", "Сохраняем историю для контекста 5m · ещё " +
       Math.ceil((item.context_until - Date.now() / 1000) / 60) + " мин. Готовность зависит от поступления данных.", card);
     const facts = item.facts ?? {};
@@ -669,7 +673,7 @@ async function refresh() {
           "% · пороги не утверждены", $("pulse-context"));
       }
     }
-    $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Hyperliquid · " + result.market) +
+    $("status").textContent = (result.mode === "demo" ? "ДЕМО · синтетические данные" : "Binance USDT-M + Hyperliquid · " + result.market) +
       " · " + result.ai_provider + " " + result.gemini + " · " + new Date().toLocaleTimeString("ru-RU");
     try {
       const system = await request("/v1/system");

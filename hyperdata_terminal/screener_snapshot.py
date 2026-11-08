@@ -89,7 +89,8 @@ def _market_row(asset, observed_fields: set[str], age: float, quality: str) -> d
         "funding_rate": _finite(fields["funding_rate"]) if "funding_rate" in observed_fields else None,
         "observed_fields": sorted(observed_fields),
         "quality": quality if observed_fields else "unavailable",
-        "source": "hyperliquid_meta_and_asset_ctxs",
+        "source": ("binance_usdtm_snapshot" if asset.symbol.startswith("BINANCE:")
+                   else "hyperliquid_meta_and_asset_ctxs"),
     }
 
 
@@ -103,10 +104,13 @@ def _flow_row(hub, symbol: str, window: str, now: float) -> dict:
         connected_at = 0.0
         venue = "combined"
     else:
-        flow = engine.get_venue_snapshot(symbol, window, "hyperliquid", now)
-        trades = engine.venue_window_trades(symbol, window, "hyperliquid", now)
+        from hyperdata_terminal.instruments import identity
+
+        primary = identity(symbol)[0]
+        flow = engine.get_venue_snapshot(symbol, window, primary, now)
+        trades = engine.venue_window_trades(symbol, window, primary, now)
         connected_at = engine.hyperliquid_connected_at(symbol)
-        venue = "hyperliquid"
+        venue = primary
         if flow is None:
             flow = bucket.get_snapshot(now) if bucket else None
             trades = bucket.window_trades(now) if bucket else ()
@@ -128,7 +132,8 @@ def _flow_row(hub, symbol: str, window: str, now: float) -> dict:
         "last_trade_at": last_trade_at or None,
         "quality": quality,
         "venue": venue,
-        "source": "hyperliquid_trades" if venue == "hyperliquid" else "hyperdata_demo",
+        "source": "binance_aggTrade" if venue == "binance" else
+                  "hyperliquid_trades" if venue == "hyperliquid" else "hyperdata_demo",
     }
 
 
@@ -142,7 +147,7 @@ def _book_row(hub, symbol: str, now: float) -> dict:
         "best_ask": _finite(book.best_ask) if book and quality != "unavailable" else None,
         "timestamp": book.timestamp if book and quality != "unavailable" else None,
         "quality": quality,
-        "source": "hyperliquid_l2book",
+        "source": "binance_depth20" if symbol.startswith("BINANCE:") else "hyperliquid_l2book",
     }
 
 
@@ -154,10 +159,10 @@ def _candle_row(hub, symbol: str, window: str, now: float, indicators, cached: b
     return {
         "natr": _finite(indicators["natr"]) if indicators else None,
         "range_ratio": _finite(indicators["range_ratio"]) if indicators else None,
-        "tape_baseline": baseline,
+        "tape_baseline": None if symbol.startswith("BINANCE:") else baseline,
         "closed_at": closed_at,
         "quality": quality,
-        "source": "hyperliquid_candles",
+        "source": "binance_klines" if symbol.startswith("BINANCE:") else "hyperliquid_candles",
         "cached": cached,
     }
 
@@ -430,6 +435,9 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
             warnings.append(f"{requested_symbol}: not listed on Hyperliquid")
             continue
         symbol = asset.symbol
+        observed_at = getattr(asset, "observed_at", 0)
+        symbol_age = max(0, now - observed_at) if observed_at else age
+        symbol_quality = "stale" if symbol_age > 20 else market_quality
         observed = (MARKET_FIELDS if getattr(hub, "demo", False)
                     else getattr(hub.market, "observed_fields", {}).get(symbol, set()))
         for window in windows:
@@ -443,7 +451,7 @@ async def build_snapshot(hub, symbols: list[str] | None = None,
             rows.append({
                 "symbol": symbol,
                 "window": window,
-                "market": _market_row(asset, observed, age, market_quality),
+                "market": _market_row(asset, observed, symbol_age, symbol_quality),
                 "flow": flow_row,
                 "book": _book_row(hub, symbol, now),
                 "candles": _candle_row(hub, symbol, window, now, indicators, cached),

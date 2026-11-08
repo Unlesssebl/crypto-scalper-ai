@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 logger = logging.getLogger(__name__)
 
 BINANCE_PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -61,7 +63,7 @@ class FundingRateCollector:
         if self._running:
             return
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         self._task = asyncio.create_task(self._poll_loop(), name="funding-rate-poll")
         logger.info("FundingRateCollector started")
 

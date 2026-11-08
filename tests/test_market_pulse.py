@@ -1452,7 +1452,7 @@ async def test_heartbeat_deadline_enters_disconnect_path(tmp_path, monkeypatch):
     ws = SilentWS([_FakeMessage(aiohttp.WSMsgType.TEXT, json.dumps({
         "event": "subscribe", "arg": {"channel": "trades-all", "instId": "BTC-USDT-SWAP"},
     }))], stop)
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda: Session(ws))
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kwargs: Session(ws))
     archive = RawArchive(tmp_path, "okx")
     try:
         collector = OkxCollector(CollectorConfig(

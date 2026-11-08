@@ -1,5 +1,13 @@
 > Unified deployment: [Единая система: запуск, данные, AI и ограничения](docs/unified-system.md).
 
+> Проверка прикладной пользы: [результаты, исправленные препятствия и ограничения, 07.11.2026](docs/practical-utility-2026-11-07.md).
+
+> Настройки: [рабочий профиль, комментарии в .env и приоритет параметров](docs/configuration.md).
+
+> Охват: [Binance USDT-M + Hyperliquid, единый adaptive attention без списков фаворитов](docs/binance-adaptive.md).
+
+> Качество отбора: [attention v6 — поиск интересных и активных инструментов для наблюдения](docs/discovery-screener-v6.md).
+
 > **Единый запуск:** `.\start.ps1 --notify` · статус `--status` · перезапуск `--restart` · остановка `--stop` · [Инструкция](docs/unified-project.md)
 
 > **Crypto Scalper AI** · Быстрый старт: `.\start.ps1` · [Установка и режимы](docs/crypto-scalper.md) · [Переход на нативный API](docs/native-migration.md) · [Эксплуатация](docs/operations.md)

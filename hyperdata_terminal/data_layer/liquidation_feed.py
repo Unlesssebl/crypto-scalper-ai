@@ -13,6 +13,7 @@ from typing import Any, Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+from hyperdata_terminal.network import exchange_session
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ class ExchangeConnection:
 
     async def start(self) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         self._task = asyncio.create_task(self._run_loop(), name=f"ws-{self.name}")
 
     async def stop(self) -> None:
@@ -440,7 +441,7 @@ class HyperliquidConnection:
 
     async def start(self) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         # Run both: WS for trade monitoring + REST poll for price context
         self._ws_task = asyncio.create_task(self._ws_loop(), name="ws-hyperliquid")
         self._task = asyncio.create_task(self._price_poll(), name="poll-hl-prices")

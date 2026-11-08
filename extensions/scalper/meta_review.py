@@ -18,6 +18,11 @@ async def run_meta(service):
         return None
     changed, packets = {}, []
     for packet in service.context_packets.values():
+        coverage = packet.get("coverage", {})
+        if coverage.get("attention_policy_version") == 5 and (
+            coverage.get("attention_state") != "focus" or not coverage.get("live_quality_confirmed")
+        ):
+            continue
         if not packet_ready(packet, now):
             continue
         memory = service.context_memory.observe(packet)
@@ -97,7 +102,8 @@ async def run_meta(service):
             for k, v in changed.items()
         }
     )
-    job, reason = routes.reserve(packet, "meta", state, now, service.policy.hourly_limit)
+    job, reason = routes.reserve(packet, "meta", state, now, service.policy.hourly_limit,
+                                cooldown_seconds=service.policy.cooldown_seconds)
     if reason:
         return None
     for source_packet in packets:

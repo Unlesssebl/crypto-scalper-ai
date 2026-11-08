@@ -16,7 +16,7 @@ VERSION = "market-pulse.overview.v1"
 def validate_candle(row, now_ms):
     if not isinstance(row, dict) or row.get("schema_version") != VERSION:
         raise ValueError("invalid candle schema")
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", str(row.get("symbol", ""))):
+    if not re.fullmatch(r"[\w.:-]{1,64}", str(row.get("symbol", ""))):
         raise ValueError("invalid candle instrument")
     for field in ("start_ms", "received_at_ms", "epoch_started_ms", "trade_count"):
         if type(row.get(field)) is not int or row[field] < 0:
@@ -50,7 +50,8 @@ def activity(rows, now_ms):
     for symbol, bars in sorted(grouped.items()):
         target = bars.get(target_start)
         item = {"symbol": symbol, "start_ms": target_start, "status": "missing",
-                "source": "hyperliquid_candle_1m", "reference_minutes": 14}
+                "source": "binance_candle_1m" if symbol.startswith("BINANCE:") else "hyperliquid_candle_1m",
+                "reference_minutes": 14}
         if target:
             item.update(status="warming_up", trade_count=target["trade_count"],
                         base_volume=target["base_volume"])

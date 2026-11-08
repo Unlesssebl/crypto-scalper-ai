@@ -161,6 +161,10 @@ async def update_policy(request: web.Request) -> web.Response:
     except (ValueError, TypeError) as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     service = request.app["service"]
+    if service.ai_routes:
+        from dataclasses import replace
+
+        policy = replace(policy, hourly_limit=min(40, policy.hourly_limit), experiments=False)
     service.journal.save_policy(asdict(policy))
     service.policy = policy
     return web.json_response(asdict(policy))

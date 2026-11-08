@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 logger = logging.getLogger(__name__)
 
 DERIBIT_WS_URL = "wss://www.deribit.com/ws/api/v2"
@@ -153,7 +155,7 @@ class DeribitFeed:
                 backoff = min(backoff * 2, RECONNECT_MAX_BACKOFF)
 
     async def _connect_and_listen(self) -> None:
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         try:
             self._ws = await self._session.ws_connect(DERIBIT_WS_URL)
             logger.info("[deribit] connected")

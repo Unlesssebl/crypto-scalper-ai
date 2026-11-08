@@ -36,6 +36,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 logger = logging.getLogger(__name__)
 
 
@@ -197,7 +199,7 @@ class HLPTracker:
     async def start(self) -> None:
         self._running = True
         self._started_at = time.time()
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         self._tasks = [
             asyncio.create_task(self._snapshot_loop(), name="hlp-snapshot"),
             asyncio.create_task(self._fills_loop(), name="hlp-fills"),

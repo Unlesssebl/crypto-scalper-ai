@@ -40,6 +40,7 @@ services:
     volumes:
       - pulse-raw-hl:/raw/hyperliquid
       - pulse-raw-okx:/raw/okx
+      - ../../.runtime/pulse-raw/binance:/raw/binance
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,6 +80,7 @@ services:
         "",
       ]
     environment:
+      HYPERDATA_EXCHANGE_PROXY: ${HYPERDATA_EXCHANGE_PROXY:-}
       PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}
@@ -101,6 +103,7 @@ services:
         "",
       ]
     environment:
+      HYPERDATA_EXCHANGE_PROXY: ${HYPERDATA_EXCHANGE_PROXY:-}
       PULSE_DYNAMIC_ATTENTION: "1"
       PULSE_INGEST_URL: http://ingest:8430
       PULSE_INGEST_TOKEN: ${PULSE_INGEST_TOKEN:?set PULSE_INGEST_TOKEN in .env}

@@ -600,7 +600,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9.0,<4.0" },
+    { name = "aiohttp", specifier = ">=3.12,<4.0" },
     { name = "asyncpg", marker = "extra == 'pulse'", specifier = ">=0.29,<1" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.2,<3" },
     { name = "numpy", specifier = ">=1.26.0,<3.0" },

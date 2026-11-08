@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
 from hyperdata_terminal.utils.helpers import source_cooldown_seconds
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class LongShortCollector:
         if self._running:
             return
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         self._task = asyncio.create_task(self._poll_loop(), name="lsr-poll")
         logger.info("LongShortCollector started for %s", self.symbols)
 

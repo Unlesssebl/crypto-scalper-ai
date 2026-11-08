@@ -26,7 +26,7 @@ class AttentionPolicy:
     context_seconds: float = 600
 
     def __post_init__(self):
-        if type(self.version) is not int or self.version not in (1, 2, 3, 4):
+        if type(self.version) is not int or self.version not in (1, 2, 3, 4, 5, 6):
             raise ValueError("unsupported attention policy version")
         if any(
             isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
@@ -85,7 +85,65 @@ class Attention:
             )
             if "context_until" in prior:
                 self.active[symbol]["context_until"] = prior["context_until"]
+            if self.policy.version >= 5:
+                for key in ("detail_samples", "detail_epoch", "confirmed_at", "quality",
+                            "interest_samples", "interest"):
+                    if key in prior:
+                        self.active[symbol][key] = prior[key]
         return row
+
+    def _detail_quality(self, current, observation, now):
+        """Episode-matched live flow confirms observation, never an entry."""
+        detail = observation.get("detail", {})
+        def number(key):
+            value = detail.get(key)
+            return value if type(value) in (int, float) and math.isfinite(value) else None
+        book_at, trade_at = number("received_at"), number("last_trade_received_at")
+        midpoint, spread = number("midpoint"), number("spread_bps")
+        fresh = (detail.get("healthy") is True and detail.get("assigned_at") == current["assigned_at"]
+                 and book_at is not None and 0 <= now - book_at <= 5
+                 and trade_at is not None and 0 <= now - trade_at <= 10
+                 and min(book_at, trade_at) >= current["assigned_at"]
+                 and midpoint is not None and midpoint > 0 and spread is not None and spread > 0
+                 and not detail.get("trade_window_truncated", True))
+        samples = current.setdefault("detail_samples", [])
+        epoch = detail.get("epoch")
+        if (not fresh or current.get("detail_epoch") != epoch
+                or samples and now - samples[-1][0] > 15):
+            samples.clear()
+        current["detail_epoch"] = epoch
+        if fresh:
+            samples[:] = [s for s in samples if 0 <= now - s[0] <= 60]
+            samples.append([now, midpoint, trade_at, spread])
+        buckets = {int((s[2] - current["assigned_at"]) // 10) for s in samples}
+        duration = samples[-1][2] - samples[0][2] if samples else 0
+        reaction = (max(s[1] for s in samples) / min(s[1] for s in samples) - 1) * 10000 if samples else 0
+        cost = max((s[3] for s in samples), default=0)
+        continuous = fresh and len(buckets) >= 3 and duration >= 20
+        confirmed = continuous and (self.policy.version >= 6 or reaction >= 2 * cost)
+        current["quality"] = dict(confirmed=confirmed, fresh=fresh, trade_buckets=len(buckets),
+                                  trade_span_seconds=duration, reaction_bps=reaction, spread_bps=cost,
+                                  limitation="Observation quality only; fees and slippage are not included.")
+        if self.policy.version >= 6:
+            current["quality"]["price_reaction_confirmed"] = reaction >= 2 * cost if cost > 0 else False
+        if confirmed:
+            current["confirmed_at"] = now
+        return confirmed
+
+    def _interest(self, current, now):
+        scout = self.scouts.get(current["symbol"], {})
+        samples = [s for s in current.get("interest_samples", []) if 0 <= now - s <= 30]
+        if scout.get("trigger") and scout.get("at") == now and (not samples or samples[-1] != now):
+            samples.append(now)
+        current["interest_samples"] = samples
+        candle = scout.get("candle_ratio")
+        unusual_candle = candle is not None and candle >= self.policy.probe_ratio
+        repeated = len(samples) >= 2 and samples[-1] - samples[0] >= 10 and now - samples[-1] <= 15
+        current["interest"] = dict(
+            at=now, potential=unusual_candle or repeated,
+            reason="closed_candle_activity" if unusual_candle else "relative_price_activity",
+            score=scout.get("score", 0), candle_ratio=candle, movement_ratio=scout.get("movement_ratio"),
+        )
 
     def _reserve_context(self, now):
         if self.policy.version < 3:
@@ -164,10 +222,21 @@ class Attention:
                 or move_ratio is not None
                 and move_ratio >= p.severe_move_ratio
             )
-            if p.version == 4:
+            if p.version >= 5:
+                # RMS includes rare nonzero moves: a nearly-zero median cannot
+                # give microscopic mark updates an unbounded ranking advantage.
+                reference = (math.hypot(*movements) / math.sqrt(len(movements))
+                             if len(movements) >= p.baseline_samples else None)
+                move_ratio = relative(move_rate, reference)
+                raw_score = move_ratio or 0
+                score = 12 * (raw_score / (raw_score + 6))
+                trigger = raw_score >= p.probe_ratio
+                severe = raw_score >= p.focus_ratio
+            if p.version >= 4:
                 external = observation.get("candle_ratio")
                 if isinstance(external, (int, float)) and math.isfinite(external) and external >= 0:
-                    score = max(score, min(external, 1000))
+                    bounded = 12 * (external / (external + 6)) if p.version >= 5 else min(external, 1000)
+                    score = max(score, bounded)
                     trigger = trigger or external >= p.probe_ratio
                     severe = severe or external >= p.focus_ratio
             ready = warm or len(movements) >= p.baseline_samples
@@ -183,8 +252,11 @@ class Attention:
                 activity_usd_lower_bound=interval_usd,
                 move_bps=move,
                 movement_ratio=move_ratio,
-                source="relative_price_and_candle.v4" if p.version == 4 else "rolling_24h_volume_change_proxy",
+                source=(f"relative_price_and_candle.v{p.version}"
+                        if p.version >= 4 else "rolling_24h_volume_change_proxy"),
                 baseline_samples=len(baseline),
+                **({"retry_after": self.scouts.get(symbol, {}).get("retry_after", 0)} if p.version >= 5 else {}),
+                **({"candle_ratio": observation.get("candle_ratio")} if p.version >= 6 else {}),
             )
             # Compare to the old baseline before adding the current observation.
             if rate is not None:
@@ -198,6 +270,19 @@ class Attention:
                 continue
             score, age = scout.get("score", 0), now - current["since"]
             current["score"] = score
+            if p.version >= 5:
+                confirmed = self._detail_quality(current, observations.get(symbol, {}), now)
+                if current["state"] == "probe":
+                    if age >= p.min_probe_seconds and confirmed:
+                        reason = "live_flow_confirmed" if p.version >= 6 else "live_flow_and_price_confirmed"
+                        changes.append(self._transition(symbol, "focus", reason, now, score))
+                    elif age >= p.probe_seconds:
+                        scout["retry_after"] = now + p.cooling_seconds
+                        changes.append(self._transition(symbol, "scout", "live_probe_not_confirmed", now, score))
+                elif current["state"] == "focus" and now - current.get("confirmed_at", 0) > 30:
+                    scout["retry_after"] = now + p.cooling_seconds
+                    changes.append(self._transition(symbol, "scout", "live_quality_lost", now, score))
+                continue
             if current.get("context_until", 0) > now:
                 continue
             if current["state"] == "probe":
@@ -214,7 +299,8 @@ class Attention:
                     changes.append(self._transition(symbol, "scout", "observation_finished", now, score))
         self._reserve_context(now)
         candidates = sorted(
-            (s for s in self.scouts.values() if s["trigger"] and s["at"] == now and s["symbol"] not in self.active),
+            (s for s in self.scouts.values() if s["trigger"] and s["at"] == now and s["symbol"] not in self.active
+             and (p.version < 5 or s.get("retry_after", 0) <= now)),
             key=lambda s: (-s["score"], s["symbol"]),
         )
         denied_now = set()
@@ -222,6 +308,8 @@ class Attention:
             if len(self.active) >= p.slots:
 
                 def replaceable(a):
+                    if p.version >= 5 and (a["state"] == "probe" or now - a["assigned_at"] < p.context_seconds):
+                        return False
                     if a.get("context_until", 0) > now:
                         return False
                     if a["state"] == "probe":
@@ -257,7 +345,7 @@ class Attention:
                             )
                         )
                     continue
-            state = "focus" if s["severe"] else "probe"
+            state = "focus" if s["severe"] and p.version < 5 else "probe"
             reason = (
                 "relative_price_activity"
                 if (s["movement_ratio"] or 0) >= p.probe_ratio
@@ -267,6 +355,9 @@ class Attention:
             self.activations += 1
         self._reserve_context(now)
         self.denied_now = denied_now
+        if p.version >= 6:
+            for current in self.active.values():
+                self._interest(current, now)
         # A bounded universe history: delisted/disappeared instruments cannot grow RAM forever.
         for symbol, prior in list(self.previous.items()):
             if now - prior[0] > 3600 and symbol not in self.active:

@@ -8,6 +8,10 @@ from .analytics_context import analytical_state
 from .fact_packet import canonical, checksum, packet_ready
 
 REASONS = {
+    "interesting_instrument": "инструмент выделяется относительно собственной обычной активности",
+    "active_instrument": "наблюдается устойчивый свежий поток сделок",
+    "interesting_level": "устойчивая необычная зона в наблюдаемом стакане",
+    "discovery_unconfirmed": "пока нет устойчивого повода выделить инструмент",
     "formation_confirmed": "движение подтвердилось последовательными наблюдениями с учётом волатильности",
     "early_context": "сильный поток подтверждён реакцией цены и контекстом",
     "flow_price_conflict": "устойчивое расхождение потока и реакции цены",
@@ -16,6 +20,7 @@ REASONS = {
     "flow_reversed": "изменился подтверждённый поток эпизода",
     "cross_window_changed": "изменилось соотношение потоков 1m и 5m",
     "insufficient_context": "недостаточно пригодного контекста",
+    "live_quality_unconfirmed": "реальный поток и реакция цены ещё не подтверждены",
     "ordinary_context": "нет значимого повода для интерпретации",
     "no_material_change": "нет содержательного изменения после отправленного разбора",
     "unstable_context": "изменение ещё не подтверждено последовательными наблюдениями",
@@ -111,6 +116,7 @@ def fingerprint(state):
             flow=sign(state.get("flow")),
             relation=state.get("relation"),
             cross=state.get("cross"),
+            **({"discovery_kind": state["discovery_kind"]} if "discovery_kind" in state else {}),
             **context,
             zone=zone["id"] if zone and zone["observed_age_seconds"] >= 30 else None,
         )
@@ -125,6 +131,11 @@ def decide(packet, history, baseline=None, *, economical=False):
         if sign(state["flow"]) and sign(state["flow5"])
         else "unknown"
     )
+    coverage = packet.get("coverage", {})
+    if coverage.get("attention_policy_version") == 5 and (
+        coverage.get("attention_state") != "focus" or not coverage.get("live_quality_confirmed")
+    ):
+        return None, "live_quality_unconfirmed", state
     if not packet_ready(packet, packet["captured_at"]) or state["at"] is None:
         return None, "insufficient_context", state
     history = [s for s in history if s.get("at") is not None and 10 <= state["at"] - s["at"] <= 30]
@@ -141,6 +152,27 @@ def decide(packet, history, baseline=None, *, economical=False):
         and zone["observed_age_seconds"] >= 30
         and any(s.get("zone", {}).get("id") == zone["id"] for s in history if s.get("zone"))
     )
+    if coverage.get("attention_policy_version") == 6:
+        discovery = coverage.get("discovery", {})
+        live = coverage.get("live_quality_confirmed") is True
+        potential = discovery.get("potential") is True
+        kind = "active" if live else "potential" if potential else "level" if stable_zone else "ordinary"
+        state["discovery_kind"] = kind
+        state["discovery_score"] = discovery.get("score", 0)
+        state["price_reaction_confirmed"] = coverage.get("price_reaction_confirmed", False)
+        state["discovery_reason"] = discovery.get("reason")
+        if kind == "ordinary":
+            return None, "discovery_unconfirmed", state
+        priority, reason = {"active": (60, "active_instrument"), "potential": (40, "interesting_instrument"),
+                            "level": (35, "interesting_level")}[kind]
+        if baseline:
+            upgraded = kind == "active" and baseline.get("discovery_kind") != "active"
+            stronger = (state["discovery_score"] >= max(6, (baseline.get("discovery_score") or 0) * 1.75)
+                        and state["discovery_score"] > (baseline.get("discovery_score") or 0))
+            new_zone = bool(stable_zone and (not baseline.get("zone") or zone["id"] != baseline["zone"]["id"]))
+            if not (upgraded or stronger or new_zone):
+                return None, "no_material_change", state
+        return priority, reason, state
     phase = state.get("phase")
     stable_phase = stable_flow and phase == "confirmed" and any(s.get("phase") == phase for s in history)
     if stable_phase and (not baseline or baseline.get("phase") != phase):

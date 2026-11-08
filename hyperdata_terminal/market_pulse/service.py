@@ -16,6 +16,7 @@ from .acceptance import build_acceptance_report, render_markdown, required_chann
 from .api import run_api
 from .collectors.attention import follow_attention
 from .collectors.base import CollectorConfig, StreamCollector
+from .collectors.binance import BinanceCollector
 from .collectors.hyperliquid import HyperliquidCollector, normalize_hyperliquid_trades
 from .collectors.okx import OkxCollector, OkxInstrumentCatalog, normalize_okx_trades
 from .collectors.specs import default_instruments, spec_index
@@ -239,6 +240,8 @@ async def run_collector(
         collector = HyperliquidCollector(config, archive, client, client, specs=specs)
     elif venue == "okx":
         collector = OkxCollector(config, archive, client, client, specs=specs)
+    elif venue == "binance":
+        collector = BinanceCollector(config, archive, client, client)
     else:
         raise ValueError(f"unsupported venue {venue!r}")
     try:

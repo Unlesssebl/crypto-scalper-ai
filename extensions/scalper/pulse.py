@@ -180,24 +180,29 @@ class PulseContext:
         # Same UTC minute on both venues; do not backfill from older usable data.
         start = (int(now * 1000) - 5_000) // 60_000 * 60_000 - 60_000
         result["window_start_ms"], result["window_end_ms"] = start, start + 60_000
-        for venue, market, channel in (("hyperliquid", symbol, "trades"),
-                                       ("okx", symbol + "-USDT-SWAP", "trades-all")):
+        from hyperdata_terminal.instruments import identity, is_binance
+
+        sources = (("binance", identity(symbol)[1], "aggTrade"),) if is_binance(symbol) else (
+            ("hyperliquid", symbol, "trades"), ("okx", symbol + "-USDT-SWAP", "trades-all"))
+        for venue, market, channel in sources:
+            kind = "aggregated" if venue == "binance" else "execution"
             source = next((c for c in self.channels if (c["venue"], c["native_market_id"], c["channel"])
                            == (venue, market, channel)), None)
             window = next((w for w in self.windows if (w["venue"], w["native_market_id"], w["channel"],
                           w["aggregation_kind"], w["window_start_ms"])
-                          == (venue, market, channel, "execution", start)), None)
+                          == (venue, market, channel, kind, start)), None)
             quality = "missing"
             if source and not source.get("stale", True) and window:
                 quality = window["quality"] if not window["provisional"] else "warming_up"
             elif source and source.get("stale", True):
                 quality = "stale"
             item = {"venue": venue, "market": market, "channel": channel, "quality": quality,
+                    "aggregation_kind": kind,
                     "currency": "USDC" if venue == "hyperliquid" else "USDT",
                     "version": None if window is None else window["version"],
                     "baseline_version": None if window is None else window.get("baseline_version"),
                     "flow": "unavailable", "ofi": None}
-            assessment = self.assessments.get((venue, market, channel, "execution"))
+            assessment = self.assessments.get((venue, market, channel, kind))
             if (assessment and window and assessment["window_start_ms"] == start
                     and assessment["target_hash"] == digest(window) and quality in USABLE):
                 item["shadow"] = assessment
@@ -212,7 +217,9 @@ class PulseContext:
                     if not buy.is_finite() or not sell.is_finite() or buy < 0 or sell < 0:
                         raise ValueError("invalid volume")
                     ofi = (buy - sell) / (buy + sell) if buy + sell else Decimal(0)
-                    item.update(execution_count=window["execution_count"], quote_volume=str(buy + sell),
+                    item.update(execution_count=window["execution_count"] if kind == "execution" else None,
+                                aggregate_count=window["event_count"] if kind == "aggregated" else None,
+                                quote_volume=str(buy + sell),
                                 ofi=float(ofi), flow="buy" if ofi > Decimal("0.15") else
                                 "sell" if ofi < Decimal("-0.15") else "neutral")
                 except (InvalidOperation, ValueError, TypeError):
@@ -224,6 +231,9 @@ class PulseContext:
             flows = {item["flow"] for item in usable}
             result["flow"] = ("aligned_buy" if flows == {"buy"} else "aligned_sell" if flows == {"sell"}
                               else "opposed" if flows == {"buy", "sell"} else "neutral_or_mixed")
+        elif is_binance(symbol) and usable:
+            result["status"] = "ready"
+            result["flow"] = "single_venue_" + usable[0]["flow"]
         result["evidence_id"] = hashlib.sha256(json.dumps(
             [VERSION, symbol, start, [(v["venue"], v["version"], v["quality"]) for v in result["venues"]]],
             sort_keys=True,

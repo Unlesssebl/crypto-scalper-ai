@@ -68,7 +68,7 @@ class AIRoutes:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def reserve(self, packet, route, state, now, limit=40):
+    def reserve(self, packet, route, state, now, limit=40, *, cooldown_seconds=300):
         from .context_auto import fingerprint
 
         limit = min(40, limit)
@@ -93,7 +93,7 @@ class AIRoutes:
                 return None, "provider_cooldown"
             if self.db.execute(
                 "SELECT 1 FROM ai_route_requests WHERE episode_id=? AND route=? AND at>?",
-                (packet["episode_id"], route, now - 300),
+                (packet["episode_id"], route, now - cooldown_seconds),
             ).fetchone():
                 return None, "cooldown"
             if route == "free":
@@ -129,7 +129,7 @@ class AIRoutes:
                     "INSERT OR REPLACE INTO ai_route_blocks VALUES(?,?)", (row[0], time.time() + max(1, delay))
                 )
 
-    def summary(self, now=None):
+    def summary(self, now=None, *, limit=40, cooldown_seconds=300):
         now = time.time() if now is None else now
         return dict(
             free_enabled=os.getenv("SCALPER_FREE_ENABLED", "true").lower() == "true",
@@ -139,7 +139,8 @@ class AIRoutes:
             paid_model=getattr(self.paid, "model", None),
             free_hour_limit=12,
             free_day_limit=40,
-            paid_hour_limit=40,
+            paid_hour_limit=min(40, limit),
+            cooldown_seconds=cooldown_seconds,
             requests=[
                 dict(r)
                 for r in self.db.execute(

@@ -36,9 +36,11 @@ class Observation:
         self._record(
             "source",
             dict(
-                venue="hyperliquid",
+                venue="per_instrument",
+                venues=["hyperliquid", "binance"],
                 market="perpetual",
-                book="l2Book snapshots",
+                book="venue-specific top-n snapshots",
+                book_sources=dict(hyperliquid="l2Book", binance="depth20"),
                 nSigFigs=5,
                 scope="top-n",
                 trade_sampling=False,
@@ -58,6 +60,8 @@ class Observation:
             return
         if text is None:
             symbols = source.split(":", 1)[1].split(",") if ":" in source else list(getattr(self, "applied", {}))
+            if source in {"book", "binance_book"}:
+                symbols = [s for s in symbols if s.startswith("BINANCE:") == (source == "binance_book")]
             self._record(
                 "transport",
                 dict(source=source, symbols=symbols, status="disconnected"),
@@ -89,6 +93,9 @@ def configure(hub):
     from .pulse_runtime import PulseObservation
 
     observation = PulseObservation(hub)
+    from hyperdata_terminal.data_layer.binance_book import BinanceOrderBookEngine
+
+    hub.orderbook.binance = BinanceOrderBookEngine()
     hub.orderbook.symbols = []
     hub.orderbook.books.clear()
     hub.orderbook.snapshots.clear()

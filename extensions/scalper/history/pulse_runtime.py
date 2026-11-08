@@ -170,7 +170,7 @@ class PulseObservation(Observation):
         if not refreshed or self.plan_status not in ("valid", "cached_valid"):
             return
         wanted = self.assignments(now)
-        body = await self.get("/events", cursor=self.cursor or 0, venue="hyperliquid", limit=5000)
+        body = await self.get("/events", cursor=self.cursor or 0, limit=5000)
         head = body["head_cursor"]
         if self.cursor is not None and head < self.cursor:
             self._record("transport", dict(symbols=list(wanted), status="cursor_regressed"), now)
@@ -184,7 +184,12 @@ class PulseObservation(Observation):
             for row in rows:
                 if row["event_seq"] <= self.cursor:
                     continue
-                if row["native_market_id"] in wanted and row.get("delivery_kind") == "live":
+                from hyperdata_terminal.instruments import observation_key
+
+                symbol = observation_key(row.get("venue", "hyperliquid"), row["native_market_id"])
+                if (symbol in wanted and row.get("venue", "hyperliquid") in {"hyperliquid", "binance"}
+                        and row.get("delivery_kind") == "live"
+                        and row["event_time_ms"] >= wanted[symbol]["assigned_at"] * 1000):
                     event = self._record("execution", row, now, epoch=row["source_epoch"])
                     if event is not None:
                         self.hub.orderflow.accept_execution(row)
@@ -233,7 +238,7 @@ class PulseObservation(Observation):
             enabled=True,
             context_only=True,
             runtime_mode=UNIFIED,
-            policy_version=4,
+            policy_version=(self.plan or {}).get("policy_version", 4),
             plan=self.plan,
             plan_status=self.plan_status,
             plan_error=self.plan_error,

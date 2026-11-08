@@ -14,6 +14,8 @@ from typing import Any
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 from ..contracts import (
     ExecutionEvent,
     InstrumentSpec,
@@ -145,7 +147,7 @@ class OkxInstrumentCatalog:
         )
 
     async def fetch_many(self, markets: tuple[str, ...]) -> list[InstrumentSpec]:
-        async with aiohttp.ClientSession() as session:
+        async with exchange_session() as session:
             return [await self.fetch(session, market) for market in markets]
 
 

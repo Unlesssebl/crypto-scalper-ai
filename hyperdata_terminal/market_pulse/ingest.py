@@ -183,10 +183,13 @@ class GapControlService:
 
     async def release_outside_attention(self, venue, symbols, now_ms):
         """Reconcile durable channels forgotten by a restarted collector, preserving gaps."""
+        from hyperdata_terminal.instruments import is_binance
+
         from .collectors.specs import market_for_venue
 
-        wanted = {market_for_venue(venue, symbol) for symbol in symbols}
-        channel = "trades" if venue == "hyperliquid" else "trades-all"
+        wanted = {market_for_venue(venue, symbol) for symbol in symbols
+                  if is_binance(symbol) == (venue == "binance")}
+        channel = "aggTrade" if venue == "binance" else "trades" if venue == "hyperliquid" else "trades-all"
         for row in await self.store.list_coverage():
             if (row.venue == venue and row.channel == channel and row.native_market_id not in wanted
                     and row.state != QualityState.OUTSIDE_ATTENTION.value):

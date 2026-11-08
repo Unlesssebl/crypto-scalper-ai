@@ -16,7 +16,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / ".runtime"
@@ -29,7 +29,9 @@ def fetch(url, token=None, timeout=3):
         url, data=b"" if token else None, headers={"Authorization": "Bearer " + token} if token else {}
     )
     try:
-        response = urllib.request.urlopen(request, timeout=timeout)
+        # These probes and stop credentials belong to local services. System
+        # proxy settings must never route them through an external proxy.
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
         response = exc
     with response:
@@ -100,6 +102,33 @@ def stop_application(process):
         stop_tree(process)
 
 
+def start_binance():
+    """Use the native app's network, with raw files shared with Pulse ingest."""
+    (RUNTIME / "pulse-raw" / "binance").mkdir(parents=True, exist_ok=True)
+    marker = RUNTIME / "binance.stop"
+    marker.unlink(missing_ok=True)
+    token = dotenv_values(ROOT / "deploy/market-pulse/.env").get("PULSE_INGEST_TOKEN")
+    if not token:
+        raise RuntimeError("Binance collector requires the configured Pulse ingest token")
+    env = {**os.environ, "PULSE_DYNAMIC_ATTENTION": "1", "PULSE_MARKETS": "",
+           "PULSE_INGEST_URL": "http://127.0.0.1:8430", "PULSE_INGEST_TOKEN": token,
+           "PULSE_RAW_DIR": str(RUNTIME / "pulse-raw"), "HYPERDATA_STOP_FILE": str(marker)}
+    with (RUNTIME / "binance.log").open("ab") as log:
+        return subprocess.Popen([sys.executable, "-m", "hyperdata_terminal.market_pulse", "collector",
+                                 "--venue", "binance"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+
+
+def stop_binance(process):
+    if process is None or process.poll() is not None:
+        return
+    (RUNTIME / "binance.stop").touch()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        stop_tree(process)
+
+
 def request_stop():
     if not STATE.exists():
         return
@@ -161,6 +190,8 @@ def worker(args, forwarded):
     state = {"root": str(ROOT), "phase": "starting", "pid": os.getpid()}
     child = None
     backup_process = None
+    binance_process = None
+    binance_restarts = []
     pulse_started = False
 
     class Handler(BaseHTTPRequestHandler):
@@ -244,7 +275,9 @@ def worker(args, forwarded):
                     + "\nPULSE_MARKETS=\n"
                 )
             pulse_started = True
+            (RUNTIME / "pulse-raw" / "binance").mkdir(parents=True, exist_ok=True)
             compose("up", "-d", *([] if args.no_build else ["--build"]))
+            binance_process = start_binance()
         env = os.environ.copy()
         env["PULSE_MARKETS"] = ""
         env["PULSE_API_URL"] = "" if args.demo else "http://127.0.0.1:8431"
@@ -263,6 +296,12 @@ def worker(args, forwarded):
         last_backup_attempt = 0
         deadline = time.monotonic() + 45
         while not shutdown.wait(1):
+            if binance_process is not None and binance_process.poll() is not None:
+                binance_restarts = [at for at in binance_restarts if time.monotonic() - at < 600]
+                if len(binance_restarts) >= 5:
+                    raise RuntimeError("Binance collector restart limit reached; inspect .runtime/binance.log")
+                binance_restarts.append(time.monotonic())
+                binance_process = start_binance()
             if not args.demo and time.time() - last_backup_attempt >= 3600:
                 last_backup_attempt = time.time()
                 snapshots = [
@@ -296,6 +335,7 @@ def worker(args, forwarded):
     finally:
         state["phase"] = "stopping"
         stop_tree(backup_process)
+        stop_binance(binance_process)
         stop_application(child)
         try:
             if pulse_started:

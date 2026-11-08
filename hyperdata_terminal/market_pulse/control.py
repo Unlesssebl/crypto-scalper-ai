@@ -16,7 +16,7 @@ def validate_plan(payload, now_ms):
         if (
             not isinstance(items, list)
             or len(items) > maximum
-            or any(not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", s) for s in items)
+            or any(not isinstance(s, str) or not re.fullmatch(r"[\w.:-]{1,64}", s) for s in items)
             or len(set(items)) != len(items)
         ):
             raise ValueError("invalid attention " + field)
@@ -33,7 +33,7 @@ def validate_plan(payload, now_ms):
         or end <= start
     ):
         raise ValueError("invalid or expired attention lease")
-    if payload.get("policy_version") == 4:
+    if payload.get("policy_version") in (4, 5, 6):
         active = payload.get("active")
         if (
             not isinstance(active, list)

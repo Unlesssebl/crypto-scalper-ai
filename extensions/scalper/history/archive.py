@@ -89,6 +89,10 @@ class Archive:
             return None
         try:
             line = json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+            # The background SQLite writer must see the same frozen state as
+            # the raw segment, even if live attention mutates the original dict.
+            if kind != "raw":
+                envelope = json.loads(line)
             self.queue.put_nowait((line, envelope if kind != "raw" else None))
         except (queue.Full, ValueError, TypeError) as exc:
             self.dropped += 1

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
 from hyperdata_terminal.utils.helpers import source_cooldown_seconds
 
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ class SpotPriceCollector:
     async def _poll_loop(self) -> None:
         while self._running:
             try:
-                async with aiohttp.ClientSession() as session:
+                async with exchange_session() as session:
                     await self._fetch(session)
             except asyncio.CancelledError:
                 return

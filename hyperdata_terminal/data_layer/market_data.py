@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from hyperdata_terminal.config.settings import HYPERLIQUID_INFO_URL, MAX_REQUESTS_PER_SECOND
+from hyperdata_terminal.network import exchange_session
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class AssetInfo:
     mark_price: float
     index_price: float
     premium_pct: float = 0.0  # (mark - index) / index * 100
+    observed_at: float = 0.0
 
 
 class MarketData:
@@ -59,6 +61,21 @@ class MarketData:
     # ── Public API ────────────────────────────────────────────────
 
     async def refresh(self) -> None:
+        from hyperdata_terminal.runtime_mode import unified_enabled
+
+        if not unified_enabled():
+            return await self._refresh_hyperliquid()
+        from .binance_market import refresh
+
+        results = await asyncio.gather(self._refresh_hyperliquid(), refresh(self), return_exceptions=True)
+        for venue, result in zip(("hyperliquid", "binance"), results):
+            if isinstance(result, Exception):
+                logger.warning("%s market overview unavailable: %s", venue, result)
+        if all(isinstance(r, Exception) for r in results):
+            raise RuntimeError("all market overview sources unavailable")
+        self.last_update = time.monotonic()
+
+    async def _refresh_hyperliquid(self) -> None:
         """Fetch all market data from Hyperliquid and update the cache."""
         async with self._managed_session() as session:
             data = await self._post(session, {"type": "metaAndAssetCtxs"})
@@ -106,6 +123,7 @@ class MarketData:
                     mark_price=mark_px,
                     index_price=oracle_px,
                     premium_pct=premium_pct,
+                    observed_at=time.time(),
                 )
                 observed_fields[symbol] = {
                     name for name, raw in {
@@ -118,8 +136,9 @@ class MarketData:
             except (ValueError, TypeError) as exc:
                 logger.debug("Skipping %s: %s", symbol, exc)
 
-        self.assets = assets
-        self.observed_fields = observed_fields
+        self.assets = {s: a for s, a in self.assets.items() if s.startswith("BINANCE:")} | assets
+        self.observed_fields = ({s: f for s, f in self.observed_fields.items() if s.startswith("BINANCE:")}
+                                | observed_fields)
         self.last_update = time.monotonic()
         self.observed_at = time.time()
         logger.info("Refreshed market data for %d assets", len(assets))
@@ -186,6 +205,10 @@ class MarketData:
 
         Timeframe: '1m', '5m', '15m', '1h', '4h', '1d'
         """
+        if symbol.startswith("BINANCE:"):
+            from .binance_market import candles
+
+            return await candles(self, symbol, timeframe, bars)
         interval_ms = _timeframe_to_ms(timeframe)
         now_ms = int(time.time() * 1000)
         start_ms = now_ms - (interval_ms * bars)
@@ -277,7 +300,7 @@ class _SessionCtx:
     async def __aenter__(self) -> aiohttp.ClientSession:
         if self._owner._session and not self._owner._session.closed:
             return self._owner._session
-        self._temp = aiohttp.ClientSession()
+        self._temp = exchange_session()
         return self._temp
 
     async def __aexit__(self, *exc: object) -> None:

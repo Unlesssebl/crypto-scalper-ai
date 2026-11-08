@@ -932,6 +932,7 @@ class HyperDataAPI:
                 "index_price": a.index_price,
                 "premium_pct": getattr(a, "premium_pct", 0.0),
                 "observed_fields": sorted(observed.get(a.symbol, set())),
+                "observed_at": getattr(a, "observed_at", 0) or getattr(self.hub.market, "observed_at", 0),
             })
         return web.json_response({
             "count": len(data),

@@ -19,6 +19,8 @@ from typing import Any, Protocol, Sequence
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 from ..contracts import ExecutionEvent
 from ..raw_archive import RawArchive
 
@@ -236,7 +238,7 @@ class StreamCollector(ABC):
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
         failures = 0
-        async with aiohttp.ClientSession() as session:
+        async with exchange_session() as session:
             self._session = session
             try:
                 while not stop.is_set():

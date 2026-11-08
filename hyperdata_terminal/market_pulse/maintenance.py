@@ -11,7 +11,7 @@ def prune_raw(root, gaps, now_ms, *, max_bytes=5 * 1024**3, max_age_ms=48 * 3600
               min_free_bytes=512 * 1024**2):
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    segments = [r for venue in ("hyperliquid", "okx")
+    segments = [r for venue in ("hyperliquid", "okx", "binance")
                 for r in RawArchive(root, venue, read_only=True).segments()]
     total = sum(r.bytes for r in segments)
     protected, removed = [], []

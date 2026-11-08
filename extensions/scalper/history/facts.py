@@ -51,7 +51,10 @@ class Facts:
             return
         if envelope["kind"] == "execution":
             p = envelope["payload"]
-            self._trade(dict(coin=p["native_market_id"], px=p["price"], sz=p["base_amount"],
+            from hyperdata_terminal.instruments import observation_key
+
+            self._trade(dict(coin=observation_key(p["venue"], p["native_market_id"]),
+                             px=p["price"], sz=p["base_amount"],
                              time=p["event_time_ms"], tid=p["trade_id"],
                              side="B" if p["side"] == "buy" else "A"), envelope["received_at"],
                         envelope["epoch"], p.get("raw_ref") or str(p["event_seq"]))
@@ -69,6 +72,16 @@ class Facts:
             return
         now, epoch = envelope["received_at"], envelope["epoch"]
         ref = f'{envelope["run"]}:{envelope["sequence"]}'
+        if raw.get("e") == "depthUpdate" and envelope["payload"].get("source") == "binance_book":
+            from hyperdata_terminal.instruments import binance_key
+
+            try:
+                self._book(dict(coin=binance_key(raw["s"]), time=raw.get("T", raw.get("E")), levels=[
+                    [dict(px=p, sz=q) for p, q in raw["b"]], [dict(px=p, sz=q) for p, q in raw["a"]]]),
+                    now, epoch, ref)
+            except (ValueError, TypeError, KeyError):
+                self.errors += 1
+            return
         if raw.get("channel") == "trades" and isinstance(raw.get("data"), list):
             for t in raw["data"]:
                 self._trade(t, now, epoch, ref)

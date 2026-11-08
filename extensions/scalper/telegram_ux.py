@@ -17,6 +17,9 @@ from .tiger import TigerBridge
 
 MSK = timezone(timedelta(hours=3))
 TITLES = {
+    "interesting_instrument": "Кандидат для наблюдения",
+    "active_instrument": "Инструмент активен",
+    "interesting_level": "Необычная зона в стакане",
     "formation_confirmed": "Движение подтвердилось",
     "density_context": "Удерживается значимая зона",
     "flow_price_conflict": "Поток расходится с реакцией цены",
@@ -120,6 +123,13 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         f"{'Усиление' if kind == 'strengthening' else 'Ситуация'} · масштаб {frame} · фаза 1м: {phase}",
     ]
     metrics = []
+    if state.get("discovery_kind"):
+        parts[1] = "Для наблюдения · " + {
+            "potential": "относительная аномалия", "active": "свежий устойчивый поток сделок",
+            "level": "устойчивая зона в стакане",
+        }.get(state["discovery_kind"], "исследование активности")
+        if state.get("wide_spread"):
+            parts.append("Широкий спред · учитывайте при изучении инструмента")
     if state.get("midpoint") is not None:
         metrics.append("Цена " + number(state["midpoint"], 8))
     if state.get("spread") is not None:
@@ -129,10 +139,11 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
     if metrics:
         parts.append(" · ".join(metrics))
     if ratio is not None:
-        parts.append(f"Сделок {'≥' if ratio >= 1000 else ''}{number(ratio)}× нормы · закрытая 1м")
+        parts.append(f"Активность {'≥' if ratio >= 1000 else ''}{number(ratio)}× нормы · закрытая 1м")
     if state.get("flow") is not None and abs(state["flow"]) <= 1 and state.get("count") is not None:
         label = "1м" if state["window"] == "1m" else "наблюдаемые ≤60с"
-        parts.append(f"Покупки {(state['flow'] + 1) * 50:.0f}% объёма · {int(state['count'])} сделок · {label}")
+        count_unit = "агрегатов" if packet["symbol"].startswith("BINANCE:") else "сделок"
+        parts.append(f"Покупки {(state['flow'] + 1) * 50:.0f}% объёма · {int(state['count'])} {count_unit} · {label}")
     zone = state.get("zone")
     if zone:
         side = "Спрос" if zone["side"] == "bid" else "Предложение"
@@ -147,7 +158,8 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         elif flow == "opposed":
             parts.append("HL и OKX: стороны потока расходятся · закрытая 1м")
     clock = datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S")
-    parts.append(f"Данные HL · график Binance · {clock} МСК")
+    venue = "Binance USDT-M" if packet["symbol"].startswith("BINANCE:") else "Hyperliquid"
+    parts.append(f"Данные {venue} · {clock} МСК")
     return "\n".join(parts), "<p>" + "<br>".join(parts) + "</p>"
 
 
@@ -292,6 +304,10 @@ class TelegramUX:
             priority, reason, state = decide(packet, memory["samples"])
             state["scale"] = scale(packet, state)
             state["ratio"] = activity(service, packet["symbol"], now)
+            if state.get("discovery_kind"):
+                candle_ratio = value(packet, "discovery.candle_ratio")
+                if candle_ratio is not None:
+                    state["ratio"] = max(state["ratio"] or 0, candle_ratio)
             candle = getattr(service.attention, "activity", {}).get(packet["symbol"], {})
             state["activity_source"] = {
                 k: candle.get(k) for k in ("source", "start_ms", "reference_policy", "reference_minutes", "ratios")
@@ -308,7 +324,8 @@ class TelegramUX:
             ).fetchone()
             if priority is None:
                 continue
-            blocked = admission(state, reason)
+            discovery = bool(state.get("discovery_kind"))
+            blocked = None if discovery else admission(state, reason)
             if blocked:
                 self.quality.record(packet, state, "blocked", blocked)
                 continue
@@ -318,7 +335,7 @@ class TelegramUX:
                 or (state.get("rolling_activity") is not None and state["rolling_activity"] >= 2)
                 or (state.get("flow") is not None and abs(state["flow"]) >= 0.6 and (state.get("count") or 0) >= 20)
             )
-            if not active:
+            if not active and not discovery:
                 self.quality.record(packet, state, "blocked", "activity_unconfirmed")
                 continue
             if previous is None:
@@ -352,11 +369,19 @@ class TelegramUX:
                 stronger_zone = bool(
                     zone and old and zone["id"] == old["id"] and zone["relative_size"] >= old["relative_size"] * 1.75
                 )
-                if now - previous["last_at"] < 120 or not (
+                discovery_upgrade = (state.get("discovery_kind") == "active"
+                                     and baseline.get("discovery_kind") != "active")
+                discovery_stronger = bool(
+                    discovery and state.get("discovery_score", 0) >=
+                    max(6, (baseline.get("discovery_score") or 0) * 1.75)
+                    and state.get("discovery_score", 0) > (baseline.get("discovery_score") or 0))
+                if (now - previous["last_at"] < 120 and not discovery_upgrade) or not (
                     new_zone or stronger or expanded or stronger_zone or confirmed
+                    or discovery_upgrade or discovery_stronger
                 ):
                     continue
-                kind, reason = "strengthening", "new_level" if new_zone else "strengthened"
+                kind = "situation" if discovery_upgrade else "strengthening"
+                reason = "active_instrument" if discovery_upgrade else "new_level" if new_zone else "strengthened"
                 generation += 1
             # Existing delivered episodes establish a baseline; no retrospective push.
             existing = self.db.execute(
@@ -461,7 +486,7 @@ class TelegramUX:
         heading = "Связи эпизодов · обзор рынка" if meta else html.escape(packet["symbol"]) + " · Разбор ситуации"
         lines = ["<b>" + heading + "</b>"]
         if meta:
-            symbols = sorted({f["id"].split(":")[0] for f in packet["facts"] if ":" in f["id"]})
+            symbols = sorted({f["id"].rsplit(":", 1)[0] for f in packet["facts"] if ":" in f["id"]})
             lines.append("Наблюдаемые инструменты: " + html.escape(", ".join(symbols)))
             for symbol in symbols[:8]:
                 fact = next(
@@ -498,7 +523,8 @@ class TelegramUX:
         lines.append(
             "Снимок "
             + datetime.fromtimestamp(packet["captured_at"], MSK).strftime("%H:%M:%S МСК")
-            + " · данные Hyperliquid."
+            + (" · данные наблюдаемых площадок." if meta else " · данные Binance USDT-M."
+               if packet["symbol"].startswith("BINANCE:") else " · данные Hyperliquid.")
         )
         # Rich detail is optional depth, not a longer first screen in operations.
         text = "\n".join(lines)

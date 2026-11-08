@@ -42,6 +42,12 @@ abstention ОБЯЗАТЕЛЬНО false. Если abstention=true, ВСЕ эти
 только зафиксированные прошлые наблюдения того же эпизода; их устаревание для текущего рынка явно отмечено.
 Для id утверждений используй только латинские буквы, цифры, '_' и '-', например obs_1, interp_1, cmp_1.
 Все id уникальны между секциями. Не копируй dotted fact_id в id; точки разрешены только в ссылках на факты.
+В interpretations.text запрещены любые цифры, даже в обозначениях L2, 1m, 5m,
+названиях инструментов и скопированных fact_id. Пиши «стакан», «минутное окно»,
+«старшее окно»; точные ссылки оставляй в evidence. Если не можешь сформулировать
+гипотезу по этим правилам, пропусти её, сохранив проверяемые observations.
+kind=context_link предназначен только для пакета scope=market_meta со ссылками
+на разные инструменты. Совместное наблюдение полей одного инструмента — kind=other.
 """
 
 
@@ -79,12 +85,12 @@ def schema(packet):
                                 "possible_absorption",
                                 "possible_replenishment",
                                 "flow_price_mismatch",
-                                "context_link",
+                                *(["context_link"] if packet.get("scope") == "market_meta" else []),
                                 "other",
                             ],
                         },
-                        evidence=array(reference, 6),
-                        text={"type": "string", "maxLength": 400},
+                        evidence={**array(reference, 6), "minItems": 1},
+                        text={"type": "string", "minLength": 1, "maxLength": 400, "pattern": r"^[^\d]+$"},
                     )
                 ),
                 4,

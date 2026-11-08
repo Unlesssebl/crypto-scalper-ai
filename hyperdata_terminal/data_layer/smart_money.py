@@ -28,6 +28,7 @@ import aiohttp
 import numpy as np
 
 from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.network import exchange_session
 from hyperdata_terminal.paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -173,7 +174,7 @@ class SmartMoneyEngine:
     async def start(self) -> None:
         """Start discovery and analysis loops."""
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = exchange_session()
         self._tasks = [
             asyncio.create_task(self._discovery_loop(), name="sm-discovery"),
             asyncio.create_task(self._analysis_loop(), name="sm-analysis"),
@@ -220,7 +221,7 @@ class SmartMoneyEngine:
         # Fallback: HTTP API endpoints
         session = self._session
         if session is None or session.closed:
-            session = aiohttp.ClientSession()
+            session = exchange_session()
             own = True
         else:
             own = False
@@ -435,7 +436,7 @@ class SmartMoneyEngine:
         """One-shot discovery: watch trades for N seconds, collect addresses."""
         symbols = symbols or ["BTC", "ETH", "SOL"]
         before = len(self.wallets)
-        session = self._session or aiohttp.ClientSession()
+        session = self._session or exchange_session()
         own_session = self._session is None
 
         try:

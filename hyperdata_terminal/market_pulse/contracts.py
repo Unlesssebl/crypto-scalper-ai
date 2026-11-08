@@ -30,6 +30,7 @@ class ContractError(ValueError):
 
 
 class Venue(StrEnum):
+    BINANCE = "binance"
     HYPERLIQUID = "hyperliquid"
     OKX = "okx"
 
@@ -97,6 +98,7 @@ CANONICAL_CHANNELS: dict[tuple[str, str], AggregationKind] = {
 KNOWN_CHANNELS: dict[tuple[str, str], AggregationKind] = {
     **CANONICAL_CHANNELS,
     (Venue.OKX, "trades"): AggregationKind.AGGREGATED,
+    (Venue.BINANCE, "aggTrade"): AggregationKind.AGGREGATED,
 }
 
 

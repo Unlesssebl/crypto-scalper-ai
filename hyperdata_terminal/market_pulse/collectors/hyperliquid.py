@@ -99,6 +99,8 @@ class HyperliquidCollector(StreamCollector):
         self._overview_subscribed = set()
         self._overview_pending = {}
         self._overview_epoch_start = 0
+        self.overview_rejected = 0
+        self.overview_last_error = None
         self._overview_lock = asyncio.Lock()
         self.specs = {spec.native_market_id: spec for spec in (specs or [])}
         if not self.specs:
@@ -126,10 +128,24 @@ class HyperliquidCollector(StreamCollector):
     async def auxiliary_payload(self, payload, epoch, received, raw_ref):
         if not isinstance(payload, dict) or payload.get("channel") != "candle":
             return
+        try:
+            self._accept_overview_candle(payload, epoch, received, raw_ref)
+        except ValueError as exc:
+            # Discovery summaries share a socket with executions. A malformed
+            # summary must not tear down healthy trade subscriptions and create
+            # gaps in the canonical tape. The raw frame is already archived.
+            self.overview_rejected += 1
+            self.overview_last_error = dict(reason=str(exc), received_at_ms=received, raw_ref=raw_ref)
+            data = payload.get("data")
+            if isinstance(data, dict) and isinstance(data.get("s"), str) and type(data.get("t")) is int:
+                self._overview_pending.pop((data["s"], data["t"]), None)
+
+    def _accept_overview_candle(self, payload, epoch, received, raw_ref):
         from ..overview import VERSION, validate_candle
-        data = payload.get("data") or {}
-        if (not isinstance(data, dict) or data.get("s") not in self.overview_markets
-                or data.get("i") != "1m"):
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("s"), str):
+            raise ValueError("invalid candle payload")
+        if data.get("s") not in self.overview_markets or data.get("i") != "1m":
             return
         start = data.get("t")
         if type(start) is not int or data.get("T") != start + 59_999:

@@ -177,6 +177,7 @@ def test_book_age_is_instrument_specific():
 @pytest.mark.asyncio
 async def test_outbox_429_survives_restart_and_edits_one_card(journal):
     alerts = SimpleNamespace(
+        telegram_chat_id="42",
         send_telegram=AsyncMock(return_value=None),
         edit_telegram=AsyncMock(return_value=True),
         last_telegram_result=dict(state="failed", http_status=429, retry_after=30),
@@ -200,6 +201,7 @@ async def test_outbox_429_survives_restart_and_edits_one_card(journal):
 @pytest.mark.asyncio
 async def test_ambiguous_initial_card_is_never_resent(journal):
     alerts = SimpleNamespace(
+        telegram_chat_id="42",
         send_telegram=AsyncMock(return_value=None), last_telegram_result=dict(state="outcome_unknown")
     )
     box = CardOutbox(journal, alerts)

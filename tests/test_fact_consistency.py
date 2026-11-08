@@ -40,6 +40,21 @@ def reply(p):
                 interpretations=[], contradictions=[], missing_data=[], abstention=False)
 
 
+def test_interpretation_schema_excludes_numeric_prose_and_requires_evidence(attention):
+    import re
+
+    from extensions.scalper.fact_review import schema
+
+    p = packet(attention)
+    fields = schema(p)["properties"]["interpretations"]["items"]["properties"]
+    assert re.fullmatch(fields["text"]["pattern"], "Наблюдаемая зона стакана")
+    assert not re.fullmatch(fields["text"]["pattern"], "Наблюдаемый L2 стакан")
+    assert fields["evidence"]["minItems"] == 1
+    assert "context_link" not in fields["kind"]["enum"]
+    p["scope"] = "market_meta"
+    assert "context_link" in schema(p)["properties"]["interpretations"]["items"]["properties"]["kind"]["enum"]
+
+
 def test_packet_content_hash_detects_metric_change_even_with_identical_time_and_symbol(attention):
     p = packet(attention)
     changed = deepcopy(p)

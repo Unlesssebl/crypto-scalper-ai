@@ -95,6 +95,14 @@ def spec_index(specs: list[InstrumentSpec]) -> dict[tuple[str, str], InstrumentS
 
 
 def market_for_venue(venue: str, base_asset: str) -> str:
+    from hyperdata_terminal.instruments import identity, is_binance
+
+    if is_binance(base_asset):
+        if venue != "binance":
+            raise ValueError("a Binance observation is not another venue's contract")
+        return identity(base_asset)[1]
+    if venue == "binance":
+        raise ValueError("Binance observations require explicit venue identity")
     if venue == "okx":
         return OKX_MARKET_IDS.get(base_asset, base_asset.upper() + "-USDT-SWAP")
     return base_asset

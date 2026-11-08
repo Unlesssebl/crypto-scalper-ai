@@ -33,7 +33,7 @@ def create_ingest_app(
     app.router.add_get("/ingest/v1/health", health)
     app.router.add_post("/ingest/v1/attention", attention)
     app.router.add_get("/ingest/v1/attention", attention)
-    app.router.add_post("/ingest/v1/collector-status/{venue:hyperliquid|okx}", collector_status)
+    app.router.add_post("/ingest/v1/collector-status/{venue:hyperliquid|okx|binance}", collector_status)
     app.middlewares.append(_auth)
     return app
 

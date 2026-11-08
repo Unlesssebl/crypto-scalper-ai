@@ -41,6 +41,12 @@ class TigerBridge:
         if not re.fullmatch(r"[A-Z]|[0-9]|1[0-8]", self.group):
             raise ValueError("Tiger link group is not configured")
         mapped = self.aliases.get(symbol)
+        if mapped is None and symbol.startswith("BINANCE:"):
+            from hyperdata_terminal.instruments import identity
+
+            if self.exchange != "BINANCE-FUT" or self.market != "FUTURES":
+                raise ValueError("Binance instrument requires a Binance Futures destination")
+            mapped = identity(symbol)[1]
         if mapped is None:
             # Only the ordinary Binance USDT-M name is inferred. Never guess 1000/k aliases.
             if (
@@ -50,7 +56,7 @@ class TigerBridge:
             ):
                 raise ValueError("An explicit Tiger symbol mapping is required")
             mapped = symbol + "USDT"
-        if not isinstance(mapped, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", mapped):
+        if not isinstance(mapped, str) or not re.fullmatch(r"[\w.:-]{1,64}", mapped):
             raise ValueError("Invalid Tiger symbol mapping")
         return dict(
             type="SETLINKSYMBOL",

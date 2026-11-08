@@ -720,6 +720,9 @@ class TestC3VenueTruth:
         from hyperdata_terminal.data_layer import orderflow_engine as oe
 
         class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
             async def __aenter__(self):
                 return self
 

@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.network import exchange_session
+
 logger = logging.getLogger(__name__)
 
 # External reference endpoints (public, no key).
@@ -95,7 +97,7 @@ class DataHealthMonitor:
 
         # Cross-reference needs network; never let it crash the whole run.
         try:
-            async with aiohttp.ClientSession() as session:
+            async with exchange_session() as session:
                 checks.extend(await self._check_cross_references(session))
         except Exception:
             logger.exception("health monitor: cross-reference checks errored")

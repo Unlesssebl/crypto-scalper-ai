@@ -249,7 +249,7 @@ def extend_packet(packet, service):
     valid_window = closed == expected_end and pulse.get("window_start_ms") == expected_end - 60000
     closed = closed / 1000 if finite(closed) else None
     refs = [pulse["evidence_id"]] if pulse.get("evidence_id") else []
-    for venue in ("hyperliquid", "okx"):
+    for venue in (("binance",) if symbol.startswith("BINANCE:") else ("hyperliquid", "okx")):
         observed = next((v for v in pulse.get("venues", []) if v["venue"] == venue), {})
         usable = valid_window and observed.get("quality") in {"observed_no_detected_gap", "reconciled"}
         for name, unit in (

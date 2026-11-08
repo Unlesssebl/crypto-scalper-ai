@@ -96,7 +96,7 @@ def test_operational_signal_is_independent_of_ai_and_ordinary_zone_is_quiet(serv
     observe(service, now + 30)
     rows = operations(service)
     assert len(rows) == 1
-    assert "Ситуация" in rows[0]["text"] and "Данные HL" in rows[0]["text"]
+    assert "Ситуация" in rows[0]["text"] and "Данные Hyperliquid" in rows[0]["text"]
     assert "медианы уровней" in rows[0]["text"] and "Покупки 90%" in rows[0]["text"]
     assert "score" not in rows[0]["text"] and "Бесплатный" not in rows[0]["text"]
     assert service.journal.db.execute("SELECT COUNT(*) FROM ai_requests").fetchone()[0] == 0

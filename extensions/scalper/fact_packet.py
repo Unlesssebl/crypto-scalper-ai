@@ -60,9 +60,10 @@ def build_packet(attention, assignment, now, frames=()):
     """Freeze the available card, explicitly preserving unknown order/tape history."""
     card = assignment["facts"]
     symbol = assignment["symbol"]
+    binance = symbol.startswith("BINANCE:")
     run = (
-        "attention-plan.v4"
-        if attention.get("policy_version") == 4
+        f"attention-plan.v{attention['policy_version']}"
+        if attention.get("policy_version") in (4, 5, 6)
         else attention.get("archive", {}).get("run", "unknown")
     )
     episode = checksum(dict(run=run, symbol=symbol, assigned_at=assignment["assigned_at"]))
@@ -81,7 +82,7 @@ def build_packet(attention, assignment, now, frames=()):
         value,
         unit,
         *,
-        source="hyperliquid_l2_snapshot",
+        source="binance_depth20_snapshot" if binance else "hyperliquid_l2_snapshot",
         at=book_at,
         evidence=(),
         role="book",
@@ -113,6 +114,11 @@ def build_packet(attention, assignment, now, frames=()):
         )
 
     book_ref = [card["evidence"]] if card.get("evidence") else []
+    if attention.get("policy_version") == 6:
+        interest = assignment.get("interest", {})
+        for key in ("candle_ratio", "movement_ratio", "score"):
+            add("discovery." + key, interest.get(key), "score" if key == "score" else "ratio",
+                source="adaptive_discovery.v6", at=interest.get("at"), role="activity")
     add("book.midpoint", card.get("midpoint"), "price", evidence=book_ref)
     add("book.spread_bps", card.get("spread_bps"), "bps", evidence=book_ref)
     add("book.visible_bid_levels", (card.get("observed_levels") or [None, None])[0], "levels", evidence=book_ref)
@@ -120,7 +126,7 @@ def build_packet(attention, assignment, now, frames=()):
     add(
         "activity.relative_score",
         assignment.get("score"),
-        "ratio",
+        "score" if attention.get("policy_version") == 6 else "ratio",
         source="relative_scout_algorithm",
         at=attention.get("last_scout_at"),
         role="activity",
@@ -129,7 +135,7 @@ def build_packet(attention, assignment, now, frames=()):
         "tape.observed_turnover_60s",
         None if not healthy or card.get("trade_window_truncated") else card.get("observed_turnover_60s_usd"),
         "usd",
-        source="hyperliquid_observed_trades",
+        source="binance_observed_aggTrade" if binance else "hyperliquid_observed_trades",
         evidence=card.get("trade_evidence", []),
         role="tape",
     )
@@ -140,8 +146,8 @@ def build_packet(attention, assignment, now, frames=()):
             add(
                 "tape." + field,
                 None if not healthy or card.get("trade_window_truncated") else card.get(field),
-                unit,
-                source="hyperliquid_observed_trades",
+                "aggregates" if binance and unit == "trades" else unit,
+                source="binance_observed_aggTrade" if binance else "hyperliquid_observed_trades",
                 role="flow",
                 at=card.get("last_trade_received_at"),
                 evidence=card.get("trade_evidence", []),
@@ -201,8 +207,8 @@ def build_packet(attention, assignment, now, frames=()):
             add(
                 prefix + name,
                 value,
-                unit,
-                source="hyperliquid_native_window",
+                "aggregates" if binance and unit == "trades" else unit,
+                source="binance_native_aggregated_window" if binance else "hyperliquid_native_window",
                 at=frame["captured_at"],
                 role=role,
                 window=window,
@@ -253,6 +259,12 @@ def build_packet(attention, assignment, now, frames=()):
             attention_state=assignment["state"],
             observation_healthy=healthy,
             trade_truncated=bool(card.get("trade_window_truncated")),
+            **({"attention_policy_version": attention["policy_version"],
+                "live_quality_confirmed": assignment.get("quality", {}).get("confirmed", False)}
+               if attention.get("policy_version") in (5, 6) else {}),
+            **({"discovery": assignment.get("interest", {}),
+                "price_reaction_confirmed": assignment.get("quality", {}).get("price_reaction_confirmed", False)}
+               if attention.get("policy_version") == 6 else {}),
         ),
         limitations=[
             "Top-N L2 snapshots are not individual orders.",

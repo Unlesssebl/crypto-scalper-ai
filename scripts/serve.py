@@ -42,7 +42,8 @@ def _health_url(port: int) -> str:
 
 def health_ok(port: int, timeout: float = 1.5) -> bool:
     try:
-        with urllib.request.urlopen(_health_url(port), timeout=timeout) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(_health_url(port), timeout=timeout) as response:
             return response.status == 200
     except (urllib.error.URLError, OSError, ValueError):
         return False

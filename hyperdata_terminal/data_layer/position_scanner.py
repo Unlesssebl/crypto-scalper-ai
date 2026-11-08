@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import aiohttp
 
 from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.network import exchange_session
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ class PositionScanner:
         recomputed against the fresh mids. Cycle time is therefore bounded
         by the budget, not by the size of the address store.
         """
-        async with aiohttp.ClientSession() as session:
+        async with exchange_session() as session:
             self._session = session
             try:
                 # Independent updates: one endpoint failing must not discard

@@ -57,7 +57,7 @@ async def overview(request):
 async def attention(request):
     store = request.app[STORE_KEY]
     return web.json_response({"plan": await store.get_control("attention"), "collectors": {
-        venue: await store.get_control("collector:" + venue) for venue in ("hyperliquid", "okx")}})
+        venue: await store.get_control("collector:" + venue) for venue in ("hyperliquid", "okx", "binance")}})
 
 
 async def health(request: web.Request) -> web.Response:
@@ -74,9 +74,12 @@ async def health(request: web.Request) -> web.Response:
         from .control import desired_symbols
         existing = {(c.venue, c.native_market_id, c.channel) for c in coverage
                     if c.state != "outside_attention"}
+        from hyperdata_terminal.instruments import is_binance
+
         missing = [{"venue": venue, "market": market_for_venue(venue, symbol)}
                    for symbol in desired_symbols(plan, now_ms())
-                   for venue, channel in (("hyperliquid", "trades"), ("okx", "trades-all"))
+                   for venue, channel in ((("binance", "aggTrade"),) if is_binance(symbol) else
+                                          (("hyperliquid", "trades"), ("okx", "trades-all")))
                    if (venue, market_for_venue(venue, symbol), channel) not in existing]
     status = detail.get("status", "ok")
     maintenance = await store.get_control("maintenance")

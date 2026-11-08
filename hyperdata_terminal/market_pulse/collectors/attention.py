@@ -7,6 +7,9 @@ import time
 
 import aiohttp
 
+from hyperdata_terminal.instruments import is_binance
+from hyperdata_terminal.network import exchange_session
+
 from ..control import desired_symbols
 from ..transport import IngestError
 from .okx import OkxInstrumentCatalog
@@ -16,19 +19,21 @@ LOG = logging.getLogger(__name__)
 
 
 async def follow_attention(collector, client, stop, *, interval=5):
+    if collector.venue == "binance":
+        return await follow_binance_attention(collector, client, stop, interval=interval)
     collector.dynamic = True
     cached_plan = None
     checks, metadata, retry_at = {}, {}, {}
     errors = {}
     catalog = OkxInstrumentCatalog()
-    async with aiohttp.ClientSession() as session:
+    async with exchange_session() as session:
         while not stop.is_set():
             now = int(time.time() * 1000)
             try:
                 cached_plan = await client.attention()
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 LOG.warning("Attention control unavailable; cached lease expires normally")
-            wanted = desired_symbols(cached_plan, now)
+            wanted = tuple(s for s in desired_symbols(cached_plan, now) if not is_binance(s))
             blocked = client.maintenance.get("status") == "blocked"
             if blocked:
                 wanted = ()
@@ -91,9 +96,58 @@ async def follow_attention(collector, client, stop, *, interval=5):
                                               socket_connected=collector._ws is not None,
                                               overview_subscriptions=len(getattr(
                                                   collector, "_overview_subscribed", ())),
-                                              overview_pending=len(getattr(collector, "_overview_pending", ())))
+                                              overview_pending=len(getattr(collector, "_overview_pending", ())),
+                                              overview_rejected=getattr(collector, "overview_rejected", 0),
+                                              overview_last_error=getattr(collector, "overview_last_error", None))
             except Exception:
                 LOG.exception("Attention reconciliation failed")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def follow_binance_attention(collector, client, stop, *, interval=5):
+    """The common plan is the only author of Binance detail subscriptions."""
+    collector.dynamic = True
+    cached_plan = None
+    async with exchange_session() as session:
+        while not stop.is_set():
+            now = int(time.time() * 1000)
+            try:
+                cached_plan = await client.attention()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                LOG.warning("Binance attention unavailable; cached lease expires normally")
+            blocked = client.maintenance.get("status") == "blocked"
+            wanted = tuple(s for s in desired_symbols(cached_plan, now) if is_binance(s)) if not blocked else ()
+            statuses, enabled = {}, []
+            try:
+                if not blocked:
+                    await collector.refresh_catalog(session)
+                    await collector.sync_overview()
+                    await collector.flush_overview()
+                for symbol in wanted:
+                    native = collector.native_market_id(symbol)
+                    if native in collector.specs:
+                        enabled.append(symbol)
+                        statuses[symbol] = dict(status="observing" if native in collector.confirmed else "pending")
+                    else:
+                        statuses[symbol] = dict(status="unavailable", reason="instrument_not_verified")
+                await collector.change_markets(enabled, reason="storage_pressure" if blocked else "attention_released")
+                await collector.expire_pending()
+                await client.collector_status("binance", statuses, desired=list(wanted),
+                                              confirmed=sorted(collector.confirmed),
+                                              socket_connected=collector._ws is not None,
+                                              last_receive_ms=collector._last_receive_ms,
+                                              pending_events=len(collector._pending),
+                                              overview_subscriptions=len(collector._overview_subscribed),
+                                              overview_pending=len(collector._overview_pending),
+                                              overview_rejected=collector.overview_rejected,
+                                              overview_last_error=collector.overview_last_error)
+            except Exception:
+                # Expiry still releases old detail even if metadata/ingest fails.
+                await collector.change_markets(set(collector.config.markets) & set(wanted))
+                LOG.exception("Binance attention reconciliation failed")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:

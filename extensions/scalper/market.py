@@ -2,6 +2,8 @@
 import math
 from dataclasses import asdict
 
+from hyperdata_terminal.instruments import identity, is_binance
+
 from .activity import BASELINE_BARS, CANDLE_SOURCE, tape_baseline
 
 WINDOWS = {"1m": 60, "5m": 300}
@@ -23,9 +25,13 @@ def metric(value, source, updated_at, unit, quality="ok"):
 
 
 def capture(hub, asset, window, now, candles=None):
-    market_at = hub.market_timestamp()
-    market_quality = "synthetic" if hub.demo else ("ok" if hub.market_age() <= 20 else "stale")
-    market_source = "HyperData demo" if hub.demo else "Hyperliquid metaAndAssetCtxs"
+    venue, contract = identity(asset.symbol)
+    binance = is_binance(asset.symbol)
+    candle_source = "Binance USD-M klines" if binance else CANDLE_SOURCE
+    market_at = getattr(asset, "observed_at", 0) or hub.market_timestamp()
+    market_quality = "synthetic" if hub.demo else ("ok" if -5 <= now - market_at <= 20 else "stale")
+    market_source = ("HyperData demo" if hub.demo else "Binance USD-M ticker/premiumIndex"
+                     if binance else "Hyperliquid metaAndAssetCtxs")
     observed = hub.market.observed_fields.get(asset.symbol, set())
     metrics = {}
     for name, unit in MARKET_FIELDS.items():
@@ -54,13 +60,14 @@ def capture(hub, asset, window, now, candles=None):
     else:
         flow_quality = "ok"
 
-    flow_source = "HyperData demo" if hub.demo else "Hyperliquid trades / HyperData Order Flow"
+    flow_source = ("HyperData demo" if hub.demo else "Binance aggTrade / HyperData Order Flow"
+                   if binance else "Hyperliquid trades / HyperData Order Flow")
     for name, value, unit in (
         ("cvd", flow.cvd if flow else None, "USD"),
         ("ofi", flow.ofi if flow else None, "ratio"),
         ("volume", flow.buy_volume + flow.sell_volume if flow else None, "USD"),
-        ("trade_count", flow.trade_count if flow else None, "trades"),
-        ("trade_rate", flow.trades_per_sec if flow else None, "trades/s"),
+        ("trade_count", flow.trade_count if flow else None, "aggregates" if binance else "trades"),
+        ("trade_rate", flow.trades_per_sec if flow else None, "aggregates/s" if binance else "trades/s"),
     ):
         metrics[name] = metric(value if flow_quality != "unavailable" else None, flow_source,
                                last_trade, unit, flow_quality)
@@ -69,12 +76,13 @@ def capture(hub, asset, window, now, candles=None):
     candle_quality = "unavailable" if not candles else "ok" if now - closed_at <= seconds + 90 else "stale"
     for name, unit in (("natr", "%"), ("range_ratio", "×")):
         value = candles[name] if candles else None
-        metrics[name] = metric(value, CANDLE_SOURCE, closed_at, unit,
+        metrics[name] = metric(value, candle_source, closed_at, unit,
                                candle_quality if value is not None else "unavailable")
     baseline = tape_baseline(candles, now, seconds) if candle_quality == "ok" else None
-    relative = flow.trade_count / baseline if flow_quality == "ok" and baseline and flow else None
+    # Aggregate records cannot be divided by a kline's individual trade count.
+    relative = flow.trade_count / baseline if not binance and flow_quality == "ok" and baseline and flow else None
     metrics["activity_ratio"] = metric(
-        relative, f"{flow_source} / {CANDLE_SOURCE} median", last_trade, "×",
+        relative, f"{flow_source} / {candle_source} median", last_trade, "×",
         "ok" if relative is not None else "unavailable",
     )
     # These are observed trades from the same native window as OFI and CVD.
@@ -87,7 +95,8 @@ def capture(hub, asset, window, now, candles=None):
         metrics[name] = metric(trade.price if trade and flow_quality != "unavailable" else None,
                                flow_source, trade.timestamp if trade else None, "USD", flow_quality)
     book = hub.get_orderbook(asset.symbol)
-    book_source = "HyperData demo" if hub.demo else "Hyperliquid l2Book / HyperData"
+    book_source = ("HyperData demo" if hub.demo else "Binance depth20 / HyperData"
+                   if binance else "Hyperliquid l2Book / HyperData")
     if not book or not book.bids or not book.asks or not 0 < book.best_bid <= book.best_ask:
         book_quality = "unavailable"
     elif hub.demo:
@@ -102,13 +111,13 @@ def capture(hub, asset, window, now, candles=None):
                                       None, "events", "unavailable")
     direction = DIRECTIONS[flow.signal] if flow_quality == "ok" else "NOT_AVAILABLE"
     snapshot = {
-        "symbol": asset.symbol, "exchange": "hyperliquid", "contract": f"{asset.symbol}-PERP",
+        "symbol": asset.symbol, "exchange": venue, "contract": contract if binance else f"{asset.symbol}-PERP",
         "window": window, "captured_at": now, "metrics": metrics,
     }
-    if baseline is not None and baseline > 0:
+    if not binance and baseline is not None and baseline > 0:
         snapshot["activity_baseline"] = {
             "kind": "median_trade_count", "samples": BASELINE_BARS,
-            "median_count": baseline, "window_seconds": seconds, "source": CANDLE_SOURCE,
+            "median_count": baseline, "window_seconds": seconds, "source": candle_source,
         }
     vote = {
         "direction": direction, "native_signal": flow.signal if flow_quality == "ok" else None,

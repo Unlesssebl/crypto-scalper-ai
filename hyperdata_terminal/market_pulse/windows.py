@@ -227,11 +227,14 @@ class WindowService:
         for channel in await self.store.list_coverage():
             if channel.state in {QualityState.UNAVAILABLE.value, QualityState.OUTSIDE_ATTENTION.value}:
                 continue
+            from .contracts import known_channel
+
+            kind = known_channel(channel.venue, channel.channel).value
             existing = await self.store.get_window(channel.venue, channel.native_market_id, channel.channel,
-                                                   "execution", start)
+                                                   kind, start)
             if existing is None:
                 await self.rebuild(channel.venue, channel.native_market_id, channel.channel,
-                                   "execution", start, now_ms=now_ms)
+                                   kind, start, now_ms=now_ms)
         rows = await self.store.due_windows(now_ms, self.grace_ms)
         due = [
             window
