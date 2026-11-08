@@ -427,6 +427,8 @@ async def run(args: argparse.Namespace) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         if "service" in locals():
             await asyncio.to_thread(service.attention.close)
+            if service.telegram_ux:
+                await service.telegram_ux.desktop.close()
         if runner is not None:
             await runner.cleanup()
         await hub.stop()

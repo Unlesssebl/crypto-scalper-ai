@@ -83,12 +83,12 @@ if ($uv) {
         & $python.Command @($python.Prefix + @("-m", "venv", ".venv"))
         if ($LASTEXITCODE -ne 0) { throw "Could not create .venv" }
     }
-    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.screener_web" 2>$null
+    & $venvPython -c "import hyperdata_terminal, extensions.scalper, apps.screener_web, windows_toasts" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Step "Installing dependencies (the first run can take a minute)"
         & $venvPython -m pip install --upgrade pip
         if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip" }
-        & $venvPython -m pip install -e .
+        & $venvPython -m pip install -e ".[desktop]"
         if ($LASTEXITCODE -ne 0) { throw "Could not install the project" }
     }
 }

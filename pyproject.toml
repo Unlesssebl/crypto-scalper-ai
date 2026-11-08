@@ -49,6 +49,11 @@ dependencies = [
 mcp = ["mcp>=2.2,<3"]
 # `hyperdata-pulse`: durable market-pulse ingest/API in PostgreSQL.
 pulse = ["asyncpg>=0.29,<1"]
+desktop = [
+    "winrt-windows-data-xml-dom>=3.2,<4 ; sys_platform == 'win32'",
+    "winrt-windows-foundation>=3.2,<4 ; sys_platform == 'win32'",
+    "winrt-windows-ui-notifications>=3.2,<4 ; sys_platform == 'win32'",
+]
 
 [dependency-groups]
 # `uv run pytest` / `uv run ruff` work in any checkout without a manual install.
