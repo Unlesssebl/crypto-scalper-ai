@@ -12,6 +12,7 @@ from hyperdata_terminal.runtime_mode import UNIFIED, RuntimeModeError, compatibi
 from .activity import btc_context, finding_strength, market_risk_context, refresh_candles, wide_spread
 from .analysis import snapshot_key
 from .audit import CONTROL_INTERVAL
+from .bots import BotObservatory
 from .consistency_store import ConsistencyStore
 from .context_auto import REASONS as CONTEXT_REASONS
 from .context_auto import ContextMemory, decide, enrich
@@ -62,7 +63,7 @@ class Screener:
             journal if hasattr(journal, "db") else None,
             slots=int(os.getenv("SCALPER_ATTENTION_SLOTS", "20")),
             detail_slots=int(os.getenv("PULSE_ATTENTION_DETAIL_SLOTS", "6")),
-            hold_seconds=int(os.getenv("PULSE_ATTENTION_HOLD_SECONDS", "300")),
+            hold_seconds=int(os.getenv("PULSE_ATTENTION_HOLD_SECONDS", "600")),
         )
         if hub is not None:
             hub.attention_selector = self.attention
@@ -78,6 +79,13 @@ class Screener:
         self.candles = {}
         self.market_context: list[str] = []
         self.consistency = ConsistencyStore(journal.db) if journal is not None and hasattr(journal, "db") else None
+        self.bots = (
+            BotObservatory(journal.db)
+            if journal is not None
+            and hasattr(journal, "db")
+            and os.getenv("SCALPER_BOTS", "1").lower() in {"1", "true", "yes"}
+            else None
+        )
         self.context_packets = {}
         self.context_cache = OrderedDict()
         self.context_lock = asyncio.Lock()
@@ -93,7 +101,7 @@ class Screener:
             from .ai_routes import AIRoutes
 
             self.ai_routes = AIRoutes(journal, gemini)
-            self.policy = replace(self.policy, hourly_limit=40, experiments=False)
+            self.policy = replace(self.policy, hourly_limit=min(40, self.policy.hourly_limit), experiments=False)
             if getattr(hub, "alerts", None) is not None:
                 from .delivery import CardOutbox
 
@@ -191,7 +199,7 @@ class Screener:
         self.phases.keep(rows)
         self.rows = rows
         if self.recorder is not None:
-            self.recorder.record(now, rows)
+            self.recorder.record(now, rows, attention=self.attention.plan)
 
         prices = {}
         market_at = self.hub.market_timestamp()
@@ -204,6 +212,7 @@ class Screener:
                 and asset.mark_price > 0
             }
         self.journal.observe(now, prices)
+        bot_prices = dict(prices)
         if getattr(self.hub, "attention", {}).get("enabled"):
             scout_prices = {
                 s: (p, at)
@@ -215,6 +224,12 @@ class Screener:
                 and 0 <= now - at <= 20
             }
             self.journal.observe(now, scout_prices)
+            bot_prices.update(scout_prices)
+        if self.bots is not None and not self.hub.demo:
+            try:
+                self.bots.tick(now, self.rows, bot_prices, self.attention.plan)
+            except Exception:
+                LOG.exception("Bot observation tick failed")
         self.refresh_context_packets(now)
         if self.context_memory:
             for packet in self.context_packets.values():
@@ -259,7 +274,8 @@ class Screener:
                 reason_labels=CONTEXT_REASONS,
                 **(self.context_memory.report(now) if self.context_memory else {}),
             ),
-            routes=self.ai_routes.summary(now) if self.ai_routes else None,
+            routes=self.ai_routes.summary(now, limit=self.policy.hourly_limit,
+                                          cooldown_seconds=self.policy.cooldown_seconds) if self.ai_routes else None,
             telegram_ux=self.telegram_ux.status() if self.telegram_ux else dict(enabled=False),
             notification_quality=self.telegram_ux.quality.report(now) if self.telegram_ux else None,
             delivery=self.outbox.summary() if self.outbox else None,
@@ -273,6 +289,18 @@ class Screener:
             ],
             report=self.consistency.report(now) if self.consistency else None,
         )
+
+    def bot_report(self, bot_id=None):
+        """Statistics for one observer or the compact list."""
+        if self.bots is None:
+            text = "Наблюдатели недоступны: журнал не открыт."
+            return {"status": "disabled", "text": text, "html": text}
+        try:
+            return self.bots.report(bot_id)
+        except Exception:
+            LOG.exception("Bot report failed")
+            text = "Не удалось построить отчёт наблюдателей."
+            return {"status": "error", "text": text, "html": text}
 
     async def review_context(
         self, symbol, packet_id=None, *, origin="manual", trigger_reason=None, auto_state=None, route="strong"
@@ -330,7 +358,8 @@ class Screener:
                 review = self.consistency.finish(key, status, now, reason="no_api_key" if not client.key else "demo")
                 return dict(status=status, packet=packet, review=review)
             if self.ai_routes:
-                route_job, reason = self.ai_routes.reserve(packet, route, auto_state, now, self.policy.hourly_limit)
+                route_job, reason = self.ai_routes.reserve(packet, route, auto_state, now, self.policy.hourly_limit,
+                                                          cooldown_seconds=self.policy.cooldown_seconds)
             else:
                 reason = self.journal.reserve_request(key, packet["symbol"], now, self.policy)
             if reason:
@@ -508,13 +537,19 @@ class Screener:
 
     async def run(self):
         while True:
+            now = time.time()
             try:
                 refresh = getattr(self.hub, "refresh_snapshot", None)
                 if refresh is not None:
                     await refresh()
-                self.scan(time.time())
+                self.scan(now)
             except Exception:
                 LOG.exception("Screener scan failed")
+            if self.bots is not None and not self.hub.demo:
+                try:
+                    await self.bots.settle(now, self.hub)
+                except Exception:
+                    LOG.exception("Bot outcome settlement failed")
             await asyncio.sleep(5)
 
     async def refresh_activity(self):

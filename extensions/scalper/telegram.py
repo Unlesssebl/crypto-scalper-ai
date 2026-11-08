@@ -176,6 +176,8 @@ def _context_status(status, reason):
 
 REPORT = re.compile(r"/report(?:@([a-zA-Z0-9_]+))?(?:\s+(1m|5m))?", re.IGNORECASE)
 ANALYZE = re.compile(r"/analyze(?:@([a-zA-Z0-9_]+))?\s+([a-zA-Z0-9_.:-]{1,40})\s+(1m|5m)", re.IGNORECASE)
+BOTS = re.compile(r"/bots(?:@([a-zA-Z0-9_]+))?", re.IGNORECASE)
+BOT = re.compile(r"/bot(?:@([a-zA-Z0-9_]+))?\s+([a-zA-Z0-9_.:-]{1,64})", re.IGNORECASE)
 
 
 def digest_text(rows, context, *, rich=False):
@@ -300,6 +302,30 @@ def analyze_command(update, chat_id, username, now):
     return symbol, window.lower()
 
 
+def bots_command(update, chat_id, username, now):
+    """Parse /bots (summary) and /bot <id> (one observer)."""
+    message = update.get("message", {})
+    if str(message.get("chat", {}).get("id")) != str(chat_id):
+        return None
+    stamp = message.get("date")
+    if not isinstance(stamp, int) or not 0 <= now - stamp <= 120:
+        return None
+    text = (message.get("text") or "").strip()
+    summary = BOTS.fullmatch(text)
+    if summary:
+        target = summary.group(1)
+        if target and target.casefold() != username.casefold():
+            return None
+        return "summary", None
+    match = BOT.fullmatch(text)
+    if not match:
+        return None
+    target, bot_id = match.groups()
+    if target and target.casefold() != username.casefold():
+        return None
+    return "bot", bot_id.casefold()
+
+
 async def telegram_call(session, token, method, body=None, timeout=10):
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
@@ -339,6 +365,8 @@ async def listen_reports(session, service):
         for item in (
             {"command": "report", "description": "Качество анализов AI за 24 часа"},
             {"command": "analyze", "description": "Анализ: /analyze BTC 1m"},
+            {"command": "bots", "description": "Статистика наблюдателей"},
+            {"command": "bot", "description": "Детально: /bot flow.continuation"},
         )
         if commands is not None and not any(c["command"] == item["command"] for c in commands)
     ]
@@ -382,6 +410,15 @@ async def listen_reports(session, service):
                 )
             command = report_command(update, chat_id, bot["username"], time.time())
             service.journal.save_telegram_offset(bot["id"], offset)
+            bot_query = bots_command(update, chat_id, bot["username"], time.time())
+            if bot_query is not None:
+                requested = None if bot_query[0] == "summary" else bot_query[1]
+                payload = service.bot_report(requested)
+                await alerts.send_telegram(
+                    payload.get("text") or "Нет данных.",
+                    rich_html=payload.get("html"),
+                )
+                continue
             manual = analyze_command(update, chat_id, bot["username"], time.time())
             if manual and getattr(service, "telegram_ux", None):
                 if not service.telegram_ux.operator_allowed(update.get("message", {}).get("from", {}).get("id")):
