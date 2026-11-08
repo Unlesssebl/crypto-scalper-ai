@@ -564,11 +564,11 @@ namespace TigerTrade.Chart.Indicators.Custom
             visual.DrawLine(new XPen(SideBrush(side, alpha), 1, live ? XDashStyle.Dash : XDashStyle.Dot), x0, y, x1, y);
             if (!live)
                 return;
-            var label = (mark.ZoneSide == "bid" ? "Спрос " : "Предложение ") + (usd > 0 ? "$" + Short(usd) : "");
+            var label = (mark.ZoneSide == "bid" ? "Заявки на покупку" : "Заявки на продажу") + (usd > 0 ? " $" + Short(usd) : "");
             if (mark.ZoneEatSeconds.HasValue)
             {
                 var eat = mark.ZoneEatSeconds.Value;
-                label += eat < 120 ? $" · съедят за ~{eat:0}с" : eat < 600 ? $" · съедят за ~{eat / 60:0} мин" : " · съедят за 10+ мин";
+                label += " · съесть: " + (eat < 1 ? "<1с" : eat < 120 ? $"~{eat:0}с" : eat < 600 ? $"~{eat / 60:0} мин" : "10+ мин");
             }
             visual.DrawString(label, font, SideBrush(side, alpha), rect.Right - 6, y - thickness / 2 - _textSize * 1.5, XTextAlignment.Right);
         }
