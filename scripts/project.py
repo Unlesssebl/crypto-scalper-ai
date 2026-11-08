@@ -346,6 +346,41 @@ def worker(args, forwarded):
             remove_owned_state(token)
 
 
+# Windows creation flags, spelled out so the module imports on POSIX too.
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+CREATE_BREAKAWAY_FROM_JOB = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def spawn_supervisor(command, log, windows=None):
+    """Start the --worker supervisor so it outlives the shell that launched it.
+
+    On Windows the child would otherwise stay in the launcher's Job object and
+    die with it when that shell's process tree is torn down. It breaks away from
+    the job, gets its own process group and its own hidden console (no
+    DETACHED_PROCESS: a console-less supervisor would make every console child
+    it spawns -- serve.py, docker compose, taskkill -- open a visible window).
+    If the parent job forbids breakaway, it falls back to staying in the job.
+    On POSIX it starts a new session, away from the terminal's process group.
+    """
+    windows = os.name == "nt" if windows is None else windows
+    options = {"cwd": ROOT, "stdout": log, "stderr": subprocess.STDOUT}
+    if not windows:
+        return subprocess.Popen(command, start_new_session=True, **options)
+    flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    try:
+        return subprocess.Popen(command, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **options)
+    except PermissionError as exc:
+        log.write(
+            (
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} WARNING project: parent job forbids breakaway ({exc}); "
+                "the supervisor will stop if the launching shell's process tree is killed\n"
+            ).encode()
+        )
+        log.flush()
+        return subprocess.Popen(command, creationflags=flags, **options)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
@@ -410,13 +445,7 @@ def main():
         if enabled
     ]
     with (RUNTIME / "project.log").open("ab") as log:
-        child = subprocess.Popen(
-            [sys.executable, __file__, *flags, *forwarded],
-            cwd=ROOT,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        child = spawn_supervisor([sys.executable, __file__, *flags, *forwarded], log)
     for _ in range(360):
         if child.poll() is not None:
             raise RuntimeError("project startup failed; inspect .runtime/project.log")
