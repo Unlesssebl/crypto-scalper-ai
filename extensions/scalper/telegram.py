@@ -402,11 +402,12 @@ async def listen_reports(session, service):
             if update.get("callback_query") and getattr(service, "telegram_ux", None):
                 query = update["callback_query"]
                 reply = await service.telegram_ux.callback(query, session)
+                # A brief toast, not a modal: the trader flips between instruments without dismissing dialogs.
                 await telegram_call(
                     session,
                     token,
                     "answerCallbackQuery",
-                    {"callback_query_id": query["id"], "text": reply[:200], "show_alert": True},
+                    {"callback_query_id": query["id"], "text": reply[:200], "show_alert": False},
                 )
             command = report_command(update, chat_id, bot["username"], time.time())
             service.journal.save_telegram_offset(bot["id"], offset)
