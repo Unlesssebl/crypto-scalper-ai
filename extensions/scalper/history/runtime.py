@@ -25,7 +25,7 @@ class Observation:
 
     def __init__(self, hub, root=None):
         self.hub = hub
-        self.facts = Facts(version=2)
+        self.facts = Facts(version=3)
         total = int(os.getenv("HYPERDATA_HISTORY_MAX_BYTES", str(5 * 1024**3)))
         reserve = min(256 * 1024**2, total // 20)
         self.archive = Archive(root or history_dir(), quota_bytes=total - reserve)
@@ -44,7 +44,7 @@ class Observation:
                 nSigFigs=5,
                 scope="top-n",
                 trade_sampling=False,
-                fact_version=2,
+                fact_version=3,
             ),
             time.time(),
         )

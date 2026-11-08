@@ -153,6 +153,28 @@ def build_packet(attention, assignment, now, frames=()):
                 evidence=card.get("trade_evidence", []),
                 window="observed_60s",
             )
+    segments = card.get("tape_segments") if "tape_segments" in card else False
+    if segments is not False:
+        # Fact v3: recent/prior aggressor volume and trade-price travel (effort vs result).
+        tape_source = "binance_observed_aggTrade" if binance else "hyperliquid_observed_trades"
+        segments = segments or {}
+        add("tape.window_change_bps", segments.get("window_change_bps"), "bps", source=tape_source,
+            role="price_action", at=card.get("last_trade_received_at"), window="observed_60s",
+            evidence=card.get("trade_evidence", []))
+        for name, seconds in (("recent", 15), ("prior", 30)):
+            seg = segments.get(name) or {}
+            usable = bool(seg.get("complete") and not seg.get("unknown_side"))
+            for field, unit, role in (
+                ("buy_usd", "usd", "flow"),
+                ("sell_usd", "usd", "flow"),
+                ("trade_count", "aggregates" if binance else "trades", "flow"),
+                ("price_change_bps", "bps", "price_action"),
+            ):
+                # Trade-price travel needs prints; a silent stretch keeps volume 0 and price unknown.
+                add(f"tape.{name}.{field}", seg.get(field) if usable else None, unit, source=tape_source,
+                    # Stamped at the card time: a silent stretch must not age into "stale".
+                    role=role, window=f"{name}_{seconds}s",
+                    evidence=card.get("trade_evidence", []))
     add("history.before_attention", None, "boolean", source="coverage", role="coverage")
     for zone in card.get("densities", []):
         key = f"density.{zone['side']}.{format(zone['price'], '.17g')}"

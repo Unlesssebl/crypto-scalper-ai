@@ -37,7 +37,7 @@ def replay(path, *, retain_cards=True, allow_incomplete=False):
         elif kind == "source":
             external = event["payload"].get("assignment_mode") == "external_plan.v1"
             facts.version = event["payload"].get("fact_version", 1)
-            if facts.version not in (1, 2):
+            if facts.version not in (1, 2, 3):
                 raise ValueError("Unsupported recorded fact version")
         elif kind == "scout":
             if attention is None:

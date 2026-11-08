@@ -1,0 +1,121 @@
+"""Effort vs result: recent 15s of the tape against the 30s impulse before it."""
+
+import json
+
+import pytest
+
+from extensions.scalper.context_auto import summarize
+from extensions.scalper.fact_packet import build_packet
+from extensions.scalper.history.archive import Archive
+from extensions.scalper.history.facts import Facts, tape_segments
+from extensions.scalper.history.replay import replay
+from extensions.scalper.microstructure import label, read_tape
+from extensions.scalper.telegram_ux import operational, tape_lines
+
+
+def fake(prior, recent, spread=1.0):
+    facts = [dict(id="book.spread_bps", value=spread, quality="ok")]
+    for name, seg in (("prior", prior), ("recent", recent)):
+        for key, v in seg.items():
+            facts.append(dict(id=f"tape.{name}.{key}", value=v, quality="ok"))
+    return dict(facts=facts)
+
+
+def seg(buy, sell, count, move):
+    return dict(buy_usd=buy, sell_usd=sell, trade_count=count, price_change_bps=move)
+
+
+IMPULSE = seg(300_000, 30_000, 60, 30)  # buyers lifted prices 30 bps in 30s
+
+
+@pytest.mark.parametrize(
+    "recent, kind",
+    [
+        (seg(200_000, 20_000, 40, 0.5), "absorption"),  # same pace of buying, prices stuck
+        (seg(20_000, 10_000, 5, 0.3), "exhaustion"),  # buying faded, prices stuck
+        (seg(30_000, 250_000, 40, -4), "counter_aggression"),  # sellers now hit the bid
+        (seg(30_000, 5_000, 6, 25), "thin_move"),  # prices run faster on little buying
+        (seg(160_000, 20_000, 30, 14), "continuation"),
+        (seg(110_000, 20_000, 20, 1), "slowdown"),  # stuck, effort neither held nor faded
+    ],
+)
+def test_reading_separates_why_a_move_stops(recent, kind):
+    reading = read_tape(fake(IMPULSE, recent))
+    assert reading["kind"] == kind and reading["side"] == 1
+
+
+def test_counter_aggression_leads_with_the_side_taking_over():
+    lines = tape_lines(read_tape(fake(IMPULSE, seg(30_000, 250_000, 40, -4))))
+    assert lines[0] == "⚡ Продавцы перехватывают инициативу"
+    assert lines[1].startswith("Продажи $250k за 15с против покупок $30k · цена -4.0 б.п.")
+
+
+def test_mirror_for_a_falling_market_and_labels_are_hypotheses():
+    reading = read_tape(fake(seg(30_000, 300_000, 60, -30), seg(20_000, 200_000, 40, -0.5)))
+    assert reading["kind"] == "absorption" and reading["side"] == -1
+    assert label(reading) == "Вероятно поглощение продаж"
+
+
+def test_no_reading_without_an_impulse_or_a_complete_tape():
+    assert read_tape(fake(seg(300_000, 30_000, 60, 1), seg(1, 1, 1, 0))) is None  # no travel: noise
+    assert read_tape(fake(seg(160_000, 150_000, 60, 30), seg(1, 1, 1, 0))) is None  # no dominant side
+    assert read_tape(fake(seg(300_000, 30_000, 4, 30), seg(1, 1, 1, 0))) is None  # too few prints
+    assert read_tape(fake(IMPULSE, {})) is None  # recent stretch not observed
+    assert read_tape(fake(IMPULSE, seg(1, 1, 1, 0), spread=20)) is None  # 30 bps < 2× a 20 bps spread
+    assert read_tape(fake(seg(3_000, 300, 60, 30), seg(1, 1, 1, 0))) is None  # dust: $3k is not an impulse
+
+
+def test_silent_recent_stretch_is_exhaustion_not_missing_data():
+    reading = read_tape(fake(IMPULSE, dict(buy_usd=0, sell_usd=0, trade_count=0)))
+    assert reading["kind"] == "exhaustion" and reading["recent"]["move_bps"] is None
+
+
+def test_card_shows_effort_result_and_the_facing_wall():
+    zone = dict(side="ask", price=100.05, notional_usd=95_000)
+    reading = read_tape(fake(IMPULSE, seg(200_000, 20_000, 40, 0.5)), zone=zone, midpoint=100)
+    lines = tape_lines(reading)
+    assert lines[0] == "⚡ Вероятно поглощение покупок · у предложения 100.05 ($95k)"
+    assert "Покупки $200k за 15с · темп ×1.3 к импульсу" in lines[1] and "импульс +30 б.п. за 30с" in lines[1]
+    assert lines[2] == "Цена за тот же объём: ×0.02 к импульсу"
+
+
+def test_segments_need_the_whole_span_observed():
+    now = 100
+    trades = [(now - 50 + i, 1000.0, f"r{i}", "B", 1 + i / 1000) for i in range(50)]
+    out = tape_segments(trades, now, truncated=False)
+    assert out["prior"]["complete"] and out["recent"]["complete"]
+    assert out["prior"]["buy_usd"] == 30_000 and out["recent"]["trade_count"] == 14  # prints at 86..99
+    assert out["recent"]["open_price"] == trades[35][4]  # last print at or before t=85
+    late = tape_segments(trades[30:], now, truncated=False)  # tape started 20s ago
+    assert not late["prior"]["complete"] and late["recent"]["complete"]
+    assert tape_segments(trades, now, truncated=True) is None
+
+
+def test_v3_facts_flow_into_the_packet_card_and_replay(tmp_path):
+    now = 200.0
+    facts = Facts(version=3)
+    archive = Archive(tmp_path / "history")
+    archive.record("source", dict(fact_version=3, assignment_mode="external_plan.v1"), 150)
+    assignment = dict(symbol="SMALL", assigned_at=150, state="focus", previous="scout", at=150, score=10)
+    facts.apply(archive.record("assignment", assignment, 150))
+    price, tid = 100.0, 0
+    for t in range(150, 201):
+        # 30 bps of buying-led travel up to t=185, then buyers keep hitting a price that no longer moves.
+        price = 100 * (1 + 0.003 * min(t - 155, 30) / 30) if t >= 155 else 100.0
+        tid += 1
+        trade = dict(coin="SMALL", time=t * 1000, px=str(price), sz="100", tid=tid, side="B")
+        facts.apply(archive.record("raw", dict(message=dict(channel="trades", data=[trade])), t, epoch="e"))
+    book = dict(coin="SMALL", time=now * 1000,
+                levels=[[dict(px="100.29", sz="10")], [dict(px="100.31", sz="10"), dict(px="100.32", sz="900")]])
+    facts.apply(archive.record("raw", dict(message=dict(channel="l2Book", data=book)), now, epoch="e"))
+    card = facts.card("SMALL", now)
+    archive.record("facts", card, now)
+    archive.close()
+    assert replay(archive.path)["verified"]
+    packet = build_packet(dict(policy_version=4, last_scout_at=now), {**assignment, "facts": card}, now)
+    state = summarize(packet)
+    assert state["tape"]["kind"] == "absorption"
+    assert state["tape_change"] == pytest.approx(30, abs=0.5)
+    text, _ = operational(packet, state, "flow_price_conflict", "situation")
+    assert "⚡ Вероятно поглощение покупок" in text and "Δ≤60с +0.30%" in text
+    json.dumps(state)  # stored as JSON in telegram_ux_events

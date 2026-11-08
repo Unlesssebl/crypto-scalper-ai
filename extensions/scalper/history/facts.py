@@ -16,6 +16,49 @@ def number(value):
     return n if math.isfinite(n) else None
 
 
+# Recent stretch vs the stretch before it: the comparison absorption/exhaustion is judged on.
+RECENT_SECONDS = 15
+PRIOR_SECONDS = 30
+
+
+def tape_segments(trades, now, truncated):
+    """Aggressor volume and trade-price travel for [now-15s, now] and the 30s before it.
+
+    A segment is reported only when its whole span was observed (a trade before its start
+    proves the tape was already flowing) and the window is not truncated.
+    """
+    if truncated or not trades:
+        return None
+    first_seen = trades[0][0]
+
+    def segment(start, end):
+        rows = [t for t in trades if start < t[0] <= end]
+        if first_seen > start + 2:
+            return dict(start=start, end=end, complete=False, trade_count=len(rows))
+        if not rows:
+            # A fully observed silent stretch is a measurement (no aggression), not missing data.
+            return dict(start=start, end=end, complete=True, trade_count=0, buy_usd=0.0, sell_usd=0.0,
+                        unknown_side=0)
+        before = [t for t in trades if t[0] <= start]
+        open_px = before[-1][4] if before else rows[0][4]
+        return dict(
+            start=start, end=end, complete=True, trade_count=len(rows),
+            buy_usd=sum(t[1] for t in rows if t[3] == "B"),
+            sell_usd=sum(t[1] for t in rows if t[3] == "A"),
+            unknown_side=sum(1 for t in rows if t[3] not in {"B", "A"}),
+            open_price=open_px, close_price=rows[-1][4],
+            price_change_bps=(rows[-1][4] / open_px - 1) * 10000,
+        )
+
+    recent_start = now - RECENT_SECONDS
+    return dict(
+        recent=segment(recent_start, now),
+        prior=segment(recent_start - PRIOR_SECONDS, recent_start),
+        window_change_bps=(trades[-1][4] / trades[0][4] - 1) * 10000,
+        window_seconds=now - first_seen,
+    )
+
+
 class Facts:
     def __init__(self, max_gap=15, version=1):
         self.version = version
@@ -114,7 +157,8 @@ class Facts:
             rows.popleft()
         if len(rows) == rows.maxlen:
             self.trade_truncated_at[symbol] = now
-        rows.append((now, px * sz, ref, t.get("side")))
+        # Price is the 5th element so v1/v2 cards (indices 0..3) replay unchanged.
+        rows.append((now, px * sz, ref, t.get("side"), px))
 
     def _book(self, book, now, epoch, ref):
         symbol, levels = book.get("coin"), book.get("levels")
@@ -205,7 +249,10 @@ class Facts:
             early = dict(observed_trade_count_60s=len(trades), last_trade_received_at=trades[-1][0] if trades else None,
                          observed_trade_imbalance=(buy - sell) / turnover
                          if known and turnover and not truncated else None)
-        return {**book, **early, "status": "observing", "densities": densities[:8],
+        segments = {}
+        if self.version >= 3:
+            segments = dict(tape_segments=tape_segments(trades, now, truncated))
+        return {**book, **early, **segments, "status": "observing", "densities": densities[:8],
                 "observed_turnover_60s_usd": turnover, "trade_window_truncated": truncated,
                 "trade_evidence": [t[2] for t in trades[-3:]],
                 "limitation": "Age since first continuous observation, not order age. Top-N absence is out of view."}

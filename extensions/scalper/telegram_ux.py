@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from .analytics_context import admission, fact_value
 from .context_auto import decide, summarize
 from .fact_packet import packet_ready
+from .microstructure import NOTABLE
+from .microstructure import label as microstructure_label
 from .notification_quality import NotificationQuality
 from .phase import PHASES
 from .tiger import TigerBridge
@@ -208,6 +210,49 @@ def discovery_gate(state):
     return None if tape + active + tradable_zone >= 2 else "discovery_quiet"
 
 
+def bps(x):
+    if abs(x) < 0.05:
+        return "0 б.п."
+    return f"{x:+.1f} б.п." if abs(x) < 10 else f"{x:+.0f} б.п."
+
+
+def times(x):
+    return f"×{number(x, 2)}" if x < 0.1 else f"×{number(x, 1)}"
+
+
+def tape_lines(reading, mid=None):
+    """Effort vs result: what the last 15s of aggression bought compared with the impulse before it."""
+    if not reading:
+        return []
+    up = reading["side"] > 0
+    head = "⚡ " + microstructure_label(reading) if reading["kind"] in NOTABLE else microstructure_label(reading)
+    wall = reading.get("wall")
+    if wall:
+        where = "предложения" if wall["side"] == "ask" else "спроса"
+        head += f" · у {where} {number(wall['price'], 8)}"
+        if wall.get("notional_usd"):
+            head += f" ({usd(wall['notional_usd'])})"
+    prior, recent = reading["prior"], reading["recent"]
+    aggressor = "Покупки" if up else "Продажи"
+    if reading["kind"] == "counter_aggression":
+        counter, against = ("Продажи", "покупок") if up else ("Покупки", "продаж")
+        effort = f"{counter} {usd(recent['opposite_usd'])} за {recent['seconds']}с"
+        effort += f" против {against} {usd(recent['aggressor_usd'])}"
+    else:
+        effort = f"{aggressor} {usd(recent['aggressor_usd'])} за {recent['seconds']}с"
+        if reading.get("effort_ratio") is not None:
+            effort += f" · темп {times(reading['effort_ratio'])} к импульсу"
+    travel = "сделок нет" if recent["move_bps"] is None else bps(recent["move_bps"])
+    lines = [head, effort + f" · цена {travel} (импульс {bps(prior['move_bps'])} за {prior['seconds']}с)"]
+    ratio = reading.get("efficiency_ratio")
+    if ratio is not None and reading["kind"] != "counter_aggression":
+        if ratio <= 0:
+            lines.append("Цена за тот же объём: не продвигается")
+        else:
+            lines.append(f"Цена за тот же объём: {times(ratio)} к импульсу")
+    return lines
+
+
 def operational(packet, state, reason, kind, ratio=None, pulse=None):
     raw = packet["symbol"]
     binance = raw.startswith("BINANCE:")
@@ -220,6 +265,7 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         title = "Усиление: " + ("новый значимый уровень" if reason == "new_level" else "ситуация заметно усилилась")
     arrow, tape = flow_side(state)
     parts = [f"<b>{arrow + ' ' if arrow else ''}{symbol}</b> · {title}"]
+    parts.extend(tape_lines(state.get("tape"), state.get("midpoint")))
 
     if tape:
         # Activity below the norm contradicts any "active" title; only an excess is informative.
@@ -238,6 +284,9 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
         metrics.append(label + small(state["spread"]) + " б.п.")
     if state.get("change") is not None:
         metrics.append(f"Δ1м {state['change'] / 100:+.2f}%")
+    elif state.get("tape_change") is not None:
+        # Trade-price travel over the observed tape when the native 1m frame is absent.
+        metrics.append(f"Δ≤60с {state['tape_change'] / 100:+.2f}%")
     natr = value(packet, "context.1m.natr")
     if natr is not None:
         metrics.append(f"NATR {small(natr, 2)}%")

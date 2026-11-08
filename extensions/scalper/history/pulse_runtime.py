@@ -27,7 +27,7 @@ class PulseObservation(Observation):
         self.plan_error = None
         self.plan_status = "waiting"
         self.last_plan_at = None
-        self._record("source", dict(fact_version=2, assignment_mode="external_plan.v1"), time.time())
+        self._record("source", dict(fact_version=3, assignment_mode="external_plan.v1"), time.time())
         self.task = asyncio.create_task(self.run(), name="pulse-native-consumer")
 
     async def get(self, path, **params):

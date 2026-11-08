@@ -6,6 +6,7 @@ from copy import deepcopy
 
 from .analytics_context import analytical_state
 from .fact_packet import canonical, checksum, packet_ready
+from .microstructure import read_tape
 
 REASONS = {
     "interesting_instrument": "инструмент выделяется относительно собственной обычной активности",
@@ -65,7 +66,10 @@ def summarize(packet):
         name: {k: facts.get(key, {}).get(k) for k in ("observed_at", "source_time", "evidence")}
         for name, key in source_ids.items()
     }
+    zone = zones[0] if zones else None
     return dict(
+        tape=read_tape(packet, value("book.spread_bps"), zone, value("book.midpoint")),
+        tape_change=value("tape.window_change_bps"),
         at=midpoint.get("observed_at"),
         midpoint=value("book.midpoint"),
         sources=sources,
@@ -77,7 +81,7 @@ def summarize(packet):
         change=value("frame.1m.observed_price_change_bps"),
         activity=value("activity.relative_score"),
         spread=value("book.spread_bps"),
-        zone=zones[0] if zones else None,
+        zone=zone,
         **analytical_state(packet),
     )
 
