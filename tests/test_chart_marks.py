@@ -77,3 +77,31 @@ def test_marks_return_the_sent_card_for_the_chart_instrument(service):
     assert not any("Hyperliquid ·" in line for line in mark["lines"])  # footer is the chart's own axis
     assert chart_marks(service, "ETHUSDT", "BINANCE-FUT", 60, now + 1)["marks"] == []
     assert chart_marks(service, "BTCUSDT", "BINANCE-FUT", 1, now + 3600)["marks"] == []  # outside the window
+
+
+def test_episode_updates_fold_into_one_marker_and_levels_are_bands_only(service):
+    import json
+
+    now = time.time()
+    observe(service, now)
+    db = service.journal.db
+    row = dict(db.execute("SELECT * FROM telegram_ux_events").fetchone())
+    state = json.loads(row["state"])
+
+    def add(ident, at, channel, reason, state_):
+        with db:
+            db.execute("INSERT INTO telegram_ux_events(id,episode,at,reason,status,packet,state,channel) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (ident, row["episode"], at, reason, "queued", row["packet"],
+                                                   json.dumps(state_), channel))
+
+    add(None, row["at"] + 30, "anomalies", "active_instrument", state)  # the same episode 30s later
+    level = dict(state, level=dict(kind="approach", zone=dict(side="ask", price=10.02, notional_usd=5_000,
+                                                              observed_age_seconds=60,
+                                                              size_to_observed_turnover=0.5)))
+    add(None, row["at"] + 40, "levels", "level_approach", level)
+    add(None, row["at"] + 700, "anomalies", "active_instrument", state)  # past the fold window: its own
+    marks = chart_marks(service, "BTCUSDT", "BINANCE-FUT", 60, now + 800)["marks"]
+    signals = [m for m in marks if m["kind"] == "signal"]
+    assert len(signals) == 2 and any(line.startswith("↻ ") for line in signals[0]["lines"])
+    [band] = [m for m in marks if m["kind"] == "level"]
+    assert band["lines"] == [] and band["zone"]["side"] == "ask" and band["zone"]["price"] == 10.02

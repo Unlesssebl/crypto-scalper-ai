@@ -9,11 +9,14 @@ say the same thing. Read-only: nothing here changes screener state.
 import html
 import json
 import re
+import time
 
 from .context_auto import summarize
 from .fact_packet import packet_ready
 from .signal_outcomes import SignalOutcomes
 from .telegram_ux import number, operational, usd
+
+EPISODE_FOLD_SECONDS = 600  # cards of one episode within 10 minutes share one chart marker
 
 TAG = re.compile(r"<[^>]+>")
 QUOTES = ("USDT", "USDC", "BUSD", "USD")
@@ -141,19 +144,40 @@ def chart_marks(service, code, exchange, minutes, now):
     minutes = max(1, min(int(minutes), 24 * 60))
     marks = []
     rows = service.journal.db.execute(
-        "SELECT e.at,e.reason,e.state,e.packet,p.symbol FROM telegram_ux_events e "
+        "SELECT e.at,e.reason,e.state,e.packet,p.symbol,e.channel,e.episode FROM telegram_ux_events e "
         "JOIN fact_packets p ON p.id=e.packet WHERE e.status='queued' AND p.symbol IN (?,?) AND e.at>=? "
         "ORDER BY e.at",
         (symbols[0], symbols[-1], now - minutes * 60),
     ).fetchall()
-    for at, reason, state_json, packet_id, symbol in rows:
+    primary = {}  # episode -> its first signal mark on the chart
+    for at, reason, state_json, packet_id, symbol, channel, episode in rows:
         packet = service.consistency.packet(packet_id)
         if packet is None:
             continue
         state = json.loads(state_json)
+        if channel == "levels":
+            # A level is a band on the chart, not a signal: no marker, caption or outcome of its own.
+            level = state.get("level") or {}
+            zone = level.get("zone") or state.get("zone")
+            if zone:
+                marks.append(dict(at=int(at * 1000), symbol=symbol, kind="level", price=state.get("midpoint"),
+                                  side=0, lines=[], zone=zone_of(at, zone), reason=reason))
+            continue
         kind = "strengthening" if reason in {"strengthened", "new_level"} else "situation"
         text, _ = operational(packet, state, reason, kind, state.get("ratio"), state.get("pulse"))
-        marks.append(mark_of(at, symbol, reason, state, text))
+        mark = mark_of(at, symbol, reason, state, text)
+        first = primary.get(episode)
+        if first is not None and at * 1000 - first["at"] <= EPISODE_FOLD_SECONDS * 1000:
+            # Later cards of one episode fold into its first marker: the hover lists them, the chart shows one.
+            verdict = mark["lines"][1] if len(mark["lines"]) > 1 else mark["lines"][0] if mark["lines"] else ""
+            stamp = time.strftime("%H:%M:%S", time.localtime(at))
+            first["lines"].append(f"↻ {stamp} · {verdict}")
+            if mark.get("zone"):
+                first["zone"] = mark["zone"]
+            continue
+        mark["kind"] = "signal"
+        primary[episode] = mark
+        marks.append(mark)
     out["marks"] = marks
     for symbol in symbols:
         packet = (getattr(service, "context_packets", None) or {}).get(symbol)

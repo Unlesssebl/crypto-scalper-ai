@@ -119,6 +119,7 @@ namespace TigerTrade.Chart.Indicators.Custom
         private sealed class Mark
         {
             public long At;
+            public string Kind;  // "signal" or "level" (a level is drawn as its band only)
             public double? Price;
             public int Side;
             public string Strength;
@@ -295,6 +296,7 @@ namespace TigerTrade.Chart.Indicators.Custom
             var mark = new Mark
             {
                 At = (long)(Number(e, "at") ?? 0),
+                Kind = Str(e, "kind") ?? "signal",
                 Price = Number(e, "price"),
                 Side = (int)(Number(e, "side") ?? 0),
                 Strength = Str(e, "strength"),
@@ -411,7 +413,7 @@ namespace TigerTrade.Chart.Indicators.Custom
             var font = new XFont(Canvas.ChartFont.Name, _textSize);
             var small = new XFont(Canvas.ChartFont.Name, Math.Max(8, _textSize - 2));
             var placed = new List<Placed>();
-            var outcomeLabels = new List<Rect>();  // outcome captions already drawn this frame
+            var labels = new List<Rect>();  // captions already drawn this frame: none may print over another
 
             if (data != null)
             {
@@ -433,15 +435,17 @@ namespace TigerTrade.Chart.Indicators.Custom
                     if (index < 0 || index > last)
                         continue;
                     var alpha = Alpha(mark.At);
-                    if (mark.ZonePrice != null && mark != latestZone)
-                        DrawZone(visual, mark, offset, false, small, (byte)(alpha / 2));
+                    // Past densities are not drawn: where a level stood until some card says nothing about what
+                    // happened to it next. Only the latest zone (below) runs to the edge.
+                    if (mark.Kind == "level")
+                        continue;  // levels-bot events: the band is the whole story, no marker or outcome
                     if (_showOutcome)
-                        DrawOutcome(visual, mark, index, offset, small, alpha, outcomeLabels);
+                        DrawOutcome(visual, mark, index, offset, small, alpha, labels);
                     if (index < first)
                         continue;
                     if (_showImpulse)
                         DrawImpulse(visual, mark, index, offset, alpha);
-                    DrawMarker(visual, mark, index, font, alpha);
+                    DrawMarker(visual, mark, index, font, alpha, labels);
                     placed.Add(new Placed { Index = index, Mark = mark });
                 }
                 if (latestZone?.ZonePrice != null)
@@ -451,7 +455,7 @@ namespace TigerTrade.Chart.Indicators.Custom
             DrawPanel(visual, data, error, font, placed.Count);
         }
 
-        private void DrawMarker(DxVisualQueue visual, Mark mark, int index, XFont font, byte alpha)
+        private void DrawMarker(DxVisualQueue visual, Mark mark, int index, XFont font, byte alpha, List<Rect> taken)
         {
             var x = GetX(index);
             var y = GetY(mark.Price.Value);
@@ -471,7 +475,16 @@ namespace TigerTrade.Chart.Indicators.Custom
             }
             var verdict = Text(mark.Lines.Count > 1 ? mark.Lines[1] : mark.Lines.Count > 0 ? mark.Lines[0] : "");
             var prefix = (mark.Strength == "strong" ? "!! " : "") + (mark.Tier.HasValue ? $"T{mark.Tier} " : "");
-            visual.DrawString(prefix + verdict, font, brush, x + size + 3, labelY, XTextAlignment.Left);
+            // Several signals on one bar at nearly one price: step each caption away from the price (down under
+            // a buy, up over a sell) until it clears every caption already drawn.
+            var text = prefix + verdict;
+            var height = _textSize * 1.3;
+            var rect = new Rect(x + size + 3, labelY, text.Length * _textSize * 0.6, height);
+            var step = mark.Side > 0 ? height : -height;
+            while (taken.Exists(r => r.IntersectsWith(rect)))
+                rect.Y += step;
+            taken.Add(rect);
+            visual.DrawString(text, font, brush, rect.X, rect.Y, XTextAlignment.Left);
         }
 
         // Impulse leg (start of the 30s impulse → signal) and two 15s volume bars beside the marker.
@@ -514,7 +527,9 @@ namespace TigerTrade.Chart.Indicators.Custom
             if (horizon - mark.At < 20000)
                 return;  // too early to say anything
             var endIndex = BarIndex(ChartTime(horizon, offset));
-            if (endIndex < index || endIndex >= count)
+            // The signal bar itself is skipped below, so until the next bar opens there is nothing to measure:
+            // no caption rather than "в пользу 0.00% · против 0.00%".
+            if (endIndex <= index || endIndex >= count)
                 return;
             double high = price, low = price;
             // The signal bar is skipped: most of its range happened before the card.
@@ -588,13 +603,14 @@ namespace TigerTrade.Chart.Indicators.Custom
             if (!_showPanel)
                 return;
             var card = new List<string>();
-            var panelMark = data?.Live ?? (data != null && data.Marks.Count > 0 ? data.Marks[data.Marks.Count - 1] : null);
+            var signals = data?.Marks.FindAll(m => m.Kind != "level") ?? new List<Mark>();
+            var panelMark = data?.Live ?? (signals.Count > 0 ? signals[signals.Count - 1] : null);
             if (panelMark != null)
                 foreach (var line in panelMark.Lines)
                     card.Add(Text(line));
             var notes = new List<string>();
-            if (data != null && data.Marks.Count > 0 && drawn == 0)
-                notes.Add($"сигналов за {_minutes} мин: {data.Marks.Count}, все вне видимой части графика");
+            if (signals.Count > 0 && drawn == 0)
+                notes.Add($"сигналов за {_minutes} мин: {signals.Count}, все вне видимой части графика");
             if (data != null && data.Live == null && panelMark != null)
                 notes.Add("последний сигнал; инструмент сейчас вне внимания скринера");
             if (data != null && panelMark == null)
@@ -677,7 +693,7 @@ namespace TigerTrade.Chart.Indicators.Custom
             long newest = 0;
             Mark latest = null;
             foreach (var mark in data.Marks)
-                if (mark.At > newest) { newest = mark.At; latest = mark; }
+                if (mark.Kind != "level" && mark.At > newest) { newest = mark.At; latest = mark; }
             if (_alertedAt < 0)
             {
                 _alertedAt = newest;  // history on first load is not news
