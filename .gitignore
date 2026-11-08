@@ -29,3 +29,7 @@ venv/
 .runtime/
 *.sqlite-wal
 *.sqlite-shm
+
+# TigerTrade indicator build output
+integrations/tigertrade/**/bin/
+integrations/tigertrade/**/obj/

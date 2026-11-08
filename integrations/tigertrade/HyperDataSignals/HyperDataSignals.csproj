@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- TigerTrade indicator: screener signals on the chart. Build: dotnet build -c Release,
+       then copy bin/Release/net10.0-windows/HyperDataSignals.dll to Documents\TigerTrade\Indicators. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>HyperDataSignals</AssemblyName>
+    <RootNamespace>TigerTrade.Chart.Indicators.Custom</RootNamespace>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Where TigerTrade is installed; its assemblies are referenced, never copied. -->
+    <TigerTradeDir Condition="'$(TigerTradeDir)' == ''">C:\Program Files (x86)\TigerTrade</TigerTradeDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TigerTrade.Chart">
+      <HintPath>$(TigerTradeDir)\TigerTrade.Chart.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TigerTrade.Core">
+      <HintPath>$(TigerTradeDir)\TigerTrade.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TigerTrade.Dx">
+      <HintPath>$(TigerTradeDir)\TigerTrade.Dx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
