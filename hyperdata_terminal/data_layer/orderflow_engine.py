@@ -746,8 +746,13 @@ class OrderFlowEngine:
 
     async def set_attention_symbols(self, symbols: list[str]) -> None:
         """One stable shard per selected coin; other selected feeds stay connected."""
-        if not self.selective or len(symbols) > 8:
-            raise ValueError("selective engine required; at most eight symbols")
+        # Own Hyperliquid sockets use one of 8 shards per symbol; with Market Pulse owning the tape
+        # (unified run) this is bookkeeping only and follows the plan contract's detail limit.
+        from hyperdata_terminal.market_pulse.control import MAX_DETAIL
+
+        limit = MAX_DETAIL if self.pulse_external else len(self._hl_shard_plan) or 8
+        if not self.selective or len(symbols) > limit:
+            raise ValueError(f"selective engine required; at most {limit} symbols")
         wanted = set(symbols)
         if self.pulse_external:
             for symbol in set(self.symbols) - wanted:

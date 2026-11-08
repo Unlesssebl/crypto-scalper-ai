@@ -17,7 +17,7 @@ def discovery_packet(now=100, *, live=False, potential=True, healthy=True, sprea
     card = dict(status="observing", received_at=now, midpoint=1, spread_bps=spread,
                 observed_levels=[20, 20], evidence="run:book", densities=[],
                 observed_trade_count_60s=trades if live else 0, observed_trade_imbalance=imbalance,
-                observed_turnover_60s_usd=10 if live else 0,
+                observed_turnover_60s_usd=100_000 if live else 0,  # x2.9 of a $50M day
                 last_trade_received_at=now if live else None, trade_window_truncated=False)
     assignment = dict(symbol="NEW", assigned_at=90, state="focus" if live else "probe", score=7,
                       facts=card, quality=dict(confirmed=live, price_reaction_confirmed=False),

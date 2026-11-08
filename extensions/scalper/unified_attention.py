@@ -4,24 +4,29 @@ import json
 import math
 from collections import deque
 
+from hyperdata_terminal.market_pulse.control import MAX_DETAIL, MAX_SELECTED
+
 from .movers import MoversSelector
 from .relative_attention import Attention, AttentionPolicy
 
-# The native hub accepts at most 8 detail subscriptions; movers take what anomalies leave of it.
-MAX_DETAIL = 8
+# The plan contract allows MAX_DETAIL order books; movers take what anomalies leave of it.
+# Each instrument's norm survives a restart (or a short absence from the overview) this long.
+BASELINE_KEEP_SECONDS = 900
+MOVERS_SAVE_SECONDS = 60
 
 
 class UnifiedAttention:
     def __init__(self, journal, *, slots=20, detail_slots=6, hold_seconds=600, movers_slots=2):
         if (type(slots) is not int or type(detail_slots) is not int
-                or not 1 <= detail_slots <= min(slots, 8) or slots > 20
+                or not 1 <= detail_slots <= min(slots, MAX_DETAIL) or slots > MAX_SELECTED
                 or type(hold_seconds) is not int or not 60 <= hold_seconds <= 3600):
-            raise ValueError("attention requires 1..20 overview slots, 1..8 detail slots, and 60..3600s context hold")
+            raise ValueError(f"attention requires 1..{MAX_SELECTED} overview slots, 1..{MAX_DETAIL} detail slots, "
+                             "and 60..3600s context hold")
         self.requested_hold_seconds = hold_seconds
         self.journal, self.slots = journal, slots
         self.engine = Attention(
             AttentionPolicy(version=6, slots=detail_slots, context_slots=min(2, detail_slots), probe_seconds=90,
-                            context_seconds=max(330, hold_seconds))
+                            context_seconds=max(330, hold_seconds), baseline_keep_seconds=BASELINE_KEEP_SECONDS)
         )
         self.activity, self.selected, self.feedback = {}, {}, {}
         # Liquid movers never compete with anomalies for the relative allocator's slots.
@@ -35,6 +40,10 @@ class UnifiedAttention:
             ).fetchone()
             if saved:
                 self.restore(json.loads(saved[0]))
+            saved = journal.db.execute("SELECT value FROM scalper_settings WHERE name='movers.v1'").fetchone()
+            if saved:
+                self.movers.restore(json.loads(saved[0]))
+        self._movers_saved_at = 0.0
 
     def restore(self, state):
         for name in ("previous", "scouts", "active"):
@@ -125,6 +134,12 @@ class UnifiedAttention:
                     "INSERT OR REPLACE INTO scalper_settings VALUES(?,?)",
                     ("unified_attention.v6", json.dumps(self.state())),
                 )
+                if now - self._movers_saved_at >= MOVERS_SAVE_SECONDS:
+                    self._movers_saved_at = now
+                    self.journal.db.execute(
+                        "INSERT OR REPLACE INTO scalper_settings VALUES(?,?)",
+                        ("movers.v1", json.dumps(self.movers.state())),
+                    )
         return chosen
 
     def volatility(self, now):

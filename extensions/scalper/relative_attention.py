@@ -22,6 +22,10 @@ class AttentionPolicy:
     min_focus_seconds: float = 60
     cooling_seconds: float = 60
     stale_seconds: float = 30
+    # A gap longer than stale_seconds never yields an interval sample. 0 (the default, replay-compatible)
+    # also drops the instrument's baselines; a positive value keeps them across gaps up to this long, so
+    # a restart does not throw away each instrument's norm (baselines are rates, not interval totals).
+    baseline_keep_seconds: float = 0
     context_slots: int = 2
     context_seconds: float = 600
 
@@ -35,16 +39,18 @@ class AttentionPolicy:
             raise ValueError("finite numeric policy fields required")
         if any(type(v) is not int for v in (self.slots, self.context_slots, self.baseline_samples, self.baseline_size)):
             raise ValueError("integer capacities required")
-        if not 1 <= self.slots <= 8:
-            raise ValueError("attention slots must be 1..8")
-        if not 1 <= self.context_slots <= 8 or self.context_seconds < 330:
-            raise ValueError("context requires at least 330 seconds and 1..8 slots")
+        if not 1 <= self.slots <= 20:
+            raise ValueError("attention slots must be 1..20")
+        if not 1 <= self.context_slots <= 20 or self.context_seconds < 330:
+            raise ValueError("context requires at least 330 seconds and 1..20 slots")
         if not 3 <= self.baseline_samples <= self.baseline_size:
             raise ValueError("invalid baseline size")
         if not 0 < self.release_ratio < self.probe_ratio < self.focus_ratio:
             raise ValueError("attention thresholds must have hysteresis")
         if self.min_activity_usd < 0 or self.severe_move_ratio <= self.probe_ratio:
             raise ValueError("invalid optional floor or movement threshold")
+        if self.baseline_keep_seconds < 0:
+            raise ValueError("baseline keep must be non-negative")
         if min(self.min_probe_seconds, self.min_focus_seconds, self.cooling_seconds, self.stale_seconds) <= 0:
             raise ValueError("positive attention thresholds required")
         if self.probe_seconds < self.min_probe_seconds:
@@ -183,8 +189,10 @@ class Attention:
             movements = self.movement_baselines.setdefault(symbol, deque(maxlen=p.baseline_size))
             valid = previous is not None and 0 < now - previous[0] <= p.stale_seconds
             if not valid:
-                baseline.clear()
-                movements.clear()
+                keep = previous is not None and 0 < now - previous[0] <= p.baseline_keep_seconds
+                if not keep:
+                    baseline.clear()
+                    movements.clear()
                 rate, move_rate = None, None
             else:
                 elapsed = now - previous[0]

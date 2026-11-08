@@ -260,6 +260,30 @@ def route(tier, strength):
     return "silent" if tier <= 2 else "watch"
 
 
+# The allocator compares an instrument with its last 10-15 minutes, so a coin that was dead and wakes up to
+# half its usual pace looks like a 3-6x burst. A card also needs the instrument busy for its own DAY: the
+# last 60s turnover against the average minute of its 24h volume. Journal 05-08.11 (161 cards, 120 scored):
+# below 1x — 47% of cards, 43% went the card's way; 2x and above — 56-60%. Initial values, to revisit.
+DAY_PACE_MIN = 1.0  # below: no card (the observers still record everything)
+DAY_PACE_ALERT = 2.0  # below: never with sound
+
+
+def day_pace(volume_24h, turnover_60s):
+    """Last 60s turnover in average minutes of the instrument's own 24h volume, or None if unknown."""
+    if not all(type(x) in (int, float) and math.isfinite(x) and x > 0 for x in (volume_24h, turnover_60s)):
+        return None
+    return turnover_60s / (volume_24h / 1440)
+
+
+def paced(route_name, pace):
+    """Route after the day-pace check; unknown pace keeps the liquidity/strength route."""
+    if pace is None or route_name == "watch":
+        return route_name
+    if pace < DAY_PACE_MIN:
+        return "watch"
+    return "silent" if route_name == "alert" and pace < DAY_PACE_ALERT else route_name
+
+
 TIGER_BUTTON_SECONDS = 1800  # the TigerTrade button works for 30 minutes after the card
 STRENGTH_MARKS = {"strong": "🔥", "notable": "🔸"}
 
@@ -398,6 +422,9 @@ def zone_line(state):
     zone, mid = state.get("zone"), state.get("midpoint")
     if not zone:
         return None
+    eat = zone.get("size_to_observed_turnover")
+    if eat is not None and eat * 60 < PUSH_ZONE_EAT_SECONDS[0]:
+        return None  # traded through in seconds at this pace: not a level, whatever its relative size
     wall = (state.get("tape") or {}).get("wall")
     on_path = bool(wall and wall["price"] == zone["price"])
     side = "Спрос" if zone["side"] == "bid" else "Предложение"
@@ -494,6 +521,8 @@ def operational(packet, state, reason, kind, ratio=None, pulse=None):
             line = f"{share_bar((flow + 1) / 2)} {side}"
             turnover = state.get("turnover_60s")
             line += f" · {usd(turnover)}/мин" if turnover else f" · {int(count)} сделок/мин"
+            if state.get("day_pace") is not None:
+                line += f" · ×{state['day_pace']:.1f} к дню"  # its own average minute over 24h
             parts.append(line)
             # Activity below the norm contradicts any "active" title; only an excess is informative.
             if ratio is not None and ratio >= 1.5:
@@ -841,6 +870,13 @@ class TelegramUX:
             )
             state["strength"] = signal_strength(state, discovery)
             state["route"] = route(state["tier"], state["strength"])
+            state["day_pace"] = day_pace(getattr(asset, "volume_24h", None), state["turnover_60s"])
+            if not mover:
+                # Movers are chosen for a liquid, sustained move already; anomalies must be busy for their day.
+                base, state["route"] = state["route"], paced(state["route"], state["day_pace"])
+                if base != "watch" and state["route"] == "watch":
+                    self.quality.record(packet, state, "blocked", "watch_slow_day_pace")
+                    continue
             if state["route"] == "watch":
                 # Found, but not worth an interruption at this liquidity/strength: quiet watch list only.
                 self.quality.record(packet, state, "blocked", f"watch_t{state['tier']}_{state['strength']}")

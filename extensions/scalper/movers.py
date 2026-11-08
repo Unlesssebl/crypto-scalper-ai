@@ -6,7 +6,8 @@ slot to illiquid spikes. This selector picks such instruments separately and res
 slots; their cards go to the movers bot (docs/multi-bot-plan.md).
 
 Eligible: T1–T2 by the venue's 24h volume. Moving: |1h| ≥ 2% from this process's own price samples
-(needs ~50 minutes of history), or |24h| ≥ 20%. Thresholds are initial engineering values.
+(needs ~50 minutes of history; samples every 30s are saved in the journal, so a restart keeps them), or
+|24h| ≥ 20%. Thresholds are initial engineering values.
 `price_change_24h_pct` from /v1/market is a fraction (2.87 = +287%), not percent.
 """
 
@@ -20,6 +21,7 @@ HISTORY_SECONDS = 3900
 MIN_HOUR_SPAN = 3000  # an "hourly" change needs at least 50 minutes of samples
 HOLD_SECONDS = 600  # a pick keeps its slot this long unless it stops being liquid
 STALE_SECONDS = 120
+SAMPLE_SECONDS = 30  # an hourly change needs no finer history; keeps the saved state small
 
 
 def finite(x):
@@ -44,19 +46,35 @@ class MoversSelector:
                 self.latest.pop(symbol, None)
                 continue
             rows = self.history.setdefault(symbol, deque())
-            rows.append((now, float(price)))
+            if not rows or now - rows[-1][0] >= SAMPLE_SECONDS:
+                rows.append((now, float(price)))
             while rows and now - rows[0][0] > HISTORY_SECONDS:
                 rows.popleft()
             change = a.get("price_change_24h_pct")
             self.latest[symbol] = dict(price=float(price), volume_24h=float(volume), t=now,
                                        change_24h=float(change) if finite(change) else None)
 
+    def state(self):
+        return {s: [[round(t, 1), p] for t, p in rows] for s, rows in self.history.items()}
+
+    def restore(self, state, now=None):
+        """Price samples from a previous run; the 1h change then works right after a restart."""
+        import time
+
+        now = time.time() if now is None else now
+        for symbol, rows in (state or {}).items():
+            kept = deque((float(t), float(p)) for t, p in rows
+                         if finite(t) and finite(p) and p > 0 and 0 <= now - t <= HISTORY_SECONDS)
+            if kept:
+                self.history[symbol] = kept
+
     def change_1h(self, symbol, now):
         rows = self.history.get(symbol)
         if not rows or now - rows[0][0] < MIN_HOUR_SPAN:
             return None
         anchor = next((p for t, p in rows if t >= now - 3600), rows[0][1])
-        return rows[-1][1] / anchor - 1
+        current = (self.latest.get(symbol) or {}).get("price", rows[-1][1])  # samples are 30s apart
+        return current / anchor - 1
 
     def score(self, symbol, now):
         info = self.latest.get(symbol)

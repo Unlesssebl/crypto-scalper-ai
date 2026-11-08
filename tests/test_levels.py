@@ -9,7 +9,7 @@ import pytest
 from extensions.scalper.channels import load_channels
 from extensions.scalper.fact_packet import build_packet
 from extensions.scalper.levels import LevelWatcher, zones_of
-from extensions.scalper.signal_outcomes import HORIZON, SETTLE
+from extensions.scalper.signal_outcomes import SCORE_AFTER
 from tests.test_signal_outcomes import Hub, bars
 from tests.test_telegram_product import service as service
 
@@ -96,7 +96,7 @@ async def test_level_cards_go_to_the_levels_bot_and_score_as_hold(service, monke
     assert state["level"]["zone"]["side"] == "bid"
     start = int(now // 60 * 60)
     candles = bars(*[(100.2, 99.7, 100)] + [(100.6, 99.9, 100.4)] * 6, start=start)
-    await service.ux.outcomes.once(Hub(candles), now + 20 + HORIZON + SETTLE + 1)
+    await service.ux.outcomes.once(Hub(candles), now + 20 + SCORE_AFTER + 1)
     sides = {r[0] for r in service.journal.db.execute("SELECT side FROM signal_outcomes")}
     assert sides == {1}  # "the bid held": scored upward regardless of the tape arrow
 

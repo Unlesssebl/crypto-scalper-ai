@@ -75,32 +75,52 @@ def senders_by_destination(channels):
 
 
 def stats_text(service, channel, now=None):
-    """/stats: this bot's cards over 24h and 7 days and how the scored ones turned out after 5 minutes."""
+    """/stats: this bot's cards over 24h and 7 days, judged by the barrier rule against their background."""
     now = time.time() if now is None else now
     outcomes = service.telegram_ux.outcomes
     lines = [f"<b>{channel.spec.title} · статистика</b>"]
+
+    def share(part, whole):
+        return f"{part / whole * 100:.0f}%"
+
+    def background(v):
+        return f" · фон {v['base_rate'] * 100:.0f}%" if v["base_rate"] is not None else ""
+
     for hours, label in ((24, "24 часа"), (24 * 7, "7 дней")):
         s = outcomes.channel_summary(channel.name, now, hours)
         line = f"<b>{label}:</b> сигналов {s['sent']}"
-        if s["sided"]:
-            share = s["right"] / s["sided"] * 100
-            line += f" · со стороной {s['right']} из {s['sided']} в плюс через 5м ({share:.0f}%)"
-            if s["favour_pct"] is not None:
-                line += f" · ср. в пользу {s['favour_pct']:.2f}% / против {s['against_pct']:.2f}%"
-        if s["neutral"]:
-            line += f" · без стороны {s['neutral']}"
         if s["pending"]:
             line += f" · ждут оценки {s['pending']}"
-        if s["sided"] and s["sided"] < 30:
+        sided, unsided = s["sided_verdict"], s["neutral_verdict"]
+        if sided["judged"] and sided["judged"] < 30:
             line += " · мало данных"
         lines.append(line)
-        for row in s["by_strength"]:
-            if row["sided"]:
-                lines.append(
-                    f"  {'🔥 сильные' if row['strength'] == 'strong' else '🔸 заметные'}: "
-                    f"{row['right']} из {row['sided']} в плюс"
-                )
-    lines.append("<i>Наблюдение после отбора, не торговый результат: без входа, комиссий и проскальзывания.</i>")
+        if sided["judged"]:
+            n = sided["judged"]
+            lines.append(
+                f"  Со стороной {n}: ✅ подтвердилось {sided['hit']} ({share(sided['hit'], n)}) · "
+                f"❌ против {sided['failed']} · ➖ без движения {sided['flat']}{background(sided)}"
+            )
+            for row in s["by_strength"]:
+                if row["judged"]:
+                    lines.append(
+                        f"    {'🔥 сильные' if row['strength'] == 'strong' else '🔸 заметные'}: "
+                        f"подтвердилось {row['hit']} из {row['judged']}{background(row)}"
+                    )
+        if unsided["judged"]:
+            n = unsided["judged"]
+            lines.append(
+                f"  Без стороны {n}: заметное движение {unsided['hit']} ({share(unsided['hit'], n)})"
+                f"{background(unsided)}"
+            )
+        unjudged = sided["unjudged"] + unsided["unjudged"]
+        if unjudged:
+            lines.append(f"  Без оценки {unjudged}: не хватило свечей до или после карточки")
+    lines.append(
+        "<i>Подтвердилось — цена прошла обычный 5-минутный размах монеты в сторону сигнала раньше, чем столько "
+        "же против, за 15 минут. Фон — как часто то же правило срабатывало у этой монеты в течение часа до "
+        "карточки. Наблюдение после отбора, не торговый результат: без входа, комиссий и проскальзывания.</i>"
+    )
     return "\n".join(lines)
 
 

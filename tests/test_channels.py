@@ -9,9 +9,9 @@ import pytest
 from extensions.scalper.channels import handle_update, load_channels, senders_by_destination, stats_text
 from extensions.scalper.delivery import CardOutbox
 from extensions.scalper.liquidation_context import LiquidationContext, liquidation_line
-from extensions.scalper.signal_outcomes import HORIZON, SETTLE
+from extensions.scalper.signal_outcomes import SCORE_AFTER
 from extensions.scalper.telegram_ux import operational, usd
-from tests.test_signal_outcomes import Hub, bars
+from tests.test_signal_outcomes import QUIET, Hub, bars, history
 from tests.test_telegram_product import observe, packet
 from tests.test_telegram_product import service as service
 
@@ -49,14 +49,16 @@ async def test_stats_counts_only_this_bots_cards(service):
     observe(service, now)  # a T1 notable ▲ BTC card from the anomalies bot
     sent_at = service.journal.db.execute("SELECT at FROM telegram_ux_events").fetchone()[0]
     start = int(sent_at // 60 * 60)
-    candles = bars(*[(10.5, 9.5, 10)] + [(10.4, 9.9, 10.2)] * 6, start=start)
-    await service.ux.outcomes.once(Hub(candles), sent_at + HORIZON + SETTLE + 1)
+    # A quiet hour (1% range, the background never reaches it), then the card and a 2% rise.
+    candles = bars(*history(), (10.05, 9.95, 10), (10.2, 9.97, 10.2), *[QUIET] * 15, start=start - 75 * 60)
+    await service.ux.outcomes.once(Hub(candles), sent_at + SCORE_AFTER + 1)
     service.telegram_ux = service.ux
     channels = load_channels(service.hub.alerts)
-    text = stats_text(service, channels["anomalies"], sent_at + HORIZON + SETTLE + 2)
-    assert "сигналов 1 · со стороной 1 из 1 в плюс через 5м (100%)" in text and "мало данных" in text
-    assert "🔸 заметные: 1 из 1 в плюс" in text
-    assert "сигналов 0" in stats_text(service, channels["movers"], sent_at + HORIZON + SETTLE + 2)
+    text = stats_text(service, channels["anomalies"], sent_at + SCORE_AFTER + 2)
+    assert "сигналов 1 · мало данных" in text
+    assert "Со стороной 1: ✅ подтвердилось 1 (100%) · ❌ против 0 · ➖ без движения 0 · фон 0%" in text
+    assert "🔸 заметные: подтвердилось 1 из 1 · фон 0%" in text
+    assert "сигналов 0" in stats_text(service, channels["movers"], sent_at + SCORE_AFTER + 2)
 
 
 @pytest.mark.asyncio

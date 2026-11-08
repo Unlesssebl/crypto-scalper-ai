@@ -87,3 +87,24 @@ def test_strong_liquid_card_alerts_with_sound_and_toast(service, monkeypatch):
     row = operations(service)[0]
     assert row["silent"] == 0 and row["text"].startswith("<b>🔥 T1 ")
     assert service.ux.desktop.shown == ["BTC"]
+
+
+def test_card_hides_a_level_traded_through_in_seconds():
+    from extensions.scalper.telegram_ux import zone_line
+
+    zone = dict(price=1.4914, side="bid", notional_usd=914.0, relative_size=7.2, observed_age_seconds=7,
+                size_to_observed_turnover=0.09)  # PIEVERSE 08.11: ~5s of its own pace
+    assert zone_line(dict(zone=zone, midpoint=1.49305)) is None
+    slow = dict(zone, size_to_observed_turnover=0.5, observed_age_seconds=40)  # 30s to trade through
+    assert "Спрос" in zone_line(dict(zone=slow, midpoint=1.49305))
+
+
+def test_day_pace_gates_cards_by_the_instruments_own_day():
+    from extensions.scalper.telegram_ux import day_pace, paced
+
+    # AIN 08.11: T2, ~$14k an average minute, a card at $9.3k/min — slower than its own day.
+    pace = day_pace(20e6, 9_300)
+    assert round(pace, 2) == 0.67 and paced("silent", pace) == "watch"
+    assert paced("alert", day_pace(20e6, 20_000)) == "silent"  # x1.4: interesting, not worth a sound
+    assert paced("alert", day_pace(20e6, 40_000)) == "alert"  # x2.9: busy for its day
+    assert paced("alert", None) == "alert" and paced("watch", 99.0) == "watch"

@@ -31,8 +31,8 @@ def test_context_hold_uses_configured_duration_and_discloses_minimum(requested, 
     assert selector.plan["requested_hold_seconds"] == requested
 
 
-@pytest.mark.parametrize("config", [dict(slots=2, detail_slots=3), dict(slots=21),
-                                  dict(detail_slots=9), dict(hold_seconds=59), dict(hold_seconds=3601)])
+@pytest.mark.parametrize("config", [dict(slots=2, detail_slots=3), dict(slots=31),
+                                  dict(detail_slots=21), dict(hold_seconds=59), dict(hold_seconds=3601)])
 def test_invalid_resource_settings_rejected(config):
     with pytest.raises(ValueError, match="attention requires"):
         UnifiedAttention(None, **config)

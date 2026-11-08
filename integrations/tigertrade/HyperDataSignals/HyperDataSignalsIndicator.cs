@@ -411,6 +411,7 @@ namespace TigerTrade.Chart.Indicators.Custom
             var font = new XFont(Canvas.ChartFont.Name, _textSize);
             var small = new XFont(Canvas.ChartFont.Name, Math.Max(8, _textSize - 2));
             var placed = new List<Placed>();
+            var outcomeLabels = new List<Rect>();  // outcome captions already drawn this frame
 
             if (data != null)
             {
@@ -435,7 +436,7 @@ namespace TigerTrade.Chart.Indicators.Custom
                     if (mark.ZonePrice != null && mark != latestZone)
                         DrawZone(visual, mark, offset, false, small, (byte)(alpha / 2));
                     if (_showOutcome)
-                        DrawOutcome(visual, mark, index, offset, small, alpha);
+                        DrawOutcome(visual, mark, index, offset, small, alpha, outcomeLabels);
                     if (index < first)
                         continue;
                     if (_showImpulse)
@@ -503,7 +504,8 @@ namespace TigerTrade.Chart.Indicators.Custom
         }
 
         // What happened next, from the chart's own bars: price at up to +5 minutes and the best/worst move band.
-        private void DrawOutcome(DxVisualQueue visual, Mark mark, int index, TimeSpan offset, XFont font, byte alpha)
+        private void DrawOutcome(DxVisualQueue visual, Mark mark, int index, TimeSpan offset, XFont font, byte alpha,
+                                 List<Rect> taken)
         {
             var price = mark.Price.Value;
             var count = DataProvider.Count;
@@ -543,7 +545,14 @@ namespace TigerTrade.Chart.Indicators.Custom
             {
                 label += $" (диапазон {Pct(low / price - 1)}…{Pct(high / price - 1)})";
             }
-            visual.DrawString(label, font, brush, x1 + 4, GetY(close) - _textSize * 0.7, XTextAlignment.Left);
+            // Fresh signals share the same end bar and price, so their captions would print over each other:
+            // move each one down until it clears the captions already drawn.
+            var height = _textSize * 1.3;
+            var rect = new Rect(x1 + 4, GetY(close) - _textSize * 0.7, label.Length * _textSize * 0.6, height);
+            while (taken.Exists(r => r.IntersectsWith(rect)))
+                rect.Y += height;
+            taken.Add(rect);
+            visual.DrawString(label, font, brush, rect.X, rect.Y, XTextAlignment.Left);
         }
 
         // Zone box from when it appeared; thickness grows with its $ size. The latest zone runs to the edge.

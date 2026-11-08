@@ -256,7 +256,7 @@ class PulseObservation(Observation):
             cursor=self.cursor,
             scout_count=(self.plan or {}).get("universe_size", 0),
             warming=(self.plan or {}).get("warming", 0),
-            policy=dict(slots=8),
+            policy=dict(slots=len((self.plan or {}).get("detail", []))),
             trade_owner="market_pulse",
             book_owner="native_hub",
         )

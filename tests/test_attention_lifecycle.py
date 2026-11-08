@@ -220,3 +220,24 @@ async def test_reassignment_invalidates_rolling_windows(monkeypatch, tmp_path):
     assert hub.orderbook.set_symbols.await_args.kwargs["reset"] == ["ETH"]
     assert observer.report()["plan_status"] == "valid"
     await observer.close()
+
+
+def test_baselines_survive_a_short_gap_only_when_the_policy_keeps_them():
+    from extensions.scalper.relative_attention import Attention, AttentionPolicy
+
+    def run(policy):
+        attention = Attention(policy)
+        for at in range(0, 100, 5):
+            attention.update({"X": dict(price=1 + (at % 10) * 1e-4, volume_24h=1000 + at)}, at)
+        before = len(attention.movement_baselines["X"])
+        attention.update({"X": dict(price=1.0, volume_24h=2000)}, 400)  # a 5-minute restart
+        return before, len(attention.movement_baselines["X"]), attention.scouts["X"]["state"]
+
+    assert run(AttentionPolicy(version=6))[1:] == (0, "warming")  # default: replay-compatible reset
+    before, after, state = run(AttentionPolicy(version=6, baseline_keep_seconds=900))
+    assert after == before and state == "ready"  # the norm is kept; the gap itself adds no sample
+    attention = Attention(AttentionPolicy(version=6, baseline_keep_seconds=900))
+    attention.update({"X": dict(price=1, volume_24h=1)}, 0)
+    attention.update({"X": dict(price=1.001, volume_24h=2)}, 5)
+    attention.update({"X": dict(price=1, volume_24h=3)}, 2000)  # longer than the keep: reset
+    assert len(attention.movement_baselines["X"]) == 0

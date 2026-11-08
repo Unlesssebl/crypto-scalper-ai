@@ -165,3 +165,30 @@ async def test_wide_frames_do_not_flood_liveness_writes(tmp_path):
     await collector._report_heartbeat(11_000)
     assert gaps.heartbeat.await_count == 2
     collector.archive.close()
+
+
+def binance_history():
+    return [{**candle(i*M, 200 if i == 20 else 10), "symbol": "BINANCE:NEW"} for i in range(6, 21)]
+
+
+def test_binance_closed_klines_survive_reconnects_late_frames_and_a_few_gaps():
+    rows = binance_history()
+    rows[3]["source_epoch"] = "after-reconnect"  # another socket delivered the same closed kline
+    rows[4]["epoch_started_ms"] = rows[4]["start_ms"] + 30_000
+    rows[5]["received_at_ms"] = rows[5]["start_ms"] + 60_000 + 21_500  # 21.5s late: still final
+    del rows[6:10]  # four missing minutes leave exactly ten reference bars
+    item = activity(rows, 21*M + 6000)["items"][0]
+    assert item["status"] == "ready" and item["reference_bars"] == 10
+    assert item["ratios"]["trade_count"] == 20 and item["reference_policy"] == "previous_14_closed_min10.v2"
+
+
+@pytest.mark.parametrize("mutation", ["five_missing", "early_target", "very_late_target"])
+def test_binance_still_needs_a_final_target_and_ten_reference_bars(mutation):
+    rows = binance_history()
+    if mutation == "five_missing":
+        del rows[2:7]
+    elif mutation == "early_target":
+        rows[-1]["received_at_ms"] = rows[-1]["start_ms"] + 40_000  # an open bar is never final
+    else:
+        rows[-1]["received_at_ms"] = rows[-1]["start_ms"] + 60_000 + 121_000
+    assert activity(rows, 21*M + 6000)["items"][0]["status"] == "warming_up"

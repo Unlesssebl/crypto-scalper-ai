@@ -1,7 +1,9 @@
 """Exchange candle summaries for broad discovery, never execution aggregates.
 
-Only recently updated closed candles and a contiguous, same-epoch reference
-qualify. These observations cannot prove absolute exchange completeness.
+Only closed candles qualify: Binance klines flagged closed (a reference of at least
+10 of the previous 14 minutes, across reconnects), Hyperliquid candles updated within
+10s of the close with a contiguous, same-epoch reference.
+These observations cannot prove absolute exchange completeness.
 """
 from __future__ import annotations
 
@@ -40,6 +42,21 @@ def validate_candle(row, now_ms):
                                 "source_epoch", "raw_ref")}
 
 
+# Binance klines arrive flagged closed (x=true) and the collector keeps only those, so a bar is final
+# whichever socket delivered it and however late. Its reference may then span reconnects and tolerate a
+# few missing minutes. Hyperliquid has no closed flag: a bar counts as final only when its last update came
+# within 10s of the close, and its 14 reference minutes must be contiguous from one connection.
+BINANCE_MIN_REFERENCE = 10
+BINANCE_MAX_LATE_MS = 120_000
+
+
+def _final(row, symbol):
+    closes = row["start_ms"] + MINUTE
+    if symbol.startswith("BINANCE:"):
+        return closes - 10_000 <= row["received_at_ms"] <= closes + BINANCE_MAX_LATE_MS
+    return row["epoch_started_ms"] <= row["start_ms"] and closes - 10_000 <= row["received_at_ms"] <= closes + 15_000
+
+
 def activity(rows, now_ms):
     """Past-only 14-minute median ratio; not a rarity or trading threshold."""
     target_start = (now_ms - 5_000) // MINUTE * MINUTE - MINUTE
@@ -49,25 +66,31 @@ def activity(rows, now_ms):
     result = []
     for symbol, bars in sorted(grouped.items()):
         target = bars.get(target_start)
+        binance = symbol.startswith("BINANCE:")
         item = {"symbol": symbol, "start_ms": target_start, "status": "missing",
-                "source": "binance_candle_1m" if symbol.startswith("BINANCE:") else "hyperliquid_candle_1m",
+                "source": "binance_candle_1m" if binance else "hyperliquid_candle_1m",
                 "reference_minutes": 14}
         if target:
             item.update(status="warming_up", trade_count=target["trade_count"],
                         base_volume=target["base_volume"])
-            reference = [bars.get(target_start - i * MINUTE) for i in range(1, 15)]
-            candidates = [target, *reference]
-            valid = all(r and r["source_epoch"] == target["source_epoch"]
-                        and r["epoch_started_ms"] <= r["start_ms"]
-                        and r["start_ms"] + MINUTE - 10_000 <= r["received_at_ms"]
-                        <= r["start_ms"] + MINUTE + 15_000 for r in candidates)
+            window = [bars.get(target_start - i * MINUTE) for i in range(1, 15)]
+            if binance:
+                reference = [r for r in window if r and _final(r, symbol)]
+                valid = _final(target, symbol) and len(reference) >= BINANCE_MIN_REFERENCE
+                policy = "previous_14_closed_min10.v2"
+            else:
+                reference = window
+                valid = all(r and r["source_epoch"] == target["source_epoch"] and _final(r, symbol)
+                            for r in [target, *window])
+                policy = "previous_14_contiguous.v1"
             if valid:
                 ratios = {}
                 for field in ("trade_count", "base_volume"):
                     baseline = median(Decimal(str(r[field])) for r in reference)
                     ratios[field] = (float(min(Decimal(1000), Decimal(str(target[field])) / baseline))
                                      if baseline > 0 else None)
-                item.update(status="ready", ratios=ratios, reference_policy="previous_14_contiguous.v1",
+                item.update(status="ready", ratios=ratios, reference_policy=policy,
+                            reference_bars=len(reference),
                             zero_reference=any(v is None for v in ratios.values()))
         result.append(item)
     return {"schema_version": VERSION, "at_ms": now_ms, "items": result,

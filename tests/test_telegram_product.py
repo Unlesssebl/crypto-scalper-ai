@@ -25,7 +25,7 @@ def packet(now, *, price=10, level=9.99, flow=0.8, count=30, assigned=1):
         received_at=now,
         midpoint=price,
         spread_bps=2,
-        observed_turnover_60s_usd=100,
+        observed_turnover_60s_usd=2_000_000,  # x2.9 of a $1B day: busy for its own day
         observed_trade_imbalance=flow,
         observed_trade_count_60s=count,
         last_trade_received_at=now,
@@ -99,7 +99,7 @@ def test_operational_signal_is_independent_of_ai_and_ordinary_zone_is_quiet(serv
     rows = operations(service)
     assert len(rows) == 1
     text = rows[0]["text"]
-    assert text.startswith("<b>🔸 T1 · BTC ▲</b>\n🟩 Покупатели давят\n🟩🟩🟩🟩🟥 Покупки 90% · $100/мин")
+    assert text.startswith("<b>🔸 T1 · BTC ▲</b>\n🟩 Покупатели давят\n🟩🟩🟩🟩🟥 Покупки 90% · $2M/мин · ×2.9 к дню")
     assert "📊 Сделок в 2 раза больше обычного" in text and "<i>Hyperliquid ·" in text
     assert "🧱 Спрос <code>9.99</code> (-0.10%)" in text
     assert "score" not in rows[0]["text"] and "Бесплатный" not in rows[0]["text"]

@@ -51,6 +51,7 @@ def normalize_binance_trades(payload, spec, *, receive_time_ms, source_epoch, ra
 
 
 class BinanceCollector(StreamCollector):
+    send_interval_s = 0.25  # Binance futures allow 10 incoming messages per second per connection
     venue, channel = "binance", "aggTrade"
 
     def __init__(self, config, archive, sink, gaps=None, specs=()):
@@ -81,8 +82,12 @@ class BinanceCollector(StreamCollector):
         return dict(method=method, params=streams, id=self._request_id)
 
     def subscriptions(self):
-        return [self.request("SUBSCRIBE", [self.native_market_id(s).lower() + "@aggTrade"], [s])
-                for s in self.config.markets]
+        # One frame for every market: the ack confirms them all, and a reconnect stays far under the
+        # venue's 10 messages a second however many detail slots there are.
+        markets = list(self.config.markets)
+        if not markets:
+            return []
+        return [self.request("SUBSCRIBE", [self.native_market_id(s).lower() + "@aggTrade" for s in markets], markets)]
 
     def is_subscription_ack(self, payload):
         return isinstance(payload, dict) and "result" in payload and "id" in payload
@@ -117,7 +122,7 @@ class BinanceCollector(StreamCollector):
                               ("SUBSCRIBE", wanted - self._overview_subscribed)):
             ordered = sorted(names)
             for offset in range(0, len(ordered), 200):
-                await self._ws.send_json(self.request(method, [n.lower() + "@kline_1m"
+                await self._send_json(self._ws, self.request(method, [n.lower() + "@kline_1m"
                                                                for n in ordered[offset:offset + 200]]))
         self._overview_subscribed = wanted
 
@@ -133,19 +138,25 @@ class BinanceCollector(StreamCollector):
 
         old, wanted = set(self.config.markets), set(markets)
         self.config = replace(self.config, markets=tuple(sorted(wanted)))
-        for symbol in old - wanted:
+        removed = sorted(old - wanted)
+        if removed and self._ws is not None and not self._ws.closed:
+            await self._send_json(self._ws, self.request(
+                "UNSUBSCRIBE", [self.native_market_id(s).lower() + "@aggTrade" for s in removed]))
+        for symbol in removed:
             native = self.native_market_id(symbol)
-            if self._ws is not None and not self._ws.closed:
-                await self._ws.send_json(self.request("UNSUBSCRIBE", [native.lower() + "@aggTrade"]))
             self.confirmed.discard(native)
             self.pending_ack.pop(native, None)
             await self.gaps.released(self.venue, native, self.channel, self._epoch or "pending", now_ms())
         if self._ws is not None and not self._ws.closed:
+            added = []
             for symbol in sorted(wanted):
                 native = self.native_market_id(symbol)
                 if native not in self.confirmed and native not in self.pending_ack:
                     self.pending_ack[native] = now_ms() + self.config.ack_timeout_ms
-                    await self._ws.send_json(self.request("SUBSCRIBE", [native.lower() + "@aggTrade"], [symbol]))
+                    added.append(symbol)
+            if added:
+                await self._send_json(self._ws, self.request(
+                    "SUBSCRIBE", [self.native_market_id(s).lower() + "@aggTrade" for s in added], added))
 
     async def _handle_payload(self, raw_text, epoch):
         payload = json.loads(raw_text)

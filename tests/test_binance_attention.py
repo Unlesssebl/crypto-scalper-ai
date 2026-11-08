@@ -256,3 +256,13 @@ async def test_binance_catalogue_tape_and_collector_status_cross_real_http_contr
             assert result["accepted"] == 1
         finally:
             await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pulse_owned_tape_follows_the_plans_twenty_books():
+    engine = OrderFlowEngine([], include_binance=False)
+    engine.selective = engine.pulse_external = True
+    await engine.set_attention_symbols([f"BINANCE:C{i}" for i in range(20)])
+    assert len(engine.symbols) == 20
+    with pytest.raises(ValueError, match="at most 20"):
+        await engine.set_attention_symbols([f"BINANCE:C{i}" for i in range(21)])

@@ -103,7 +103,7 @@ def test_unobserved_symbol_cannot_stay_in_focus_forever():
     assert {c["reason"] for c in changes} == {"scout_stale"}
 
 
-@pytest.mark.parametrize("fields", [dict(slots=9), dict(slots=1.5), dict(probe_ratio=float("nan")),
+@pytest.mark.parametrize("fields", [dict(slots=21), dict(slots=1.5), dict(probe_ratio=float("nan")),
                                   dict(min_activity_usd=-1), dict(release_ratio=4)])
 def test_invalid_policy_rejected(fields):
     with pytest.raises(ValueError):

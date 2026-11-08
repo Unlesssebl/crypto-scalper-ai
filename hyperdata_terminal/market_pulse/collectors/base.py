@@ -150,7 +150,7 @@ class StreamCollector(ABC):
             for market in removed:
                 for message in self._messages_for((market,)):
                     message = {**message, ("method" if self.venue == "hyperliquid" else "op"): "unsubscribe"}
-                    await self._ws.send_json(message)
+                    await self._send_json(self._ws, message)
                 native = self.native_market_id(market)
                 self.confirmed.discard(native)
                 self.pending_ack.pop(native, None)
@@ -166,7 +166,7 @@ class StreamCollector(ABC):
                         and self.rejected_until.get(native, 0) <= now_ms()):
                     self.pending_ack[native] = now_ms() + self.config.ack_timeout_ms
                     for message in self._messages_for((market,)):
-                        await self._ws.send_json(message)
+                        await self._send_json(self._ws, message)
         self.config = replace(self.config, markets=wanted)
 
     async def expire_pending(self):
@@ -288,7 +288,7 @@ class StreamCollector(ABC):
                                 for m in self.config.markets}
         try:
             for subscription in self.subscriptions():
-                await ws.send_json(subscription)
+                await self._send_json(ws, subscription)
             await self.auxiliary_connected(ws, epoch)
             early = await self._wait_for_subscription(ws)
             # Report the new epoch before ingesting anything: a data frame may
@@ -321,7 +321,11 @@ class StreamCollector(ABC):
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.ERROR,
                 }:
-                    raise ConnectionError(f"{self.venue} websocket closed")
+                    # The close code tells a venue's policy disconnect (rate, limits) from a network drop.
+                    code = message.data if message.type == aiohttp.WSMsgType.CLOSE else ws.close_code
+                    detail = message.extra or (ws.exception() and repr(ws.exception())) or ""
+                    suffix = f", {detail}" if detail else ""
+                    raise ConnectionError(f"{self.venue} websocket closed (code {code}{suffix})")
             return
         finally:
             self._ws = None
@@ -420,6 +424,19 @@ class StreamCollector(ABC):
         del self._pending[: len(batch)]
         self._last_flush_ms = now_ms()
 
+    # Minimum spacing of outgoing frames on one socket; 0 = no limit. Binance closes a connection that sends
+    # more than 10 messages a second, and a reconnect or an attention change can send a dozen at once.
+    send_interval_s = 0.0
+
+    async def _send_json(self, ws, message) -> None:
+        if self.send_interval_s:
+            now = time.monotonic()
+            at = max(now, getattr(self, "_next_send_at", 0.0))
+            self._next_send_at = at + self.send_interval_s  # reserved before sleeping: concurrent senders queue
+            if at > now:
+                await asyncio.sleep(at - now)
+        await ws.send_json(message)
+
     async def _send_heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         payload = self.heartbeat_payload()
         if payload is None:
@@ -427,7 +444,7 @@ class StreamCollector(ABC):
         if isinstance(payload, str):
             await ws.send_str(payload)
         else:
-            await ws.send_json(payload)
+            await self._send_json(ws, payload)
 
     async def _report_disconnect(self, epoch: str, now: int, reason: str) -> None:
         for market in self.config.markets:

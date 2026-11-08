@@ -6,12 +6,15 @@ import math
 import re
 
 VERSION = "attention.v1"
+MAX_SELECTED = 30
+MAX_DETAIL = 20
 
 
 def validate_plan(payload, now_ms):
     if not isinstance(payload, dict) or payload.get("schema_version") != VERSION:
         raise ValueError("unsupported attention schema")
-    for field, maximum in (("selected", 20), ("detail", 8), ("controls", 2)):
+    # 20 order books + 10 overview-only symbols; native books and Pulse tapes follow `detail`.
+    for field, maximum in (("selected", MAX_SELECTED), ("detail", MAX_DETAIL), ("controls", 2)):
         items = payload.get(field)
         if (
             not isinstance(items, list)

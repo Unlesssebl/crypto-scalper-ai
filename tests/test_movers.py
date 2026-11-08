@@ -54,8 +54,8 @@ def test_pick_holds_its_slot_and_capacity_is_respected():
 
 
 def test_plan_reserves_mover_slots_beyond_anomalies_within_the_native_limit():
-    attention = UnifiedAttention(None, slots=20, detail_slots=6, movers_slots=4)
-    assert attention.movers.slots == 2  # 6 anomaly slots + 2 = the native hub's 8
+    attention = UnifiedAttention(None, slots=30, detail_slots=18, movers_slots=4)
+    assert attention.movers.slots == 2  # 18 anomaly slots + 2 = the plan's 20 order books
     now = time.time()
     attention.choose([asset("BINANCE:JCT", 0.0132, 936e6, 2.87, now), asset("BTC", 1e5, 2e9, 0.0, now)], now)
     plan = attention.plan
@@ -100,3 +100,27 @@ def test_first_mover_card_waits_for_a_warm_tape(service, monkeypatch):
     observe(service, now + 5, flow=0.8, count=40)  # the tape is warm: the pick itself is the news
     rows = list(service.journal.db.execute("SELECT text FROM episode_cards WHERE destination='movers'"))
     assert len(rows) == 1 and "Покупки 90%" in rows[0]["text"]
+
+
+def test_hourly_history_survives_a_restart_through_the_journal():
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE scalper_settings(name TEXT PRIMARY KEY, value TEXT)")
+    journal = SimpleNamespace(db=db)
+    first = UnifiedAttention(journal, slots=20, detail_slots=6)
+    t0 = time.time() - 3500
+    for i in range(0, 3301, 60):
+        first.choose([asset("SOL", 100 * (1 + 0.03 * i / 3600), 60e6, 0.04, t0 + i)], t0 + i)
+    assert len(first.movers.history["SOL"]) == 56  # one sample per 30s at most
+    # Restart: a new process restores the samples and sees the hourly move on its first pass.
+    second = UnifiedAttention(journal, slots=20, detail_slots=6)
+    now = time.time()
+    second.choose([asset("SOL", 103.2, 60e6, 0.04, now)], now)
+    assert second.plan["detail"] == ["SOL"] and second.movers.picked["SOL"]["change_1h"] > 0.02
+
+
+def test_restore_drops_samples_older_than_the_history_window():
+    selector = MoversSelector()
+    selector.restore({"SOL": [[1_000.0, 100.0], [5_000.0, 101.0]], "BAD": [[4_900.0, -1]]}, now=5_000.0)
+    assert list(selector.history["SOL"]) == [(5_000.0, 101.0)] and "BAD" not in selector.history
